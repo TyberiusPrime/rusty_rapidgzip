@@ -1,0 +1,5 @@
+/target
+Cargo.lock.bak
+tests/corpus/*.gz
+tests/corpus/*.sha256
+!tests/corpus/.gitkeep
