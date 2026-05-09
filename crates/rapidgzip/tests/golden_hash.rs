@@ -60,7 +60,6 @@ fn decode_and_hash(path: &Path) -> anyhow::Result<String> {
 }
 
 #[test]
-#[ignore = "phase 0 stub: read_gz is unimplemented"]
 fn golden_hash_all_corpus() {
     let fixtures = fixtures();
     if fixtures.is_empty() {
