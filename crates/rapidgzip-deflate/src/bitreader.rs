@@ -144,6 +144,29 @@ impl<'a> BitReader<'a> {
     pub fn at_eof(&self) -> bool {
         self.exhausted || (self.bits == 0 && self.byte_pos >= self.input.len())
     }
+
+    /// Reposition to absolute bit offset `pos`. Drops the buffer.
+    /// Required for the block-finder, which probes many candidate offsets.
+    pub fn seek_to_bit(&mut self, pos: u64) -> Result<(), DeflateError> {
+        let total_bits = (self.input.len() as u64) * 8;
+        if pos > total_bits {
+            self.exhausted = true;
+            return Err(DeflateError::UnexpectedEof);
+        }
+        let byte = (pos / 8) as usize;
+        let sub = (pos & 7) as u32;
+        self.byte_pos = byte;
+        self.buf = 0;
+        self.bits = 0;
+        self.exhausted = false;
+        if sub != 0 {
+            // Discard `sub` bits at the new byte boundary.
+            self.refill(sub)?;
+            self.buf >>= sub;
+            self.bits -= sub;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

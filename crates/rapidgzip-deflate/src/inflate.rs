@@ -63,6 +63,18 @@ fn inflate_fixed(br: &mut BitReader<'_>, out: &mut Vec<u8>) -> Result<(), Deflat
 }
 
 fn inflate_dynamic(br: &mut BitReader<'_>, out: &mut Vec<u8>) -> Result<(), DeflateError> {
+    let (lit, dist) = read_dynamic_header(br)?;
+    decode_block(br, out, &lit, &dist)
+}
+
+/// Parse a dynamic-Huffman block header. Caller must have already consumed
+/// the BFINAL bit and the 2 BTYPE bits. On success, returns the literal/length
+/// and distance Huffman decoders, and the bitreader is positioned at the
+/// start of the compressed body. On any structural failure returns
+/// `DeflateError`. Used by the block finder to verify candidate offsets.
+pub fn read_dynamic_header(
+    br: &mut BitReader<'_>,
+) -> Result<(HuffmanDecoder, HuffmanDecoder), DeflateError> {
     let hlit = br.read(5)? as usize + 257;
     let hdist = br.read(5)? as usize + 1;
     let hclen = br.read(4)? as usize + 4;
@@ -71,14 +83,12 @@ fn inflate_dynamic(br: &mut BitReader<'_>, out: &mut Vec<u8>) -> Result<(), Defl
         return Err(DeflateError::Invalid("dynamic block: HLIT/HDIST out of range"));
     }
 
-    // Read code-length-code lengths in the permuted order.
     let mut cl_lengths = [0u8; 19];
     for i in 0..hclen {
         cl_lengths[CODE_LENGTH_ORDER[i]] = br.read(3)? as u8;
     }
     let cl_decoder = HuffmanDecoder::from_lengths(&cl_lengths)?;
 
-    // Decode HLIT + HDIST code lengths using cl_decoder.
     let total = hlit + hdist;
     let mut lengths = vec![0u8; total];
     let mut i = 0;
@@ -108,22 +118,29 @@ fn inflate_dynamic(br: &mut BitReader<'_>, out: &mut Vec<u8>) -> Result<(), Defl
                 if i + n > total {
                     return Err(DeflateError::Invalid("code 17 overruns lengths"));
                 }
-                i += n; // already zero
+                i += n;
             }
             18 => {
                 let n = (br.read(7)? as usize) + 11;
                 if i + n > total {
                     return Err(DeflateError::Invalid("code 18 overruns lengths"));
                 }
-                i += n; // already zero
+                i += n;
             }
             _ => return Err(DeflateError::Invalid("bad code-length symbol")),
         }
     }
 
+    // The end-of-block symbol must be representable, otherwise the block
+    // can never terminate. This is the cheapest "is this really a block?"
+    // signal beyond the canonical-Huffman check.
+    if lengths[256] == 0 {
+        return Err(DeflateError::Invalid("EOB symbol has zero length"));
+    }
+
     let lit = HuffmanDecoder::from_lengths(&lengths[..hlit])?;
     let dist = HuffmanDecoder::from_lengths(&lengths[hlit..])?;
-    decode_block(br, out, &lit, &dist)
+    Ok((lit, dist))
 }
 
 fn decode_block(
