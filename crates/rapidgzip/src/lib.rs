@@ -101,14 +101,25 @@ pub fn read_gz(
         );
     }
 
-    // Parse only the *first* member's header here; the pipeline handles
-    // every subsequent member's header inline as it crosses BFINAL.
-    let header_len = gzip::parse_header(&bytes)?;
-    let body_start = header_len;
-
-    let body: Arc<Vec<u8>> = Arc::new(bytes[body_start..].to_vec());
-    let (total_uncompressed, _body_consumed, chunks_sent) =
-        pipeline::parallel_decode_member(Arc::clone(&body), &sink, &config)?;
+    // BGZF fast-path: if the first member carries a BC FEXTRA subfield, the
+    // whole file is bgzip — every member is an independent deflate stream
+    // and we can decode them in parallel without speculation or markers.
+    let (total_uncompressed, chunks_sent) = if gzip::parse_bgzf_block_size(&bytes).is_some() {
+        if verbose {
+            eprintln!("[rapidgzip] bgzf detected — using fast path");
+        }
+        let file: Arc<Vec<u8>> = Arc::new(bytes);
+        pipeline::parallel_decode_bgzf(Arc::clone(&file), &sink, &config)?
+    } else {
+        // Parse only the *first* member's header here; the pipeline handles
+        // every subsequent member's header inline as it crosses BFINAL.
+        let header_len = gzip::parse_header(&bytes)?;
+        let body_start = header_len;
+        let body: Arc<Vec<u8>> = Arc::new(bytes[body_start..].to_vec());
+        let (uc, _body_consumed, ch) =
+            pipeline::parallel_decode_member(Arc::clone(&body), &sink, &config)?;
+        (uc, ch)
+    };
 
     drop(sink);
     if verbose {

@@ -187,6 +187,45 @@ pub(crate) fn parse_header(input: &[u8]) -> Result<usize, GzipError> {
     Ok(pos)
 }
 
+/// If `input` starts with a BGZF block header, return its total size in bytes
+/// (BSIZE + 1). Otherwise return `None`.
+///
+/// BGZF (samtools spec) is gzip with a mandatory FEXTRA subfield
+/// `SI1='B', SI2='C', SLEN=2, BSIZE(u16 LE)` where BSIZE = total block size - 1.
+/// Each BGZF member is an independent, complete deflate stream — no back-refs
+/// cross member boundaries. That lets the pipeline split the file at known
+/// byte offsets and decode each block in parallel with the plain serial
+/// inflater (no speculation, no marker resolution).
+pub(crate) fn parse_bgzf_block_size(input: &[u8]) -> Option<u32> {
+    if input.len() < 12 || input[0..2] != GZ_MAGIC || input[2] != CM_DEFLATE {
+        return None;
+    }
+    let flg = input[3];
+    if flg & FEXTRA == 0 {
+        return None;
+    }
+    let xlen = u16::from_le_bytes(input[10..12].try_into().unwrap()) as usize;
+    if 12 + xlen > input.len() {
+        return None;
+    }
+    let mut p = 12;
+    let end = 12 + xlen;
+    while p + 4 <= end {
+        let si1 = input[p];
+        let si2 = input[p + 1];
+        let slen = u16::from_le_bytes(input[p + 2..p + 4].try_into().unwrap()) as usize;
+        if p + 4 + slen > end {
+            return None;
+        }
+        if si1 == b'B' && si2 == b'C' && slen == 2 {
+            let bsize = u16::from_le_bytes(input[p + 4..p + 6].try_into().unwrap());
+            return Some(bsize as u32 + 1);
+        }
+        p += 4 + slen;
+    }
+    None
+}
+
 fn skip_zstring(input: &[u8], from: usize) -> Result<usize, GzipError> {
     let rest = input.get(from..).ok_or(GzipError::Truncated)?;
     let zero = rest.iter().position(|&b| b == 0).ok_or(GzipError::Truncated)?;

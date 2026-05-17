@@ -65,7 +65,9 @@ impl HuffmanDecoder {
     /// symbol `s` is not present in this tree. Accepts incomplete trees
     /// (Kraft sum < full code space) — see comment in the body.
     pub fn from_lengths(lengths: &[u8]) -> Result<Self, DeflateError> {
-        Self::from_lengths_with(lengths, false)
+        let mut out = Self::new_empty();
+        out.rebuild_from_lengths(lengths, false)?;
+        Ok(out)
     }
 
     /// Strict variant: also reject incomplete trees with ≥2 symbols. Used by
@@ -73,10 +75,48 @@ impl HuffmanDecoder {
     /// the candidate offset is a false positive (random bits parsing as a
     /// header). Real DEFLATE encoders produce complete trees.
     pub fn from_lengths_strict(lengths: &[u8]) -> Result<Self, DeflateError> {
-        Self::from_lengths_with(lengths, true)
+        let mut out = Self::new_empty();
+        out.rebuild_from_lengths(lengths, true)?;
+        Ok(out)
     }
 
-    fn from_lengths_with(lengths: &[u8], strict: bool) -> Result<Self, DeflateError> {
+    /// Allocate a decoder with empty buffers, ready to be reused via
+    /// [`Self::rebuild_from_lengths`]. The hot path allocates two of these
+    /// per worker and rebuilds them once per dynamic block, avoiding the
+    /// 1024-entry LUT allocation that would otherwise dominate decode time.
+    pub fn new_empty() -> Self {
+        Self {
+            lut: vec![Entry::default(); LUT_SIZE],
+            long_codes: Vec::new(),
+        }
+    }
+
+    /// Rebuild this decoder's tables in place from the given code-lengths.
+    /// Preserves the LUT allocation so successive dynamic blocks don't
+    /// re-pay the 8 KiB-per-tree allocation cost.
+    pub fn rebuild_from_lengths(
+        &mut self,
+        lengths: &[u8],
+        strict: bool,
+    ) -> Result<(), DeflateError> {
+        Self::build_into(&mut self.lut, &mut self.long_codes, lengths, strict)
+    }
+
+    fn build_into(
+        lut: &mut Vec<Entry>,
+        long_codes: &mut Vec<LongCode>,
+        lengths: &[u8],
+        strict: bool,
+    ) -> Result<(), DeflateError> {
+        // Reuse buffers: clear entries in place rather than reallocating.
+        if lut.len() != LUT_SIZE {
+            lut.resize(LUT_SIZE, Entry::default());
+        }
+        for e in lut.iter_mut() {
+            *e = Entry::default();
+        }
+        long_codes.clear();
+
         // Count codes per length.
         let mut bl_count = [0u32; (MAX_CODE_LEN + 1) as usize];
         for &l in lengths {
@@ -120,9 +160,6 @@ impl HuffmanDecoder {
             next_code[l] = code;
         }
 
-        let mut lut = vec![Entry::default(); LUT_SIZE];
-        let mut long_codes: Vec<LongCode> = Vec::new();
-
         // Assign codes in symbol order, just as RFC 1951 prescribes.
         for (sym, &len_u8) in lengths.iter().enumerate() {
             let len = len_u8 as u32;
@@ -156,7 +193,7 @@ impl HuffmanDecoder {
         // when codes form a prefix tree of the LUT_BITS-prefix bucket.
         long_codes.sort_by_key(|c| c.length);
 
-        Ok(Self { lut, long_codes })
+        Ok(())
     }
 
     /// Decode the next symbol from `br`.

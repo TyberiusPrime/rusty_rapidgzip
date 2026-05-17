@@ -15,15 +15,21 @@
 //!
 //! ## Marker representation
 //!
-//! We keep two parallel buffers:
-//!   - `bytes: Vec<u8>` — the chunk output, with a placeholder `0` byte
-//!     wherever a marker lives.
-//!   - `markers: Vec<Marker>` — sparse list of `(out_pos, prefix_offset)`.
+//! Markers are kept *sparse*: just `markers: Vec<Marker>` recording
+//! `(out_pos, prefix_offset)`, plus a placeholder `0` byte at each marker
+//! position in `bytes`. We deliberately do *not* maintain a dense parallel
+//! `marker_at: Vec<u16>` — the inner literal loop runs millions of times per
+//! chunk and a parallel vec doubles its per-byte cost.
+//!
+//! For marker *propagation* (an in-chunk back-reference whose source byte is
+//! itself a marker), we short-circuit with `max_marker_pos`: if the source
+//! offset is strictly greater than the highest marker position we've ever
+//! seen, no propagation is possible and we bulk-copy. Otherwise we fall back
+//! to a binary search over `markers` (already sorted by position).
 //!
 //! `prefix_offset` is the distance into the unknown prefix counted backwards
 //! from the byte just before the chunk's first byte: 0 = the immediately
-//! preceding byte, 1 = the one before that, …, 32767 = the oldest byte
-//! still in the 32 KiB window.
+//! preceding byte, …, 32767 = the oldest byte still in the 32 KiB window.
 //!
 //! In real-world streams the marker count is small: roughly
 //! `O(32 KiB / mean_match_distance)` per chunk. After ~32 KiB of decoded
@@ -32,7 +38,19 @@
 use crate::tables::{
     DISTANCE_BASE, DISTANCE_EXTRA, LENGTH_BASE, LENGTH_EXTRA,
 };
+use std::sync::LazyLock;
+
 use crate::{tables, BitReader, DeflateError, HuffmanDecoder};
+
+/// Fixed Huffman trees (RFC 1951 §3.2.6) never change. Build them once.
+static FIXED_LIT: LazyLock<HuffmanDecoder> = LazyLock::new(|| {
+    HuffmanDecoder::from_lengths(&tables::fixed_literal_lengths())
+        .expect("fixed literal tree is well-formed")
+});
+static FIXED_DIST: LazyLock<HuffmanDecoder> = LazyLock::new(|| {
+    HuffmanDecoder::from_lengths(&tables::fixed_distance_lengths())
+        .expect("fixed distance tree is well-formed")
+});
 
 /// One unresolved back-reference byte. See module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,34 +62,48 @@ pub struct Marker {
     pub prefix_offset: u16,
 }
 
-/// Sentinel for "this output byte is a real literal, not a marker".
-/// DEFLATE's max distance is 32768, so values 0..32768 are valid offsets
-/// and `u16::MAX` is unambiguous.
-const NO_MARKER: u16 = u16::MAX;
-
 /// One chunk's worth of speculatively-decoded output.
 ///
-/// Uses two parallel buffers:
-///   - `bytes` holds output bytes, with `0` at marker positions as a
-///     placeholder.
-///   - `marker_at` is the same length as `bytes`; `NO_MARKER` means
-///     "literal byte", any other value is a prefix offset.
-///
-/// `markers` is a sparse list of marker positions used for the resolution
-/// loop. It's kept in sync with `marker_at` and is the canonical way to
-/// iterate just the marker bytes.
-///
-/// The `marker_at` lookup is what makes back-reference propagation correct:
-/// when an in-chunk back-reference's *source* byte is itself a marker, we
-/// must emit a new marker at the target position rather than copying the
-/// placeholder zero.
+/// - `bytes` holds output bytes, with a placeholder (any value) at marker
+///   positions.
+/// - `markers` is a sparse list of `(out_pos, prefix_offset)` kept sorted
+///   by `out_pos` (push order is increasing position).
+/// - `max_marker_pos` is the largest `out_pos` ever inserted into `markers`.
+///   Used as a fast non-marker test in [`emit_back_ref`]: if a source byte
+///   is strictly past it, there's no marker there to propagate.
 #[derive(Debug, Default)]
 pub struct SpeculativeChunk {
     pub bytes: Vec<u8>,
-    marker_at: Vec<u16>,
     pub markers: Vec<Marker>,
+    /// Highest output position that is (or was) a marker. `None` when no
+    /// marker has ever been pushed.
+    max_marker_pos: Option<u32>,
     /// True if the last block consumed had BFINAL set.
     pub final_block_seen: bool,
+    /// Reusable decoder buffers for dynamic blocks. Built lazily by
+    /// `inflate_dynamic`. Allocating a 1024-entry LUT per block per tree
+    /// shows up at the top of the profile, so we pool them across blocks
+    /// within a chunk.
+    decoder_pool: Option<Box<DecoderPool>>,
+}
+
+#[derive(Debug)]
+struct DecoderPool {
+    cl: HuffmanDecoder,
+    lit: HuffmanDecoder,
+    dist: HuffmanDecoder,
+    lengths: Vec<u8>,
+}
+
+impl DecoderPool {
+    fn new() -> Self {
+        Self {
+            cl: HuffmanDecoder::new_empty(),
+            lit: HuffmanDecoder::new_empty(),
+            dist: HuffmanDecoder::new_empty(),
+            lengths: Vec::new(),
+        }
+    }
 }
 
 impl SpeculativeChunk {
@@ -83,19 +115,46 @@ impl SpeculativeChunk {
         self.markers.is_empty()
     }
 
+    /// Pre-allocate `bytes` to avoid reallocation while decoding a chunk
+    /// whose expected output size is known approximately. Used by the
+    /// parallel pipeline to size each worker's chunk up front.
+    pub fn reserve_bytes(&mut self, n: usize) {
+        self.bytes.reserve(n);
+    }
+
     #[inline]
     fn push_literal(&mut self, b: u8) {
         self.bytes.push(b);
-        self.marker_at.push(NO_MARKER);
     }
 
     #[inline]
     fn push_marker(&mut self, prefix_offset: u16) {
-        debug_assert!(prefix_offset != NO_MARKER);
         let pos = self.bytes.len() as u32;
         self.bytes.push(0);
-        self.marker_at.push(prefix_offset);
         self.markers.push(Marker { out_pos: pos, prefix_offset });
+        self.max_marker_pos = Some(pos);
+    }
+
+    /// True if `src` is known *not* to be a marker without searching
+    /// `markers`. Cheap fast path for the common case.
+    #[inline]
+    fn cannot_be_marker(&self, src: u32) -> bool {
+        match self.max_marker_pos {
+            None => true,
+            Some(max) => src > max,
+        }
+    }
+
+    /// `src` is in-range; check whether it is a marker. Caller has verified
+    /// `cannot_be_marker(src) == false`. Returns `Some(prefix_offset)` if
+    /// it is.
+    #[inline]
+    fn marker_at(&self, src: u32) -> Option<u16> {
+        // `markers` is sorted ascending by `out_pos` (push order).
+        self.markers
+            .binary_search_by_key(&src, |m| m.out_pos)
+            .ok()
+            .map(|i| self.markers[i].prefix_offset)
     }
 }
 
@@ -112,9 +171,7 @@ pub fn inflate_block_speculative(
     match btype {
         0 => inflate_stored(br, chunk)?,
         1 => {
-            let lit = HuffmanDecoder::from_lengths(&tables::fixed_literal_lengths())?;
-            let dist = HuffmanDecoder::from_lengths(&tables::fixed_distance_lengths())?;
-            decode_block(br, chunk, &lit, &dist)?;
+            decode_block(br, chunk, &FIXED_LIT, &FIXED_DIST)?;
         }
         2 => inflate_dynamic(br, chunk)?,
         _ => return Err(DeflateError::Invalid("reserved block type")),
@@ -148,7 +205,6 @@ fn inflate_stored(
         return Err(DeflateError::Invalid("stored block: LEN/NLEN mismatch"));
     }
     chunk.bytes.reserve(len as usize);
-    chunk.marker_at.reserve(len as usize);
     for _ in 0..len {
         chunk.push_literal(br.read(8)? as u8);
     }
@@ -169,13 +225,17 @@ fn inflate_dynamic(
     for i in 0..hclen {
         cl_lengths[tables::CODE_LENGTH_ORDER[i]] = br.read(3)? as u8;
     }
-    let cl_decoder = HuffmanDecoder::from_lengths(&cl_lengths)?;
+
+    let mut pool = chunk.decoder_pool.take().unwrap_or_else(|| Box::new(DecoderPool::new()));
+    pool.cl.rebuild_from_lengths(&cl_lengths, false)?;
 
     let total = hlit + hdist;
-    let mut lengths = vec![0u8; total];
+    pool.lengths.clear();
+    pool.lengths.resize(total, 0);
     let mut i = 0;
     while i < total {
-        let sym = cl_decoder.decode(br)?;
+        let sym = pool.cl.decode(br)?;
+        let lengths = &mut pool.lengths;
         match sym {
             0..=15 => {
                 lengths[i] = sym as u8;
@@ -212,9 +272,11 @@ fn inflate_dynamic(
             _ => return Err(DeflateError::Invalid("bad code-length symbol")),
         }
     }
-    let lit = HuffmanDecoder::from_lengths(&lengths[..hlit])?;
-    let dist = HuffmanDecoder::from_lengths(&lengths[hlit..])?;
-    decode_block(br, chunk, &lit, &dist)
+    pool.lit.rebuild_from_lengths(&pool.lengths[..hlit], false)?;
+    pool.dist.rebuild_from_lengths(&pool.lengths[hlit..], false)?;
+    let result = decode_block(br, chunk, &pool.lit, &pool.dist);
+    chunk.decoder_pool = Some(pool);
+    result
 }
 
 fn decode_block(
@@ -274,22 +336,58 @@ fn emit_back_ref(
     length: usize,
 ) -> Result<(), DeflateError> {
     chunk.bytes.reserve(length);
-    chunk.marker_at.reserve(length);
-    for _ in 0..length {
-        let cur = chunk.bytes.len();
-        if cur >= distance {
-            let src = cur - distance;
-            let src_marker = chunk.marker_at[src];
-            if src_marker == NO_MARKER {
-                let b = chunk.bytes[src];
-                chunk.push_literal(b);
+    let cur = chunk.bytes.len();
+
+    if cur < distance {
+        // Source falls (at least partly) in the unknown prefix: every byte
+        // of the copy that lands there becomes a fresh marker. The rest, if
+        // any, falls in-chunk at increasing positions starting from 0.
+        for _ in 0..length {
+            let cur_now = chunk.bytes.len();
+            if cur_now < distance {
+                let prefix_offset = distance - cur_now - 1;
+                debug_assert!(prefix_offset <= 32 * 1024);
+                chunk.push_marker(prefix_offset as u16);
             } else {
-                chunk.push_marker(src_marker);
+                // In-chunk part — propagate via the slow path. Source bytes
+                // here may themselves be markers we just emitted.
+                let src = cur_now - distance;
+                if let Some(po) = chunk.marker_at(src as u32) {
+                    chunk.push_marker(po);
+                } else {
+                    let b = chunk.bytes[src];
+                    chunk.push_literal(b);
+                }
             }
+        }
+        return Ok(());
+    }
+
+    // Pure in-chunk back-reference (cur >= distance).
+    let src = cur - distance;
+
+    // Hot fast path: no overlap (src+length <= cur), and source range is
+    // guaranteed marker-free. Markers live at positions <= max_marker_pos,
+    // so if the FIRST source byte (the lowest position) is past it, none of
+    // the source bytes are markers.
+    if distance >= length && chunk.cannot_be_marker(src as u32) {
+        chunk.bytes.extend_from_within(src..src + length);
+        return Ok(());
+    }
+
+    // Slow path: either source range overlaps the destination, or it might
+    // contain a marker we need to propagate.
+    for _ in 0..length {
+        let cur_now = chunk.bytes.len();
+        let s = cur_now - distance;
+        if chunk.cannot_be_marker(s as u32) {
+            let b = chunk.bytes[s];
+            chunk.push_literal(b);
+        } else if let Some(po) = chunk.marker_at(s as u32) {
+            chunk.push_marker(po);
         } else {
-            let prefix_offset = distance - cur - 1;
-            debug_assert!(prefix_offset < NO_MARKER as usize); // DEFLATE caps at 32 KiB
-            chunk.push_marker(prefix_offset as u16);
+            let b = chunk.bytes[s];
+            chunk.push_literal(b);
         }
     }
     Ok(())
@@ -321,9 +419,9 @@ pub fn resolve_markers(
         let b = prev_tail[idx];
         let pos = m.out_pos as usize;
         chunk.bytes[pos] = b;
-        chunk.marker_at[pos] = NO_MARKER;
     }
     chunk.markers.clear();
+    chunk.max_marker_pos = None;
     Ok(())
 }
 

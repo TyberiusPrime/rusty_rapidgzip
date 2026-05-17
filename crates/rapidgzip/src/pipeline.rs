@@ -303,6 +303,14 @@ fn decode_one_chunk(body: &[u8], item: &WorkItem) -> Result<WorkResult, Error> {
     let mut br = BitReader::new(body);
     br.seek_to_bit(item.start_bit).map_err(Error::Deflate)?;
     let mut chunk = SpeculativeChunk::default();
+    // Optimistic pre-allocate: assume ~3x compression ratio. Worst case
+    // (incompressible / stored blocks) we over-reserve harmlessly; common
+    // case avoids the cascade of doublings.
+    let span_bits = item.end_bit_hint.saturating_sub(item.start_bit);
+    if span_bits != u64::MAX && span_bits > 0 {
+        let est_output = ((span_bits / 8) as usize).saturating_mul(3);
+        chunk.reserve_bytes(est_output.min(64 * 1024 * 1024));
+    }
     let mut final_block = false;
     let mut member_boundaries: Vec<MemberBoundary> = Vec::new();
 
@@ -391,6 +399,164 @@ fn update_tail(prev_tail: &mut Vec<u8>, new_bytes: &[u8]) {
         let drop = prev_tail.len() - WINDOW;
         prev_tail.drain(..drop);
     }
+}
+
+/// BGZF fast-path pipeline.
+///
+/// BGZF (bgzip / samtools spec) is gzip with a mandatory `BC` FEXTRA subfield
+/// giving each member's size. Every member is an independent deflate stream
+/// with no back-refs across boundaries, so we can split the file at known
+/// byte offsets and decode each member with the plain serial inflater — no
+/// speculation, no marker resolution, no boundary scanning.
+///
+/// `file` is the entire compressed input (every member has its own header).
+/// Returns `(total_uncompressed, chunks_sent)`.
+pub fn parallel_decode_bgzf(
+    file: Arc<Vec<u8>>,
+    sink: &Sender<Vec<u8>>,
+    config: &Config,
+) -> Result<(u64, u64), Error> {
+    use std::collections::BTreeMap;
+
+    let num_threads = effective_threads(config);
+    let verbose = config.verbose.is_on();
+
+    // Walk member boundaries up front.
+    let mut members: Vec<(usize, usize)> = Vec::new();
+    let mut pos = 0usize;
+    while pos < file.len() {
+        let Some(size) = crate::gzip::parse_bgzf_block_size(&file[pos..]) else {
+            return Err(Error::Gzip(crate::gzip::GzipError::Truncated));
+        };
+        let size = size as usize;
+        if pos + size > file.len() {
+            return Err(Error::Gzip(crate::gzip::GzipError::Truncated));
+        }
+        members.push((pos, pos + size));
+        pos += size;
+    }
+
+    // Batch members so each work item covers ~chunk_size_bytes of compressed
+    // input. With BGZF blocks typically ~16 KiB compressed, a 4 MiB chunk
+    // groups ~256 members — enough amortization to keep workers busy. But
+    // for small files we'd end up with one giant batch; cap by the total
+    // size divided by (num_threads × 4) so every worker gets several batches.
+    let total_compressed: usize = members.iter().map(|(s, e)| e - s).sum();
+    let per_worker_target = total_compressed / (num_threads * 4).max(1);
+    let target = config
+        .chunk_size_bytes
+        .min(per_worker_target.max(64 * 1024))
+        .max(64 * 1024);
+    let mut batches: Vec<(usize, usize)> = Vec::new(); // (start_member, end_member) exclusive
+    let mut i = 0;
+    while i < members.len() {
+        let start = i;
+        let mut bytes = 0usize;
+        while i < members.len() && (bytes == 0 || bytes < target) {
+            bytes += members[i].1 - members[i].0;
+            i += 1;
+        }
+        batches.push((start, i));
+    }
+
+    if verbose {
+        eprintln!(
+            "[rapidgzip] bgzf: {} members → {} batch(es), {} worker(s)",
+            members.len(),
+            batches.len(),
+            num_threads,
+        );
+    }
+
+    // Work channel: (batch_id, member_start, member_end_exclusive).
+    let (work_tx, work_rx) = bounded::<(u64, usize, usize)>(num_threads * 2);
+    let (result_tx, result_rx) =
+        bounded::<Result<(u64, Vec<u8>), Error>>(num_threads * 2);
+
+    let mut workers = Vec::with_capacity(num_threads);
+    for _ in 0..num_threads {
+        let work_rx = work_rx.clone();
+        let result_tx = result_tx.clone();
+        let file = Arc::clone(&file);
+        let members_ref: Vec<(usize, usize)> = members.clone();
+        workers.push(thread::spawn(move || {
+            while let Ok((id, m_start, m_end)) = work_rx.recv() {
+                let mut out: Vec<u8> = Vec::new();
+                let mut err: Option<Error> = None;
+                for mi in m_start..m_end {
+                    let (s, e) = members_ref[mi];
+                    match crate::gzip::decode_one_indexed(&file[s..e], &mut out, mi as u32) {
+                        Ok(_) => {}
+                        Err(ge) => {
+                            err = Some(Error::Gzip(ge));
+                            break;
+                        }
+                    }
+                }
+                let msg = match err {
+                    Some(e) => Err(e),
+                    None => Ok((id, out)),
+                };
+                if result_tx.send(msg).is_err() {
+                    return;
+                }
+            }
+        }));
+    }
+    drop(result_tx);
+
+    // Dispatch all work items, then close the work channel.
+    let dispatch = thread::spawn(move || {
+        for (id, &(s, e)) in batches.iter().enumerate() {
+            if work_tx.send((id as u64, s, e)).is_err() {
+                return;
+            }
+        }
+        drop(work_tx);
+    });
+
+    // Serializer: reorder, stream in order.
+    let mut pending: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+    let mut next_id: u64 = 0;
+    let mut total_uncompressed: u64 = 0;
+    let mut chunks_sent: u64 = 0;
+    let mut last_err: Option<Error> = None;
+    for msg in result_rx.iter() {
+        match msg {
+            Err(e) => {
+                last_err = Some(e);
+                break;
+            }
+            Ok((id, bytes)) => {
+                pending.insert(id, bytes);
+                while let Some(bytes) = pending.remove(&next_id) {
+                    total_uncompressed += bytes.len() as u64;
+                    if sink.send(bytes).is_err() {
+                        last_err = Some(Error::Io(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "sink closed",
+                        )));
+                        break;
+                    }
+                    chunks_sent += 1;
+                    next_id += 1;
+                }
+                if last_err.is_some() {
+                    break;
+                }
+            }
+        }
+    }
+
+    let _ = dispatch.join();
+    for w in workers {
+        let _ = w.join();
+    }
+
+    if let Some(e) = last_err {
+        return Err(e);
+    }
+    Ok((total_uncompressed, chunks_sent))
 }
 
 #[cfg(test)]
