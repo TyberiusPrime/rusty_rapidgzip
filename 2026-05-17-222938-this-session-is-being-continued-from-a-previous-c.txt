@@ -1,0 +1,543 @@
+ ▐▛███▜▌   Claude Code v2.1.113
+▝▜█████▛▘  Sonnet 4.6 · Claude Pro
+  ▘▘ ▝▝    /project/rapidgzip_rs
+
+✻ Conversation compacted (ctrl+o for history)
+
+  ⎿  Referenced file crates/rapidgzip-deflate/src/huffman.rs
+  ⎿  Referenced file crates/rapidgzip-deflate/src/inflate.rs
+  ⎿  Referenced file crates/rapidgzip-deflate/src/speculative.rs
+  ⎿  Read crates/rapidgzip-deflate/src/lib.rs (30 lines)
+  ⎿  Read crates/rapidgzip-deflate/src/bitreader.rs (319 lines)
+
+  Searched for 1 pattern, read 3 files (ctrl+o to expand)
+
+● Now let me update encode_entry to distinguish EOB from reserved symbols, then
+  update both decode_block callers.
+
+● Update(crates/rapidgzip-deflate/src/huffman.rs)
+  ⎿  Added 5 lines, removed 4 lines
+      345                  let extra = LENGTH_EXTRA[li] as u32;
+      346                  (base << 16) | (extra << 8) | len
+      347              } else {
+      348 -                // sym 286/287 are reserved by RFC 1951. They 
+          -shouldn't be                                                  
+      349 -                // decoded; encode as exceptional so the hot p
+          -ath can refuse                                                
+      350 -                // via the same EOB-or-error fallthrough as bi
+          -t 15.                                                         
+      351 -                HUFFDEC_EXCEPTIONAL | len                     
+      348 +                // sym 286/287 are reserved by RFC 1951. Encod
+          +e as exceptional                                              
+      349 +                // with the symbol value retained in bits 31..
+          +16 so the hot                                                 
+      350 +                // path can tell them apart from EOB (sym 256)
+          +, which has                                                   
+      351 +                // zeros there.                               
+      352 +                HUFFDEC_EXCEPTIONAL | ((sym as u32) << 16) | l
+          +en                                                            
+      353              }
+      354          }
+      355      }
+
+● Now rewrite decode_block in inflate.rs and inflate_fixed /
+  read_dynamic_header:
+
+● Update(crates/rapidgzip-deflate/src/inflate.rs)
+  ⎿  Added 1 line
+       9  //! into that same buffer — so the caller controls memory: trim
+           it
+      10  //! periodically if streaming long files.
+      11  
+      12 +use crate::huffman::{HUFFDEC_EXCEPTIONAL, HUFFDEC_LITERAL};    
+      13  use crate::tables::*;
+      14  use crate::{BitReader, DeflateError, HuffmanDecoder};
+      15  
+
+● Update(crates/rapidgzip-deflate/src/inflate.rs)
+  ⎿  Added 1 line, removed 1 line
+      58  }
+      59  
+      60  fn inflate_fixed(br: &mut BitReader<'_>, out: &mut Vec<u8>) -> 
+          Result<(), DeflateError> {
+      61 -    let lit = HuffmanDecoder::from_lengths(&fixed_literal_lengt
+         -hs())?;                                                        
+      61 +    let lit = HuffmanDecoder::from_lengths_litlen(&fixed_litera
+         +l_lengths())?;                                                 
+      62      let dist = HuffmanDecoder::from_lengths(&fixed_distance_len
+          gths())?;
+      63      decode_block(br, out, &lit, &dist)
+      64  }
+
+● Update(crates/rapidgzip-deflate/src/inflate.rs)
+  ⎿  Added 1 line, removed 1 line
+      139          return Err(DeflateError::Invalid("EOB symbol has zero 
+           length"));
+      140      }
+      141  
+      142 -    let lit = HuffmanDecoder::from_lengths(&lengths[..hlit])?;
+      142 +    let lit = HuffmanDecoder::from_lengths_litlen(&lengths[..h
+          +lit])?;                                                       
+      143      let dist = HuffmanDecoder::from_lengths(&lengths[hlit..])?
+           ;
+      144      Ok((lit, dist))
+      145  }
+
+● Now rewrite decode_block in inflate.rs:
+
+● Update(crates/rapidgzip-deflate/src/inflate.rs)
+  ⎿  Added 16 lines, removed 12 lines
+      169          if let Err(e) = br.ensure_bits(NEEDED) {
+      170              break 'outer Err(e);
+      171          }
+      172 -        let sym = match lit.decode_filled(br) {               
+      173 -            Ok(s) => s,                                       
+      172 +        let entry = match lit.lookup_filled(br) {             
+      173 +            Ok(e) => e,                                       
+      174              Err(e) => break 'outer Err(e),
+      175          };
+      176 -        if sym < 256 {                                        
+      176 +        if entry & HUFFDEC_LITERAL != 0 {                     
+      177              if cur == cap {
+      178                  unsafe { out.set_len(cur); }
+      179                  out.reserve(HEADROOM);
+      180                  cap = out.capacity();
+      181                  ptr = out.as_mut_ptr();
+      182              }
+      183 -            unsafe { *ptr.add(cur) = sym as u8; }             
+      183 +            unsafe { *ptr.add(cur) = (entry >> 16) as u8; }   
+      184              cur += 1;
+      185 -        } else if sym == 256 {                                
+      186 -            break 'outer Ok(());                              
+      187 -        } else if sym <= 285 {                                
+      188 -            let li = (sym - 257) as usize;                    
+      189 -            let mut length = LENGTH_BASE[li] as usize;        
+      190 -            let extra = LENGTH_EXTRA[li];                     
+      185 +        } else if entry & HUFFDEC_EXCEPTIONAL != 0 {          
+      186 +            if entry >> 16 == 0 {                             
+      187 +                break 'outer Ok(()); // EOB (sym 256)         
+      188 +            }                                                 
+      189 +            unsafe { out.set_len(cur); }                      
+      190 +            break 'outer Err(DeflateError::Invalid("literal/le
+          +ngth symbol out of range"));                                  
+      191 +        } else {                                              
+      192 +            let length_base = ((entry >> 16) & 0x1ff) as usize
+          +;                                                             
+      193 +            let extra = ((entry >> 8) & 0x1f) as u32;         
+      194 +            let mut length = length_base;                     
+      195              if extra > 0 {
+      192 -                length += br.peek_bits_unchecked(extra as u32)
+          - as usize;                                                    
+      193 -                br.consume(extra as u32);                     
+      196 +                length += br.peek_bits_unchecked(extra) as usi
+          +ze;                                                           
+      197 +                br.consume(extra);                            
+      198              }
+      199              let dsym = match dist.decode_filled(br) {
+      200                  Ok(s) => s,
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(crates/rapidgzip-deflate/src/inflate.rs)
+  ⎿  Removed 3 lines
+      232                  cap = out.capacity();
+      233              }
+      234              ptr = out.as_mut_ptr();
+      235 -        } else {                                              
+      236 -            unsafe { out.set_len(cur); }                      
+      237 -            break 'outer Err(DeflateError::Invalid("literal/le
+          -ngth symbol out of range"));                                  
+      235          }
+      236      };
+      237  
+
+● Now do the same for speculative.rs:
+
+● Update(crates/rapidgzip-deflate/src/speculative.rs)
+  ⎿  Added 3 lines, removed 4 lines
+      35  //! `O(32 KiB / mean_match_distance)` per chunk. After ~32 KiB 
+          of decoded
+      36  //! output, every back-reference lands in-chunk and stops produ
+          cing markers.
+      37  
+      38 -use crate::tables::{                                           
+      39 -    DISTANCE_BASE, DISTANCE_EXTRA, LENGTH_BASE, LENGTH_EXTRA,  
+      40 -};                                                             
+      38 +use crate::huffman::{HUFFDEC_EXCEPTIONAL, HUFFDEC_LITERAL};    
+      39 +use crate::tables::{DISTANCE_BASE, DISTANCE_EXTRA};            
+      40  use std::sync::LazyLock;
+      41  
+      42  use crate::{tables, BitReader, DeflateError, HuffmanDecoder};
+      43  
+      44  /// Fixed Huffman trees (RFC 1951 §3.2.6) never change. Build t
+          hem once.
+      45  static FIXED_LIT: LazyLock<HuffmanDecoder> = LazyLock::new(|| {
+      47 -    HuffmanDecoder::from_lengths(&tables::fixed_literal_lengths
+         -())                                                            
+      46 +    HuffmanDecoder::from_lengths_litlen(&tables::fixed_literal_
+         +lengths())                                                     
+      47          .expect("fixed literal tree is well-formed")
+      48  });
+      49  static FIXED_DIST: LazyLock<HuffmanDecoder> = LazyLock::new(|| 
+          {
+
+● Update(crates/rapidgzip-deflate/src/speculative.rs)
+  ⎿  Added 1 line, removed 1 line
+      271              _ => return Err(DeflateError::Invalid("bad code-le
+           ngth symbol")),
+      272          }
+      273      }
+      274 -    pool.lit.rebuild_from_lengths(&pool.lengths[..hlit], false
+          -)?;                                                           
+      274 +    pool.lit.rebuild_from_lengths_litlen(&pool.lengths[..hlit]
+          +)?;                                                           
+      275      pool.dist.rebuild_from_lengths(&pool.lengths[hlit..], fals
+           e)?;
+      276      let result = decode_block(br, chunk, &pool.lit, &pool.dist
+           );
+      277      chunk.decoder_pool = Some(pool);
+
+● Update(crates/rapidgzip-deflate/src/speculative.rs)
+  ⎿  Added 16 lines, removed 12 lines
+      305          if let Err(e) = br.ensure_bits(NEEDED) {
+      306              break 'outer Err(e);
+      307          }
+      308 -        let sym = match lit.decode_filled(br) {               
+      309 -            Ok(s) => s,                                       
+      308 +        let entry = match lit.lookup_filled(br) {             
+      309 +            Ok(e) => e,                                       
+      310              Err(e) => break 'outer Err(e),
+      311          };
+      312 -        if sym < 256 {                                        
+      312 +        if entry & HUFFDEC_LITERAL != 0 {                     
+      313              // Literal hot path: raw pointer write, no Vec::pu
+           sh round-trip.
+      314              if cur == cap {
+      315                  unsafe { chunk.bytes.set_len(cur); }
+     ...
+      317                  cap = chunk.bytes.capacity();
+      318                  ptr = chunk.bytes.as_mut_ptr();
+      319              }
+      320 -            unsafe { *ptr.add(cur) = sym as u8; }             
+      320 +            unsafe { *ptr.add(cur) = (entry >> 16) as u8; }   
+      321              cur += 1;
+      322 -        } else if sym == 256 {                                
+      323 -            break 'outer Ok(());                              
+      324 -        } else if sym <= 285 {                                
+      325 -            let li = (sym - 257) as usize;                    
+      326 -            let mut length = LENGTH_BASE[li] as usize;        
+      327 -            let extra = LENGTH_EXTRA[li];                     
+      322 +        } else if entry & HUFFDEC_EXCEPTIONAL != 0 {          
+      323 +            if entry >> 16 == 0 {                             
+      324 +                break 'outer Ok(()); // EOB (sym 256)         
+      325 +            }                                                 
+      326 +            unsafe { chunk.bytes.set_len(cur); }              
+      327 +            break 'outer Err(DeflateError::Invalid("literal/le
+          +ngth symbol out of range"));                                  
+      328 +        } else {                                              
+      329 +            let length_base = ((entry >> 16) & 0x1ff) as usize
+          +;                                                             
+      330 +            let extra = ((entry >> 8) & 0x1f) as u32;         
+      331 +            let mut length = length_base;                     
+      332              if extra > 0 {
+      329 -                length += br.peek_bits_unchecked(extra as u32)
+          - as usize;                                                    
+      330 -                br.consume(extra as u32);                     
+      333 +                length += br.peek_bits_unchecked(extra) as usi
+          +ze;                                                           
+      334 +                br.consume(extra);                            
+      335              }
+      336              let dsym = match dist.decode_filled(br) {
+      337                  Ok(s) => s,
+
+● Now remove the trailing else branch in speculative.rs:
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(crates/rapidgzip-deflate/src/speculative.rs)
+  ⎿  Removed 3 lines
+      370                  cap = chunk.bytes.capacity();
+      371              }
+      372              ptr = chunk.bytes.as_mut_ptr();
+      373 -        } else {                                              
+      374 -            unsafe { chunk.bytes.set_len(cur); }              
+      375 -            break 'outer Err(DeflateError::Invalid("literal/le
+          -ngth symbol out of range"));                                  
+      373          }
+      374      };
+      375  
+
+● Now build & test:
+● Bash(cargo build --release -p rapidgzip-deflate 2>&1 | tail -30)
+  ⎿     Compiling rapidgzip-deflate v0.0.1 (/project/rapidgzip_rs/crates/ra
+     pidgzip-deflate)
+         Finished `release` profile [optimized + debuginfo] target(s) in 0.
+     36s
+
+● Bash(cargo test -p rapidgzip-deflate 2>&1 | tail -40)
+  ⎿  test bitreader::tests::multibyte_le ... ok
+     test bitreader::tests::peek_then_consume ... ok
+     test bitreader::tests::read_32_bits ... ok
+     … +24 lines (ctrl+o to expand)
+
+● All 37 tests pass. Let me also run the full workspace tests to ensure nothing
+  else broke, then build the binary:
+
+● Bash(cargo test --workspace --release 2>&1 | tail -20)
+  ⎿  test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 0 filtere
+     d out; finished in 0.11s
+     … +21 lines (ctrl+o to expand)
+
+● Bash(cargo build --release --bin rapidgzip-rs 2>&1 | tail -10 && cp
+      target_claude/release/rapidgzip-rs
+      /home/finkernagel/.cache/cargo/target/release/rapidgzip-rs 2>&…)
+  ⎿     Compiling rapidgzip-bin v0.0.1 (/project/rapidgzip_rs/crates/rapidg
+     zip-bin)
+         Finished `release` profile [optimized + debuginfo] target(s) in 2.
+     … +4 lines (ctrl+o to expand)
+
+  Read 1 file, listed 1 directory (ctrl+o to expand)
+
+● Phase A complete. The packed-entry rewrite is in: huffman.rs now produces u32
+  entries with HUFFDEC_LITERAL/HUFFDEC_EXCEPTIONAL flag bits and pre-baked
+  length base/extra for length codes; both decode_block functions (serial
+  inflate.rs and speculative.rs) dispatch via flag bits instead of match sym,
+  eliminating the LENGTH_BASE[li] / LENGTH_EXTRA[li] array lookups in the hot
+  path.
+
+  All 37 deflate tests pass. Release binary built at
+  target_claude/release/rapidgzip-rs.
+
+  Ready for your benchmark — same command as before:
+  time /home/finkernagel/.cache/cargo/target/release/rapidgzip-rs
+  ID136786_all_cells_S1_R2_001.fastq.gz -P 16 --verbose >/dev/null
+  (or copy target_claude/release/rapidgzip-rs to wherever that path points).
+  Prior baseline was 8.45s wall / 130.5s CPU.
+
+✻ Worked for 10m 21s
+
+❯ Executed in    8.39 secs    fish           external                           
+     usr time  128.68 secs    0.00 micros  128.68 secs                          
+     sys time    8.14 secs  874.00 micros    8.14 secs                          
+
+● Small but real improvement: 8.45→8.39 wall, 130.5→128.7 CPU (~1.4% CPU). The
+  pre-baked length tables saved the array lookups, but the bigger wins are still
+   ahead.
+
+  Phase B (subtable chain) only helps if the long-code linear scan is
+  meaningful, but the prior profile showed lookup_long was ~0.1% — so Phase B is
+   skippable.
+
+  Phase C (multi-symbol fastloop) is the big one — libdeflate decodes 3+ symbols
+   per refill when bits-remaining allows, eliminating most ensure_bits calls.
+  That's where C++ rapidgzip pulls ahead.
+
+  Want a fresh perf report first to confirm the post-Phase-A profile, then go to
+   Phase C? Or jump straight to Phase C?
+
+❯     90.63%  rapidgzip-rs  rapidgzip-rs          [.]                           
+  rapidgzip_deflate::speculative::decode_block                                  
+       3.73%  rapidgzip-rs  rapidgzip-rs          [.]                           
+  crc32fast::specialized::pclmulqdq::calculate                                  
+       2.22%  rapidgzip-rs  rapidgzip-rs          [.]                           
+  rapidgzip_deflate::huffman::HuffmanDecoder::build_into                        
+       1.05%  rapidgzip-rs  libc.so.6             [.]                           
+  __memmove_avx512_unaligned_erms                                               
+       0.75%  rapidgzip-rs  rapidgzip-rs          [.]                           
+  rapidgzip::pipeline::parallel_decode_member                                   
+       0.29%  rapidgzip-rs  [unknown]             [k] 0xffffffff8da01280        
+       0.26%  rapidgzip-rs  rapidgzip-rs          [.]                           
+  rapidgzip_deflate::speculative::inflate_block_speculative                     
+       0.21%  rapidgzip-rs  libc.so.6             [.]                           
+  __memset_avx512_unaligned_erms - jump straight to phase c, I'd say.           
+
+● decode_block is 91% — let's attack it with the multi-symbol fastloop. Plan: do
+   3 unrolled literal decodes per ensure_bits(48); if any is non-literal, refill
+   once and handle length code as before. After 3 max-length literal codes (45
+  bits), we still have ≥3 bits, so the top-of-loop refill is sometimes a no-op.
+
+  Bit-budget check: lookup_filled reads LUT_BITS=10 via peek_bits_unchecked (or
+  falls back to lookup_long which re-refills via peek). After two max 15-bit
+  decodes from 48, buffer has 18 bits — safe for a third 10-bit peek. ✓
+
+  Read 1 file (ctrl+o to expand)
+
+● Background command "Find binary install location" completed (exit code 0)
+
+● Update(crates/rapidgzip-deflate/src/speculative.rs)
+  ⎿  Added 43 lines, removed 8 lines
+      305          if let Err(e) = br.ensure_bits(NEEDED) {
+      306              break 'outer Err(e);
+      307          }
+      308 -        let entry = match lit.lookup_filled(br) {             
+      309 -            Ok(e) => e,                                       
+      310 -            Err(e) => break 'outer Err(e),                    
+      311 -        };                                                    
+      312 -        if entry & HUFFDEC_LITERAL != 0 {                     
+      313 -            // Literal hot path: raw pointer write, no Vec::pu
+          -sh round-trip.                                                
+      314 -            if cur == cap {                                   
+      308 +        // Multi-symbol fastloop: up to 3 unrolled literal dec
+          +odes per refill.                                              
+      309 +        // After 3 max-length 15-bit codes the buffer holds ≥3
+          + bits; the next                                               
+      310 +        // ensure_bits at the top tops it back up. In practice
+          + (avg ~9-bit                                                  
+      311 +        // codes) we re-enter with ~21 bits and the refill is 
+          +a no-op.                                                      
+      312 +        // If any unrolled decode lands on a non-literal we fa
+          +ll through to                                                 
+      313 +        // the length/EOB handler with that entry in `entry`, 
+          +after an                                                      
+      314 +        // ensure_bits to top the buffer back up for the dist+
+          +extras.                                                       
+      315 +        let entry: u32 = 'fast: {                             
+      316 +            // Pre-check: enough headroom for 3 literal writes
+          +.                                                             
+      317 +            if cap - cur < 3 {                                
+      318                  unsafe { chunk.bytes.set_len(cur); }
+      319                  chunk.bytes.reserve(HEADROOM);
+      320                  cap = chunk.bytes.capacity();
+      321                  ptr = chunk.bytes.as_mut_ptr();
+      322              }
+      320 -            unsafe { *ptr.add(cur) = (entry >> 16) as u8; }   
+      323 +            // Unrolled 3×.                                   
+      324 +            let e1 = match lit.lookup_filled(br) {            
+      325 +                Ok(e) => e,                                   
+      326 +                Err(e) => break 'outer Err(e),                
+      327 +            };                                                
+      328 +            if e1 & HUFFDEC_LITERAL == 0 { break 'fast e1; }  
+      329 +            unsafe { *ptr.add(cur) = (e1 >> 16) as u8; }      
+      330              cur += 1;
+      331 +                                                              
+      332 +            let e2 = match lit.lookup_filled(br) {            
+      333 +                Ok(e) => e,                                   
+      334 +                Err(e) => break 'outer Err(e),                
+      335 +            };                                                
+      336 +            if e2 & HUFFDEC_LITERAL == 0 { break 'fast e2; }  
+      337 +            unsafe { *ptr.add(cur) = (e2 >> 16) as u8; }      
+      338 +            cur += 1;                                         
+      339 +                                                              
+      340 +            let e3 = match lit.lookup_filled(br) {            
+      341 +                Ok(e) => e,                                   
+      342 +                Err(e) => break 'outer Err(e),                
+      343 +            };                                                
+      344 +            if e3 & HUFFDEC_LITERAL == 0 { break 'fast e3; }  
+      345 +            unsafe { *ptr.add(cur) = (e3 >> 16) as u8; }      
+      346 +            cur += 1;                                         
+      347 +            continue 'outer;                                  
+      348 +        };                                                    
+      349 +        // Non-literal: top the buffer back up so length/dist 
+          +extras have                                                   
+      350 +        // their bits available (they use peek_bits_unchecked)
+          +.                                                             
+      351 +        if let Err(e) = br.ensure_bits(NEEDED) {              
+      352 +            unsafe { chunk.bytes.set_len(cur); }              
+      353 +            break 'outer Err(e);                              
+      354 +        }                                                     
+      355 +        if false {                                            
+      356 +            unreachable!();                                   
+      357          } else if entry & HUFFDEC_EXCEPTIONAL != 0 {
+      358              if entry >> 16 == 0 {
+      359                  break 'outer Ok(()); // EOB (sym 256)
+
+● Update(crates/rapidgzip-deflate/src/speculative.rs)
+  ⎿  Added 1 line, removed 3 lines
+      352              unsafe { chunk.bytes.set_len(cur); }
+      353              break 'outer Err(e);
+      354          }
+      355 -        if false {                                            
+      356 -            unreachable!();                                   
+      357 -        } else if entry & HUFFDEC_EXCEPTIONAL != 0 {          
+      355 +        if entry & HUFFDEC_EXCEPTIONAL != 0 {                 
+      356              if entry >> 16 == 0 {
+      357                  break 'outer Ok(()); // EOB (sym 256)
+      358              }
+
+● Now do the same in inflate.rs:
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(crates/rapidgzip-deflate/src/inflate.rs)
+  ⎿  Added 32 lines, removed 8 lines
+      169          if let Err(e) = br.ensure_bits(NEEDED) {
+      170              break 'outer Err(e);
+      171          }
+      172 -        let entry = match lit.lookup_filled(br) {             
+      173 -            Ok(e) => e,                                       
+      174 -            Err(e) => break 'outer Err(e),                    
+      175 -        };                                                    
+      176 -        if entry & HUFFDEC_LITERAL != 0 {                     
+      177 -            if cur == cap {                                   
+      172 +        // Multi-symbol fastloop — see speculative::decode_blo
+          +ck for details.                                               
+      173 +        let entry: u32 = 'fast: {                             
+      174 +            if cap - cur < 3 {                                
+      175                  unsafe { out.set_len(cur); }
+      176                  out.reserve(HEADROOM);
+      177                  cap = out.capacity();
+      178                  ptr = out.as_mut_ptr();
+      179              }
+      183 -            unsafe { *ptr.add(cur) = (entry >> 16) as u8; }   
+      180 +            let e1 = match lit.lookup_filled(br) {            
+      181 +                Ok(e) => e,                                   
+      182 +                Err(e) => break 'outer Err(e),                
+      183 +            };                                                
+      184 +            if e1 & HUFFDEC_LITERAL == 0 { break 'fast e1; }  
+      185 +            unsafe { *ptr.add(cur) = (e1 >> 16) as u8; }      
+      186              cur += 1;
+      185 -        } else if entry & HUFFDEC_EXCEPTIONAL != 0 {          
+      187 +                                                              
+      188 +            let e2 = match lit.lookup_filled(br) {            
+      189 +                Ok(e) => e,                                   
+      190 +                Err(e) => break 'outer Err(e),                
+      191 +            };                                                
+      192 +            if e2 & HUFFDEC_LITERAL == 0 { break 'fast e2; }  
+      193 +            unsafe { *ptr.add(cur) = (e2 >> 16) as u8; }      
+      194 +            cur += 1;                                         
+      195 +                                                              
+      196 +            let e3 = match lit.lookup_filled(br) {            
+      197 +                Ok(e) => e,                                   
+      198 +                Err(e) => break 'outer Err(e),                
+      199 +            };                                                
+      200 +            if e3 & HUFFDEC_LITERAL == 0 { break 'fast e3; }  
+      201 +            unsafe { *ptr.add(cur) = (e3 >> 16) as u8; }      
+      202 +            cur += 1;                                         
+      203 +            continue 'outer;                                  
+      204 +        };                                                    
+      205 +        if let Err(e) = br.ensure_bits(NEEDED) {              
+      206 +            unsafe { out.set_len(cur); }                      
+      207 +            break 'outer Err(e);                              
+      208 +        }                                                     
+      209 +        if entry & HUFFDEC_EXCEPTIONAL != 0 {                 
+      210              if entry >> 16 == 0 {
+      211                  break 'outer Ok(()); // EOB (sym 256)
+      212              }
+
+● Bash(cargo build --release -p rapidgzip-deflate 2>&1 | tail -20)
+  ⎿     Compiling rapidgzip-deflate v0.0.1 (/project/rapidgzip_rs/crates/ra
+     pidgzip-deflate)
+         Finished `release` profile [optimized + debuginfo] target(s) in 0.
+     38s
+
+● Bash(cargo test -p rapidgzip-deflate --release 2>&1 | tail -15)
+  ⎿  test inflate::tests::ascii_1k ... ok
+     test inflate::tests::stored_block_path ... ok
+     test inflate::tests::level_9_dynamic ... ok
+     … +13 lines (ctrl+o to expand)
+
+● All 37 tests pass.
+
+● Bash(cargo build --release --bin rapidgzip-rs 2>&1 | tail -5)
+  ⎿     Compiling rapidgzip-deflate v0.0.1 (/project/rapidgzip_rs/crates/ra
+     pidgzip-deflate)
+        Compiling rapidgzip v0.0.1 (/project/rapidgzip_rs/crates/rapidgzip)
+     … +4 lines (ctrl+o to expand)
+
+● Phase C done — multi-symbol fastloop (3-way unroll) in both decode_block
+  functions. Each top-of-loop refill now amortizes over up to 3 literal decodes
+  instead of 1.
+
+  Ready for benchmark. Prior was 8.39s / 128.7s CPU.
+
+✻ Cogitated for 2m 31s

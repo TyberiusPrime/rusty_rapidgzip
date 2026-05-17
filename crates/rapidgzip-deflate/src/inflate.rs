@@ -9,7 +9,7 @@
 //! into that same buffer — so the caller controls memory: trim it
 //! periodically if streaming long files.
 
-use crate::huffman::{HUFFDEC_EXCEPTIONAL, HUFFDEC_LITERAL};
+use crate::huffman::{HUFFDEC_EXCEPTIONAL, HUFFDEC_LITERAL, LUT_BITS};
 use crate::tables::*;
 use crate::{BitReader, DeflateError, HuffmanDecoder};
 
@@ -151,115 +151,198 @@ fn decode_block(
     lit: &HuffmanDecoder,
     dist: &HuffmanDecoder,
 ) -> Result<(), DeflateError> {
-    // One refill per iteration: worst-case symbol consumes
-    //   15 (lit) + 5 (length-extra) + 15 (dist) + 13 (dist-extra) = 48 bits.
+    // Worst-case 48-bit symbol: 15 (lit) + 5 (length-extra) + 15 (dist) + 13.
     const NEEDED: u32 = 48;
-    // See speculative::decode_block for the rationale of the raw-pointer
-    // literal hot path. We keep HEADROOM of slack between `cur` and `cap`
-    // so the per-literal capacity check is amortized.
     const HEADROOM: usize = 4096;
+    const LUT_MASK: u64 = (1u64 << LUT_BITS) - 1;
+
     if out.capacity() - out.len() < HEADROOM {
         out.reserve(HEADROOM);
     }
     let mut cap = out.capacity();
-    let mut ptr = out.as_mut_ptr();
+    let mut out_ptr = out.as_mut_ptr();
     let mut cur = out.len();
 
+    // Pull bit-reader state into locals — the whole point of this function.
+    // We sync back on exit and around any helper that touches `br`.
+    let mut buf = br.buf;
+    let mut bits = br.bits;
+    let mut byte_pos = br.byte_pos;
+    let input_ptr = br.input.as_ptr();
+    let input_len = br.input.len();
+    let lit_lut = lit.lut_ptr();
+    let dist_lut = dist.lut_ptr();
+
     let result: Result<(), DeflateError> = 'outer: loop {
-        if let Err(e) = br.ensure_bits(NEEDED) {
-            break 'outer Err(e);
+        // ---- Local refill to >= NEEDED bits. ----
+        if bits < NEEDED {
+            if byte_pos + 8 <= input_len {
+                // Fast path: unaligned 8-byte LE load. `bits <= 48 < 56` so
+                // the shift is always defined.
+                let chunk = unsafe {
+                    std::ptr::read_unaligned(input_ptr.add(byte_pos) as *const u64)
+                };
+                buf |= chunk << bits;
+                let added = 64 - bits;
+                byte_pos += (added / 8) as usize;
+                bits += (added / 8) * 8;
+            } else {
+                // Slow byte-by-byte until either enough bits or EOF.
+                while bits < NEEDED {
+                    if byte_pos >= input_len {
+                        // Sync, mark exhausted, return.
+                        br.buf = buf;
+                        br.bits = bits;
+                        br.byte_pos = byte_pos;
+                        br.exhausted = true;
+                        unsafe { out.set_len(cur); }
+                        break 'outer Err(DeflateError::UnexpectedEof);
+                    }
+                    buf |= (unsafe { *input_ptr.add(byte_pos) } as u64) << bits;
+                    byte_pos += 1;
+                    bits += 8;
+                }
+            }
         }
-        // Multi-symbol fastloop — see speculative::decode_block for details.
-        let entry: u32 = 'fast: {
-            if cap - cur < 3 {
+
+        // ---- Decode lit/length symbol via direct LUT lookup. ----
+        let entry = {
+            let idx = (buf & LUT_MASK) as usize;
+            let e = unsafe { *lit_lut.add(idx) };
+            let len = e & 0xff;
+            if len == 0 {
+                // Cold: long-code chain. Sync state, call, reload.
+                br.buf = buf;
+                br.bits = bits;
+                br.byte_pos = byte_pos;
+                match lit.lookup_long(br) {
+                    Ok(e) => {
+                        buf = br.buf;
+                        bits = br.bits;
+                        byte_pos = br.byte_pos;
+                        e
+                    }
+                    Err(e) => {
+                        // `br` already holds the latest state — we synced
+                        // before the call. Don't reload locals; we're done.
+                        unsafe { out.set_len(cur); }
+                        break 'outer Err(e);
+                    }
+                }
+            } else {
+                buf >>= len;
+                bits -= len;
+                e
+            }
+        };
+
+        if entry & HUFFDEC_LITERAL != 0 {
+            if cur == cap {
                 unsafe { out.set_len(cur); }
                 out.reserve(HEADROOM);
                 cap = out.capacity();
-                ptr = out.as_mut_ptr();
+                out_ptr = out.as_mut_ptr();
             }
-            let e1 = match lit.lookup_filled(br) {
-                Ok(e) => e,
-                Err(e) => break 'outer Err(e),
-            };
-            if e1 & HUFFDEC_LITERAL == 0 { break 'fast e1; }
-            unsafe { *ptr.add(cur) = (e1 >> 16) as u8; }
-            cur += 1;
-
-            let e2 = match lit.lookup_filled(br) {
-                Ok(e) => e,
-                Err(e) => break 'outer Err(e),
-            };
-            if e2 & HUFFDEC_LITERAL == 0 { break 'fast e2; }
-            unsafe { *ptr.add(cur) = (e2 >> 16) as u8; }
-            cur += 1;
-
-            let e3 = match lit.lookup_filled(br) {
-                Ok(e) => e,
-                Err(e) => break 'outer Err(e),
-            };
-            if e3 & HUFFDEC_LITERAL == 0 { break 'fast e3; }
-            unsafe { *ptr.add(cur) = (e3 >> 16) as u8; }
+            unsafe { *out_ptr.add(cur) = (entry >> 16) as u8; }
             cur += 1;
             continue 'outer;
-        };
-        if let Err(e) = br.ensure_bits(NEEDED) {
-            unsafe { out.set_len(cur); }
-            break 'outer Err(e);
         }
         if entry & HUFFDEC_EXCEPTIONAL != 0 {
             if entry >> 16 == 0 {
-                break 'outer Ok(()); // EOB (sym 256)
+                br.buf = buf;
+                br.bits = bits;
+                br.byte_pos = byte_pos;
+                unsafe { out.set_len(cur); }
+                break 'outer Ok(()); // EOB
             }
+            br.buf = buf;
+            br.bits = bits;
+            br.byte_pos = byte_pos;
             unsafe { out.set_len(cur); }
             break 'outer Err(DeflateError::Invalid("literal/length symbol out of range"));
-        } else {
-            let length_base = ((entry >> 16) & 0x1ff) as usize;
-            let extra = ((entry >> 8) & 0x1f) as u32;
-            let mut length = length_base;
-            if extra > 0 {
-                length += br.peek_bits_unchecked(extra) as usize;
-                br.consume(extra);
-            }
-            let dsym = match dist.decode_filled(br) {
-                Ok(s) => s,
-                Err(e) => {
-                    unsafe { out.set_len(cur); }
-                    break 'outer Err(e);
-                }
-            };
-            if dsym >= 30 {
-                unsafe { out.set_len(cur); }
-                break 'outer Err(DeflateError::Invalid("distance symbol out of range"));
-            }
-            let di = dsym as usize;
-            let mut distance = DISTANCE_BASE[di] as usize;
-            let dextra = DISTANCE_EXTRA[di];
-            if dextra > 0 {
-                distance += br.peek_bits_unchecked(dextra as u32) as usize;
-                br.consume(dextra as u32);
-            }
-            if distance == 0 || distance > cur {
-                unsafe { out.set_len(cur); }
-                break 'outer Err(DeflateError::Invalid(
-                    "back-reference distance out of bounds",
-                ));
-            }
-            if distance > MAX_DISTANCE {
-                unsafe { out.set_len(cur); }
-                break 'outer Err(DeflateError::Invalid("distance > 32 KiB"));
-            }
-            unsafe { out.set_len(cur); }
-            copy_back(out, distance, length);
-            cur = out.len();
-            if cap - cur < HEADROOM {
-                out.reserve(HEADROOM);
-                cap = out.capacity();
-            }
-            ptr = out.as_mut_ptr();
         }
+
+        // Length code: base + extra (extra ≤ 5 bits, already buffered).
+        let length_base = ((entry >> 16) & 0x1ff) as usize;
+        let len_extra = ((entry >> 8) & 0x1f) as u32;
+        let mut length = length_base;
+        if len_extra > 0 {
+            length += (buf & ((1u64 << len_extra) - 1)) as usize;
+            buf >>= len_extra;
+            bits -= len_extra;
+        }
+
+        // Distance symbol — same LUT pattern.
+        let dsym = {
+            let idx = (buf & LUT_MASK) as usize;
+            let e = unsafe { *dist_lut.add(idx) };
+            let len = e & 0xff;
+            if len == 0 {
+                br.buf = buf;
+                br.bits = bits;
+                br.byte_pos = byte_pos;
+                match dist.lookup_long(br) {
+                    Ok(e) => {
+                        buf = br.buf;
+                        bits = br.bits;
+                        byte_pos = br.byte_pos;
+                        (e >> 16) as u16
+                    }
+                    Err(e) => {
+                        // `br` already holds the latest state — we synced
+                        // before the call. Don't reload locals; we're done.
+                        unsafe { out.set_len(cur); }
+                        break 'outer Err(e);
+                    }
+                }
+            } else {
+                buf >>= len;
+                bits -= len;
+                (e >> 16) as u16
+            }
+        };
+
+        if dsym >= 30 {
+            br.buf = buf;
+            br.bits = bits;
+            br.byte_pos = byte_pos;
+            unsafe { out.set_len(cur); }
+            break 'outer Err(DeflateError::Invalid("distance symbol out of range"));
+        }
+        let di = dsym as usize;
+        let mut distance = DISTANCE_BASE[di] as usize;
+        let dextra = DISTANCE_EXTRA[di] as u32;
+        if dextra > 0 {
+            distance += (buf & ((1u64 << dextra) - 1)) as usize;
+            buf >>= dextra;
+            bits -= dextra;
+        }
+        if distance == 0 || distance > cur {
+            br.buf = buf;
+            br.bits = bits;
+            br.byte_pos = byte_pos;
+            unsafe { out.set_len(cur); }
+            break 'outer Err(DeflateError::Invalid(
+                "back-reference distance out of bounds",
+            ));
+        }
+        if distance > MAX_DISTANCE {
+            br.buf = buf;
+            br.bits = bits;
+            br.byte_pos = byte_pos;
+            unsafe { out.set_len(cur); }
+            break 'outer Err(DeflateError::Invalid("distance > 32 KiB"));
+        }
+        unsafe { out.set_len(cur); }
+        copy_back(out, distance, length);
+        cur = out.len();
+        if cap - cur < HEADROOM {
+            out.reserve(HEADROOM);
+            cap = out.capacity();
+        }
+        out_ptr = out.as_mut_ptr();
     };
 
-    unsafe { out.set_len(cur); }
     result
 }
 

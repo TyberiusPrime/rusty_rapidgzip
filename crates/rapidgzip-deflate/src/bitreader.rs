@@ -27,16 +27,17 @@ const REFILL_FAST_AHEAD: usize = 8;
 
 #[derive(Debug)]
 pub struct BitReader<'a> {
-    /// Backing input. Never reborrowed.
-    input: &'a [u8],
+    /// Backing input. Never reborrowed. `pub(crate)` so the inflate hot path
+    /// can pull a raw pointer + len once outside the loop.
+    pub(crate) input: &'a [u8],
     /// Byte offset of the *next* unbuffered byte in `input`.
-    byte_pos: usize,
+    pub(crate) byte_pos: usize,
     /// Up to 64 buffered bits, low-order bits valid.
-    buf: u64,
+    pub(crate) buf: u64,
     /// Number of valid bits in `buf` (0..=64).
-    bits: u32,
+    pub(crate) bits: u32,
     /// Sticky EOF latch: once we've returned `UnexpectedEof`, stay there.
-    exhausted: bool,
+    pub(crate) exhausted: bool,
 }
 
 impl<'a> BitReader<'a> {

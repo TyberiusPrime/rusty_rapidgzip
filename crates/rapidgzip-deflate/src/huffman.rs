@@ -315,8 +315,15 @@ impl HuffmanDecoder {
         Ok(entry)
     }
 
+    /// Raw LUT pointer for hot-path callers that want to do the LUT lookup
+    /// inline with a manual bit buffer (no `&mut BitReader` round-trip).
+    #[inline]
+    pub(crate) fn lut_ptr(&self) -> *const u32 {
+        self.lut.as_ptr()
+    }
+
     #[cold]
-    fn lookup_long(&self, br: &mut BitReader<'_>) -> Result<u32, DeflateError> {
+    pub(crate) fn lookup_long(&self, br: &mut BitReader<'_>) -> Result<u32, DeflateError> {
         let bits = br.peek(MAX_CODE_LEN)?;
         for c in &self.long_codes {
             let mask = (1u32 << c.length) - 1;

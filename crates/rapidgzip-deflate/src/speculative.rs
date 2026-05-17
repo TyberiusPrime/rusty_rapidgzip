@@ -35,7 +35,7 @@
 //! `O(32 KiB / mean_match_distance)` per chunk. After ~32 KiB of decoded
 //! output, every back-reference lands in-chunk and stops producing markers.
 
-use crate::huffman::{HUFFDEC_EXCEPTIONAL, HUFFDEC_LITERAL};
+use crate::huffman::{HUFFDEC_EXCEPTIONAL, HUFFDEC_LITERAL, LUT_BITS};
 use crate::tables::{DISTANCE_BASE, DISTANCE_EXTRA};
 use std::sync::LazyLock;
 
@@ -285,128 +285,181 @@ fn decode_block(
     lit: &HuffmanDecoder,
     dist: &HuffmanDecoder,
 ) -> Result<(), DeflateError> {
-    // One refill per iteration covers the worst-case 48-bit symbol cost.
-    // See decode_block in inflate.rs for the bit budget.
+    // See `inflate::decode_block` for the design notes. The shape is the
+    // same: bit-reader state in locals, sync back only on exit / before
+    // helper calls that touch `br`. The two differences from the serial
+    // version are: output goes into `chunk.bytes`, and the back-reference
+    // path calls `emit_back_ref` (which handles markers) instead of
+    // `copy_back`.
     const NEEDED: u32 = 48;
-    // Headroom we keep available in the output buffer so the literal hot
-    // path can write through a raw pointer without per-byte capacity checks.
-    // When `cur` reaches `cap`, we sync, reserve another `HEADROOM` bytes,
-    // and re-acquire the pointer. A 4 KiB headroom amortizes the capacity
-    // check to ~once per 4 KiB of decoded literals.
     const HEADROOM: usize = 4096;
+    const LUT_MASK: u64 = (1u64 << LUT_BITS) - 1;
+
     if chunk.bytes.capacity() - chunk.bytes.len() < HEADROOM {
         chunk.bytes.reserve(HEADROOM);
     }
     let mut cap = chunk.bytes.capacity();
-    let mut ptr = chunk.bytes.as_mut_ptr();
+    let mut out_ptr = chunk.bytes.as_mut_ptr();
     let mut cur = chunk.bytes.len();
 
+    let mut buf = br.buf;
+    let mut bits = br.bits;
+    let mut byte_pos = br.byte_pos;
+    let input_ptr = br.input.as_ptr();
+    let input_len = br.input.len();
+    let lit_lut = lit.lut_ptr();
+    let dist_lut = dist.lut_ptr();
+
     let result: Result<(), DeflateError> = 'outer: loop {
-        if let Err(e) = br.ensure_bits(NEEDED) {
-            break 'outer Err(e);
+        if bits < NEEDED {
+            if byte_pos + 8 <= input_len {
+                let chunk_bytes = unsafe {
+                    std::ptr::read_unaligned(input_ptr.add(byte_pos) as *const u64)
+                };
+                buf |= chunk_bytes << bits;
+                let added = 64 - bits;
+                byte_pos += (added / 8) as usize;
+                bits += (added / 8) * 8;
+            } else {
+                while bits < NEEDED {
+                    if byte_pos >= input_len {
+                        br.buf = buf;
+                        br.bits = bits;
+                        br.byte_pos = byte_pos;
+                        br.exhausted = true;
+                        unsafe { chunk.bytes.set_len(cur); }
+                        break 'outer Err(DeflateError::UnexpectedEof);
+                    }
+                    buf |= (unsafe { *input_ptr.add(byte_pos) } as u64) << bits;
+                    byte_pos += 1;
+                    bits += 8;
+                }
+            }
         }
-        // Multi-symbol fastloop: up to 3 unrolled literal decodes per refill.
-        // After 3 max-length 15-bit codes the buffer holds ≥3 bits; the next
-        // ensure_bits at the top tops it back up. In practice (avg ~9-bit
-        // codes) we re-enter with ~21 bits and the refill is a no-op.
-        // If any unrolled decode lands on a non-literal we fall through to
-        // the length/EOB handler with that entry in `entry`, after an
-        // ensure_bits to top the buffer back up for the dist+extras.
-        let entry: u32 = 'fast: {
-            // Pre-check: enough headroom for 3 literal writes.
-            if cap - cur < 3 {
+
+        let entry = {
+            let idx = (buf & LUT_MASK) as usize;
+            let e = unsafe { *lit_lut.add(idx) };
+            let len = e & 0xff;
+            if len == 0 {
+                br.buf = buf;
+                br.bits = bits;
+                br.byte_pos = byte_pos;
+                match lit.lookup_long(br) {
+                    Ok(e) => {
+                        buf = br.buf;
+                        bits = br.bits;
+                        byte_pos = br.byte_pos;
+                        e
+                    }
+                    Err(e) => {
+                        unsafe { chunk.bytes.set_len(cur); }
+                        break 'outer Err(e);
+                    }
+                }
+            } else {
+                buf >>= len;
+                bits -= len;
+                e
+            }
+        };
+
+        if entry & HUFFDEC_LITERAL != 0 {
+            if cur == cap {
                 unsafe { chunk.bytes.set_len(cur); }
                 chunk.bytes.reserve(HEADROOM);
                 cap = chunk.bytes.capacity();
-                ptr = chunk.bytes.as_mut_ptr();
+                out_ptr = chunk.bytes.as_mut_ptr();
             }
-            // Unrolled 3×.
-            let e1 = match lit.lookup_filled(br) {
-                Ok(e) => e,
-                Err(e) => break 'outer Err(e),
-            };
-            if e1 & HUFFDEC_LITERAL == 0 { break 'fast e1; }
-            unsafe { *ptr.add(cur) = (e1 >> 16) as u8; }
-            cur += 1;
-
-            let e2 = match lit.lookup_filled(br) {
-                Ok(e) => e,
-                Err(e) => break 'outer Err(e),
-            };
-            if e2 & HUFFDEC_LITERAL == 0 { break 'fast e2; }
-            unsafe { *ptr.add(cur) = (e2 >> 16) as u8; }
-            cur += 1;
-
-            let e3 = match lit.lookup_filled(br) {
-                Ok(e) => e,
-                Err(e) => break 'outer Err(e),
-            };
-            if e3 & HUFFDEC_LITERAL == 0 { break 'fast e3; }
-            unsafe { *ptr.add(cur) = (e3 >> 16) as u8; }
+            unsafe { *out_ptr.add(cur) = (entry >> 16) as u8; }
             cur += 1;
             continue 'outer;
-        };
-        // Non-literal: top the buffer back up so length/dist extras have
-        // their bits available (they use peek_bits_unchecked).
-        if let Err(e) = br.ensure_bits(NEEDED) {
-            unsafe { chunk.bytes.set_len(cur); }
-            break 'outer Err(e);
         }
         if entry & HUFFDEC_EXCEPTIONAL != 0 {
+            br.buf = buf;
+            br.bits = bits;
+            br.byte_pos = byte_pos;
+            unsafe { chunk.bytes.set_len(cur); }
             if entry >> 16 == 0 {
-                break 'outer Ok(()); // EOB (sym 256)
+                break 'outer Ok(()); // EOB
             }
-            unsafe { chunk.bytes.set_len(cur); }
             break 'outer Err(DeflateError::Invalid("literal/length symbol out of range"));
-        } else {
-            let length_base = ((entry >> 16) & 0x1ff) as usize;
-            let extra = ((entry >> 8) & 0x1f) as u32;
-            let mut length = length_base;
-            if extra > 0 {
-                length += br.peek_bits_unchecked(extra) as usize;
-                br.consume(extra);
-            }
-            let dsym = match dist.decode_filled(br) {
-                Ok(s) => s,
-                Err(e) => {
-                    unsafe { chunk.bytes.set_len(cur); }
-                    break 'outer Err(e);
-                }
-            };
-            if dsym >= 30 {
-                unsafe { chunk.bytes.set_len(cur); }
-                break 'outer Err(DeflateError::Invalid("distance symbol out of range"));
-            }
-            let di = dsym as usize;
-            let mut distance = DISTANCE_BASE[di] as usize;
-            let dextra = DISTANCE_EXTRA[di];
-            if dextra > 0 {
-                distance += br.peek_bits_unchecked(dextra as u32) as usize;
-                br.consume(dextra as u32);
-            }
-            if distance == 0 || distance > 32 * 1024 {
-                unsafe { chunk.bytes.set_len(cur); }
-                break 'outer Err(DeflateError::Invalid("distance out of range"));
-            }
-            // Sync our local `cur` into chunk.bytes so emit_back_ref sees
-            // the correct length. emit_back_ref may also reserve, so we
-            // refresh the pointer / capacity afterward.
-            unsafe { chunk.bytes.set_len(cur); }
-            if let Err(e) = emit_back_ref(chunk, distance, length) {
-                cur = chunk.bytes.len();
-                break 'outer Err(e);
-            }
-            cur = chunk.bytes.len();
-            // Ensure we still have HEADROOM of slack for the next literal run.
-            if cap - cur < HEADROOM {
-                chunk.bytes.reserve(HEADROOM);
-                cap = chunk.bytes.capacity();
-            }
-            ptr = chunk.bytes.as_mut_ptr();
         }
+
+        let length_base = ((entry >> 16) & 0x1ff) as usize;
+        let len_extra = ((entry >> 8) & 0x1f) as u32;
+        let mut length = length_base;
+        if len_extra > 0 {
+            length += (buf & ((1u64 << len_extra) - 1)) as usize;
+            buf >>= len_extra;
+            bits -= len_extra;
+        }
+
+        let dsym = {
+            let idx = (buf & LUT_MASK) as usize;
+            let e = unsafe { *dist_lut.add(idx) };
+            let len = e & 0xff;
+            if len == 0 {
+                br.buf = buf;
+                br.bits = bits;
+                br.byte_pos = byte_pos;
+                match dist.lookup_long(br) {
+                    Ok(e) => {
+                        buf = br.buf;
+                        bits = br.bits;
+                        byte_pos = br.byte_pos;
+                        (e >> 16) as u16
+                    }
+                    Err(e) => {
+                        unsafe { chunk.bytes.set_len(cur); }
+                        break 'outer Err(e);
+                    }
+                }
+            } else {
+                buf >>= len;
+                bits -= len;
+                (e >> 16) as u16
+            }
+        };
+
+        if dsym >= 30 {
+            br.buf = buf;
+            br.bits = bits;
+            br.byte_pos = byte_pos;
+            unsafe { chunk.bytes.set_len(cur); }
+            break 'outer Err(DeflateError::Invalid("distance symbol out of range"));
+        }
+        let di = dsym as usize;
+        let mut distance = DISTANCE_BASE[di] as usize;
+        let dextra = DISTANCE_EXTRA[di] as u32;
+        if dextra > 0 {
+            distance += (buf & ((1u64 << dextra) - 1)) as usize;
+            buf >>= dextra;
+            bits -= dextra;
+        }
+        if distance == 0 || distance > 32 * 1024 {
+            br.buf = buf;
+            br.bits = bits;
+            br.byte_pos = byte_pos;
+            unsafe { chunk.bytes.set_len(cur); }
+            break 'outer Err(DeflateError::Invalid("distance out of range"));
+        }
+        // Sync output length before emit_back_ref, which reads chunk.bytes.
+        unsafe { chunk.bytes.set_len(cur); }
+        if let Err(e) = emit_back_ref(chunk, distance, length) {
+            br.buf = buf;
+            br.bits = bits;
+            br.byte_pos = byte_pos;
+            break 'outer Err(e);
+        }
+        cur = chunk.bytes.len();
+        if cap - cur < HEADROOM {
+            chunk.bytes.reserve(HEADROOM);
+            cap = chunk.bytes.capacity();
+        }
+        out_ptr = chunk.bytes.as_mut_ptr();
     };
 
-    unsafe { chunk.bytes.set_len(cur); }
     result
 }
 
