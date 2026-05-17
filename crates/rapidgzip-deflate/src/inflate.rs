@@ -169,20 +169,44 @@ fn decode_block(
         if let Err(e) = br.ensure_bits(NEEDED) {
             break 'outer Err(e);
         }
-        let entry = match lit.lookup_filled(br) {
-            Ok(e) => e,
-            Err(e) => break 'outer Err(e),
-        };
-        if entry & HUFFDEC_LITERAL != 0 {
-            if cur == cap {
+        // Multi-symbol fastloop — see speculative::decode_block for details.
+        let entry: u32 = 'fast: {
+            if cap - cur < 3 {
                 unsafe { out.set_len(cur); }
                 out.reserve(HEADROOM);
                 cap = out.capacity();
                 ptr = out.as_mut_ptr();
             }
-            unsafe { *ptr.add(cur) = (entry >> 16) as u8; }
+            let e1 = match lit.lookup_filled(br) {
+                Ok(e) => e,
+                Err(e) => break 'outer Err(e),
+            };
+            if e1 & HUFFDEC_LITERAL == 0 { break 'fast e1; }
+            unsafe { *ptr.add(cur) = (e1 >> 16) as u8; }
             cur += 1;
-        } else if entry & HUFFDEC_EXCEPTIONAL != 0 {
+
+            let e2 = match lit.lookup_filled(br) {
+                Ok(e) => e,
+                Err(e) => break 'outer Err(e),
+            };
+            if e2 & HUFFDEC_LITERAL == 0 { break 'fast e2; }
+            unsafe { *ptr.add(cur) = (e2 >> 16) as u8; }
+            cur += 1;
+
+            let e3 = match lit.lookup_filled(br) {
+                Ok(e) => e,
+                Err(e) => break 'outer Err(e),
+            };
+            if e3 & HUFFDEC_LITERAL == 0 { break 'fast e3; }
+            unsafe { *ptr.add(cur) = (e3 >> 16) as u8; }
+            cur += 1;
+            continue 'outer;
+        };
+        if let Err(e) = br.ensure_bits(NEEDED) {
+            unsafe { out.set_len(cur); }
+            break 'outer Err(e);
+        }
+        if entry & HUFFDEC_EXCEPTIONAL != 0 {
             if entry >> 16 == 0 {
                 break 'outer Ok(()); // EOB (sym 256)
             }

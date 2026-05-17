@@ -305,21 +305,54 @@ fn decode_block(
         if let Err(e) = br.ensure_bits(NEEDED) {
             break 'outer Err(e);
         }
-        let entry = match lit.lookup_filled(br) {
-            Ok(e) => e,
-            Err(e) => break 'outer Err(e),
-        };
-        if entry & HUFFDEC_LITERAL != 0 {
-            // Literal hot path: raw pointer write, no Vec::push round-trip.
-            if cur == cap {
+        // Multi-symbol fastloop: up to 3 unrolled literal decodes per refill.
+        // After 3 max-length 15-bit codes the buffer holds ≥3 bits; the next
+        // ensure_bits at the top tops it back up. In practice (avg ~9-bit
+        // codes) we re-enter with ~21 bits and the refill is a no-op.
+        // If any unrolled decode lands on a non-literal we fall through to
+        // the length/EOB handler with that entry in `entry`, after an
+        // ensure_bits to top the buffer back up for the dist+extras.
+        let entry: u32 = 'fast: {
+            // Pre-check: enough headroom for 3 literal writes.
+            if cap - cur < 3 {
                 unsafe { chunk.bytes.set_len(cur); }
                 chunk.bytes.reserve(HEADROOM);
                 cap = chunk.bytes.capacity();
                 ptr = chunk.bytes.as_mut_ptr();
             }
-            unsafe { *ptr.add(cur) = (entry >> 16) as u8; }
+            // Unrolled 3×.
+            let e1 = match lit.lookup_filled(br) {
+                Ok(e) => e,
+                Err(e) => break 'outer Err(e),
+            };
+            if e1 & HUFFDEC_LITERAL == 0 { break 'fast e1; }
+            unsafe { *ptr.add(cur) = (e1 >> 16) as u8; }
             cur += 1;
-        } else if entry & HUFFDEC_EXCEPTIONAL != 0 {
+
+            let e2 = match lit.lookup_filled(br) {
+                Ok(e) => e,
+                Err(e) => break 'outer Err(e),
+            };
+            if e2 & HUFFDEC_LITERAL == 0 { break 'fast e2; }
+            unsafe { *ptr.add(cur) = (e2 >> 16) as u8; }
+            cur += 1;
+
+            let e3 = match lit.lookup_filled(br) {
+                Ok(e) => e,
+                Err(e) => break 'outer Err(e),
+            };
+            if e3 & HUFFDEC_LITERAL == 0 { break 'fast e3; }
+            unsafe { *ptr.add(cur) = (e3 >> 16) as u8; }
+            cur += 1;
+            continue 'outer;
+        };
+        // Non-literal: top the buffer back up so length/dist extras have
+        // their bits available (they use peek_bits_unchecked).
+        if let Err(e) = br.ensure_bits(NEEDED) {
+            unsafe { chunk.bytes.set_len(cur); }
+            break 'outer Err(e);
+        }
+        if entry & HUFFDEC_EXCEPTIONAL != 0 {
             if entry >> 16 == 0 {
                 break 'outer Ok(()); // EOB (sym 256)
             }
