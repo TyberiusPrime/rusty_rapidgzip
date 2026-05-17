@@ -21,6 +21,7 @@ rapidgzip = { path = "crates/rapidgzip" }
 crc32fast = "1.4"
 crossbeam-channel = "0.5"
 thiserror = "2"
+memmap2 = "0.9"
 anyhow = "1"
 sha2 = "0.10"
 hex = "0.4"

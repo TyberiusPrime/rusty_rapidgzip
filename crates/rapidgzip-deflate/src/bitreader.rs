@@ -72,6 +72,25 @@ impl<'a> BitReader<'a> {
         self.bits -= drop;
     }
 
+    /// Ensure at least `n` bits are buffered. Public for hot-path callers
+    /// that want to amortize one refill across many small peeks/consumes.
+    /// After a successful call, [`Self::peek_bits_unchecked`] /
+    /// [`Self::consume`] are safe for any `m ≤ n`.
+    #[inline]
+    pub fn ensure_bits(&mut self, n: u32) -> Result<(), DeflateError> {
+        self.refill(n)
+    }
+
+    /// Peek the low `n` bits of the buffer without checking it has enough.
+    /// **Caller must have ensured the buffer holds ≥ `n` bits.** Used by the
+    /// inflate inner loop after a single `ensure_bits` per iteration.
+    #[inline]
+    pub fn peek_bits_unchecked(&self, n: u32) -> u32 {
+        debug_assert!(self.bits >= n, "peek_bits_unchecked: buffer underfilled");
+        let mask: u64 = (1u64 << n) - 1;
+        (self.buf & mask) as u32
+    }
+
     /// Ensure `bits_in_buffer >= n`. `n <= MAX_READ_BITS` is required.
     #[inline]
     fn refill(&mut self, n: u32) -> Result<(), DeflateError> {

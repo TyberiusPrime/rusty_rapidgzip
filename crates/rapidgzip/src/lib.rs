@@ -9,12 +9,14 @@ pub mod pipeline;
 
 pub use gzip::{decode_all, decode_one, GzipError};
 
-use std::fs;
+use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
 use crossbeam_channel::Sender;
 use thiserror::Error;
+
+use pipeline::InputBytes;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -88,14 +90,23 @@ pub fn read_gz(
     config: Config,
 ) -> Result<DecodeStats, Error> {
     let path = path.as_ref();
-    let bytes = fs::read(path)?;
-    let compressed_bytes = bytes.len() as u64;
     let verbose = config.verbose.is_on();
+    let t_open = std::time::Instant::now();
+    // mmap so workers can fault pages in on demand instead of paying for the
+    // whole file up front. For multi-GB inputs the wall-time savings vs.
+    // `fs::read` are very large; for small files the mmap setup is cheap.
+    let file = File::open(path)?;
+    let mmap = unsafe { memmap2::Mmap::map(&file)? };
+    // Best-effort hint for sequential access; OS may ignore.
+    let _ = mmap.advise(memmap2::Advice::Sequential);
+    let compressed_bytes = mmap.len() as u64;
+    let input = Arc::new(InputBytes::Mapped(mmap));
     if verbose {
         eprintln!(
-            "[rapidgzip] {}: {} compressed bytes, {} threads, chunk_size={}",
+            "[rapidgzip] {}: mmaped {} bytes in {:.3}s, {} threads, chunk_size={}",
             path.display(),
             compressed_bytes,
+            t_open.elapsed().as_secs_f64(),
             if config.num_threads == 0 { "auto".to_string() } else { config.num_threads.to_string() },
             config.chunk_size_bytes,
         );
@@ -104,20 +115,17 @@ pub fn read_gz(
     // BGZF fast-path: if the first member carries a BC FEXTRA subfield, the
     // whole file is bgzip — every member is an independent deflate stream
     // and we can decode them in parallel without speculation or markers.
-    let (total_uncompressed, chunks_sent) = if gzip::parse_bgzf_block_size(&bytes).is_some() {
+    let (total_uncompressed, chunks_sent) = if gzip::parse_bgzf_block_size(input.as_slice()).is_some() {
         if verbose {
             eprintln!("[rapidgzip] bgzf detected — using fast path");
         }
-        let file: Arc<Vec<u8>> = Arc::new(bytes);
-        pipeline::parallel_decode_bgzf(Arc::clone(&file), &sink, &config)?
+        pipeline::parallel_decode_bgzf(Arc::clone(&input), &sink, &config)?
     } else {
         // Parse only the *first* member's header here; the pipeline handles
         // every subsequent member's header inline as it crosses BFINAL.
-        let header_len = gzip::parse_header(&bytes)?;
-        let body_start = header_len;
-        let body: Arc<Vec<u8>> = Arc::new(bytes[body_start..].to_vec());
+        let header_len = gzip::parse_header(input.as_slice())?;
         let (uc, _body_consumed, ch) =
-            pipeline::parallel_decode_member(Arc::clone(&body), &sink, &config)?;
+            pipeline::parallel_decode_member(Arc::clone(&input), header_len, &sink, &config)?;
         (uc, ch)
     };
 

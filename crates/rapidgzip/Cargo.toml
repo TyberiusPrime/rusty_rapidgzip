@@ -12,6 +12,7 @@ rapidgzip-deflate.workspace = true
 crc32fast.workspace = true
 crossbeam-channel.workspace = true
 thiserror.workspace = true
+memmap2.workspace = true
 
 [dev-dependencies]
 sha2.workspace = true

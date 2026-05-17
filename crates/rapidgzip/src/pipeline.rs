@@ -34,6 +34,35 @@ use std::thread;
 
 use crossbeam_channel::{bounded, Sender};
 
+/// Compressed input backing store. Either an mmap'd file (production) or a
+/// heap buffer (tests / small inputs). Both deref to `&[u8]`.
+#[derive(Debug)]
+pub enum InputBytes {
+    Owned(Vec<u8>),
+    Mapped(memmap2::Mmap),
+}
+
+impl InputBytes {
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            InputBytes::Owned(v) => v,
+            InputBytes::Mapped(m) => m,
+        }
+    }
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+}
+
+impl std::ops::Deref for InputBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
 use rapidgzip_deflate::{
     find_next_dynamic_block, inflate_block_speculative, resolve_markers,
     BitReader, SpeculativeChunk,
@@ -91,27 +120,74 @@ struct MemberBoundary {
 /// chunks_sent)` where `chunks_sent` is the number of `Vec<u8>` chunks
 /// pushed onto `sink`.
 pub fn parallel_decode_member(
-    body: Arc<Vec<u8>>,
+    input: Arc<InputBytes>,
+    body_offset: usize,
     sink: &Sender<Vec<u8>>,
     config: &Config,
 ) -> Result<(u64, usize, u64), Error> {
+    // Inside this function `body` is the deflate body — the slice of `input`
+    // starting at `body_offset`. Workers receive the full Arc + the offset
+    // so they don't need to know about the gzip header layer.
+    let body: &[u8] = &input.as_slice()[body_offset..];
     let num_threads = effective_threads(config);
     let verbose = config.verbose.is_on();
     let total_bits = (body.len() as u64) * 8;
     let chunk_bits = (config.chunk_size_bytes as u64).max(64 * 1024) * 8;
 
-    // Phase 4a: find block boundaries. Always include 0; then scan forward
-    // every `chunk_bits` for the next valid dynamic-block start.
+    // Phase 4a: find block boundaries in parallel. Pick fixed target offsets
+    // every `chunk_bits` and search each in parallel; each search is local
+    // and independent — the only post-step is dedup + sort.
+    let t_scan = std::time::Instant::now();
     let mut boundaries: Vec<u64> = vec![0];
-    let mut cursor = chunk_bits;
-    while cursor < total_bits {
-        match find_next_dynamic_block(&body, cursor, total_bits) {
-            Some(b) if b > *boundaries.last().unwrap() => {
-                boundaries.push(b);
-                cursor = b + chunk_bits;
-            }
-            _ => break,
+    {
+        let mut targets: Vec<u64> = Vec::new();
+        let mut c = chunk_bits;
+        while c < total_bits {
+            targets.push(c);
+            c += chunk_bits;
         }
+        if !targets.is_empty() {
+            let body_ref = &body[..];
+            let found: Vec<Option<u64>> = std::thread::scope(|s| {
+                let mut handles = Vec::with_capacity(targets.len().min(num_threads));
+                // Split targets across `num_threads` workers in round-robin.
+                let n = num_threads.min(targets.len()).max(1);
+                let chunks: Vec<Vec<usize>> = (0..n)
+                    .map(|i| (i..targets.len()).step_by(n).collect())
+                    .collect();
+                for indices in chunks {
+                    let targets = &targets;
+                    let body_ref = body_ref;
+                    handles.push(s.spawn(move || {
+                        indices
+                            .into_iter()
+                            .map(|i| {
+                                let t = targets[i];
+                                (i, find_next_dynamic_block(body_ref, t, total_bits))
+                            })
+                            .collect::<Vec<_>>()
+                    }));
+                }
+                let mut out: Vec<Option<u64>> = vec![None; targets.len()];
+                for h in handles {
+                    for (i, b) in h.join().unwrap() {
+                        out[i] = b;
+                    }
+                }
+                out
+            });
+            for b in found.into_iter().flatten() {
+                if b > *boundaries.last().unwrap() {
+                    boundaries.push(b);
+                }
+            }
+        }
+    }
+    if verbose {
+        eprintln!(
+            "[rapidgzip] pipeline: scanned in {:.3}s",
+            t_scan.elapsed().as_secs_f64(),
+        );
     }
 
     // Build work items. The last item has no end_bit_hint (decode until BFINAL).
@@ -141,15 +217,18 @@ pub fn parallel_decode_member(
     let (work_tx, work_rx) = bounded::<WorkItem>(num_threads * 2);
     let (result_tx, result_rx) = bounded::<Result<WorkResult, Error>>(num_threads * 2);
 
-    // Spawn workers.
+    // Spawn workers. Each holds an Arc<InputBytes> and recomputes the body
+    // slice locally — keeps the closure 'static while sharing a single
+    // backing mmap or buffer across all workers.
     let mut worker_handles = Vec::with_capacity(num_threads);
     for _ in 0..num_threads {
-        let body = Arc::clone(&body);
+        let input = Arc::clone(&input);
         let work_rx = work_rx.clone();
         let result_tx = result_tx.clone();
         let handle = thread::spawn(move || {
+            let body = &input.as_slice()[body_offset..];
             while let Ok(item) = work_rx.recv() {
-                let res = decode_one_chunk(&body, &item);
+                let res = decode_one_chunk(body, &item);
                 if result_tx.send(res).is_err() {
                     return;
                 }
@@ -412,7 +491,7 @@ fn update_tail(prev_tail: &mut Vec<u8>, new_bytes: &[u8]) {
 /// `file` is the entire compressed input (every member has its own header).
 /// Returns `(total_uncompressed, chunks_sent)`.
 pub fn parallel_decode_bgzf(
-    file: Arc<Vec<u8>>,
+    file: Arc<InputBytes>,
     sink: &Sender<Vec<u8>>,
     config: &Config,
 ) -> Result<(u64, u64), Error> {
@@ -481,7 +560,9 @@ pub fn parallel_decode_bgzf(
         let members_ref: Vec<(usize, usize)> = members.clone();
         workers.push(thread::spawn(move || {
             while let Ok((id, m_start, m_end)) = work_rx.recv() {
-                let mut out: Vec<u8> = Vec::new();
+                // BGZF blocks are ≤64 KiB uncompressed; preallocate to avoid
+                // Vec growth reallocations inside the inflate hot loop.
+                let mut out: Vec<u8> = Vec::with_capacity((m_end - m_start) * 65_536);
                 let mut err: Option<Error> = None;
                 for mi in m_start..m_end {
                     let (s, e) = members_ref[mi];

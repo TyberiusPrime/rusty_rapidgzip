@@ -149,8 +149,14 @@ fn decode_block(
     lit: &HuffmanDecoder,
     dist: &HuffmanDecoder,
 ) -> Result<(), DeflateError> {
+    // One refill per iteration: worst-case symbol consumes
+    //   15 (lit) + 5 (length-extra) + 15 (dist) + 13 (dist-extra) = 48 bits.
+    // Buffer holds ≤64 bits, so 48 always fits; after `ensure_bits`,
+    // `decode_filled` and `peek_bits_unchecked` are safe within the iteration.
+    const NEEDED: u32 = 48;
     loop {
-        let sym = lit.decode(br)?;
+        br.ensure_bits(NEEDED)?;
+        let sym = lit.decode_filled(br)?;
         match sym {
             0..=255 => out.push(sym as u8),
             256 => return Ok(()),
@@ -159,9 +165,10 @@ fn decode_block(
                 let mut length = LENGTH_BASE[li] as usize;
                 let extra = LENGTH_EXTRA[li];
                 if extra > 0 {
-                    length += br.read(extra as u32)? as usize;
+                    length += br.peek_bits_unchecked(extra as u32) as usize;
+                    br.consume(extra as u32);
                 }
-                let dsym = dist.decode(br)?;
+                let dsym = dist.decode_filled(br)?;
                 if dsym >= 30 {
                     return Err(DeflateError::Invalid("distance symbol out of range"));
                 }
@@ -169,7 +176,8 @@ fn decode_block(
                 let mut distance = DISTANCE_BASE[di] as usize;
                 let dextra = DISTANCE_EXTRA[di];
                 if dextra > 0 {
-                    distance += br.read(dextra as u32)? as usize;
+                    distance += br.peek_bits_unchecked(dextra as u32) as usize;
+                    br.consume(dextra as u32);
                 }
                 if distance == 0 || distance > out.len() {
                     return Err(DeflateError::Invalid(

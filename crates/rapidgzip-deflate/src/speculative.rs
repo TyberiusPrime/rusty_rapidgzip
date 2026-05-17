@@ -285,8 +285,12 @@ fn decode_block(
     lit: &HuffmanDecoder,
     dist: &HuffmanDecoder,
 ) -> Result<(), DeflateError> {
+    // One refill per iteration covers the worst-case 48-bit symbol cost.
+    // See decode_block in inflate.rs for the bit budget.
+    const NEEDED: u32 = 48;
     loop {
-        let sym = lit.decode(br)?;
+        br.ensure_bits(NEEDED)?;
+        let sym = lit.decode_filled(br)?;
         match sym {
             0..=255 => chunk.push_literal(sym as u8),
             256 => return Ok(()),
@@ -295,9 +299,10 @@ fn decode_block(
                 let mut length = LENGTH_BASE[li] as usize;
                 let extra = LENGTH_EXTRA[li];
                 if extra > 0 {
-                    length += br.read(extra as u32)? as usize;
+                    length += br.peek_bits_unchecked(extra as u32) as usize;
+                    br.consume(extra as u32);
                 }
-                let dsym = dist.decode(br)?;
+                let dsym = dist.decode_filled(br)?;
                 if dsym >= 30 {
                     return Err(DeflateError::Invalid("distance symbol out of range"));
                 }
@@ -305,7 +310,8 @@ fn decode_block(
                 let mut distance = DISTANCE_BASE[di] as usize;
                 let dextra = DISTANCE_EXTRA[di];
                 if dextra > 0 {
-                    distance += br.read(dextra as u32)? as usize;
+                    distance += br.peek_bits_unchecked(dextra as u32) as usize;
+                    br.consume(dextra as u32);
                 }
                 if distance == 0 || distance > 32 * 1024 {
                     return Err(DeflateError::Invalid("distance out of range"));
