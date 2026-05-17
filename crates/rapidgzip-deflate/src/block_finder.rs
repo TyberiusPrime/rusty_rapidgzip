@@ -142,6 +142,31 @@ pub fn find_next_dynamic_block(
     None
 }
 
+// Per-thread decoder pool: block finder verifies many candidates per scan
+// and most fail; reusing the LUTs across calls eliminated ~16% of total CPU
+// (was per-call 1024-entry HuffmanDecoder allocation).
+thread_local! {
+    static SCAN_POOL: std::cell::RefCell<ScanPool> = std::cell::RefCell::new(ScanPool::new());
+}
+
+struct ScanPool {
+    cl: HuffmanDecoder,
+    lit: HuffmanDecoder,
+    dist: HuffmanDecoder,
+    lengths: Vec<u8>,
+}
+
+impl ScanPool {
+    fn new() -> Self {
+        Self {
+            cl: HuffmanDecoder::new_empty(),
+            lit: HuffmanDecoder::new_empty(),
+            dist: HuffmanDecoder::new_empty(),
+            lengths: Vec::new(),
+        }
+    }
+}
+
 /// Verify a candidate offset: parse the dynamic header (with **strict**
 /// Huffman validation — incomplete trees are rejected), then trial-decode
 /// up to [`TRIAL_SYMBOLS`] symbols. Returns true iff both succeed.
@@ -156,11 +181,13 @@ fn verify_candidate(br: &mut BitReader<'_>, pos: u64) -> bool {
     if br.read(3).is_err() {
         return false;
     }
-    let (lit, dist) = match read_dynamic_header_strict(br) {
-        Ok(pair) => pair,
-        Err(_) => return false,
-    };
-    trial_decode(br, &lit, &dist, TRIAL_SYMBOLS).is_ok()
+    SCAN_POOL.with(|cell| {
+        let mut pool = cell.borrow_mut();
+        if read_dynamic_header_strict_into(br, &mut pool).is_err() {
+            return false;
+        }
+        trial_decode(br, &pool.lit, &pool.dist, TRIAL_SYMBOLS).is_ok()
+    })
 }
 
 /// Strict dynamic-Huffman header parser. Mirrors `inflate::read_dynamic_header`
@@ -168,9 +195,10 @@ fn verify_candidate(br: &mut BitReader<'_>, pos: u64) -> bool {
 /// rejected. We don't share the inflate version because the inflate path
 /// must tolerate the (legitimate) incomplete fixed distance tree; the
 /// block finder cannot.
-fn read_dynamic_header_strict(
+fn read_dynamic_header_strict_into(
     br: &mut BitReader<'_>,
-) -> Result<(HuffmanDecoder, HuffmanDecoder), DeflateError> {
+    pool: &mut ScanPool,
+) -> Result<(), DeflateError> {
     let hlit = br.read(5)? as usize + 257;
     let hdist = br.read(5)? as usize + 1;
     let hclen = br.read(4)? as usize + 4;
@@ -181,13 +209,15 @@ fn read_dynamic_header_strict(
     for i in 0..hclen {
         cl_lengths[CODE_LENGTH_ORDER[i]] = br.read(3)? as u8;
     }
-    let cl_decoder = HuffmanDecoder::from_lengths_strict(&cl_lengths)?;
+    pool.cl.rebuild_from_lengths(&cl_lengths, true)?;
 
     let total = hlit + hdist;
-    let mut lengths = vec![0u8; total];
+    pool.lengths.clear();
+    pool.lengths.resize(total, 0);
     let mut i = 0;
     while i < total {
-        let sym = cl_decoder.decode(br)?;
+        let sym = pool.cl.decode(br)?;
+        let lengths = &mut pool.lengths;
         match sym {
             0..=15 => {
                 lengths[i] = sym as u8;
@@ -224,12 +254,12 @@ fn read_dynamic_header_strict(
             _ => return Err(DeflateError::Invalid("strict: bad code-length symbol")),
         }
     }
-    if lengths[256] == 0 {
+    if pool.lengths[256] == 0 {
         return Err(DeflateError::Invalid("strict: EOB symbol has zero length"));
     }
-    let lit = HuffmanDecoder::from_lengths_strict(&lengths[..hlit])?;
-    let dist = HuffmanDecoder::from_lengths_strict(&lengths[hlit..])?;
-    Ok((lit, dist))
+    pool.lit.rebuild_from_lengths(&pool.lengths[..hlit], true)?;
+    pool.dist.rebuild_from_lengths(&pool.lengths[hlit..], true)?;
+    Ok(())
 }
 
 /// Decode up to `n_symbols` literal/length+distance pairs from `br`, just

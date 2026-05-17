@@ -279,6 +279,7 @@ fn inflate_dynamic(
     result
 }
 
+#[allow(unsafe_code)]
 fn decode_block(
     br: &mut BitReader<'_>,
     chunk: &mut SpeculativeChunk,
@@ -288,39 +289,92 @@ fn decode_block(
     // One refill per iteration covers the worst-case 48-bit symbol cost.
     // See decode_block in inflate.rs for the bit budget.
     const NEEDED: u32 = 48;
-    loop {
-        br.ensure_bits(NEEDED)?;
-        let sym = lit.decode_filled(br)?;
-        match sym {
-            0..=255 => chunk.push_literal(sym as u8),
-            256 => return Ok(()),
-            257..=285 => {
-                let li = (sym - 257) as usize;
-                let mut length = LENGTH_BASE[li] as usize;
-                let extra = LENGTH_EXTRA[li];
-                if extra > 0 {
-                    length += br.peek_bits_unchecked(extra as u32) as usize;
-                    br.consume(extra as u32);
-                }
-                let dsym = dist.decode_filled(br)?;
-                if dsym >= 30 {
-                    return Err(DeflateError::Invalid("distance symbol out of range"));
-                }
-                let di = dsym as usize;
-                let mut distance = DISTANCE_BASE[di] as usize;
-                let dextra = DISTANCE_EXTRA[di];
-                if dextra > 0 {
-                    distance += br.peek_bits_unchecked(dextra as u32) as usize;
-                    br.consume(dextra as u32);
-                }
-                if distance == 0 || distance > 32 * 1024 {
-                    return Err(DeflateError::Invalid("distance out of range"));
-                }
-                emit_back_ref(chunk, distance, length)?;
-            }
-            _ => return Err(DeflateError::Invalid("literal/length symbol out of range")),
-        }
+    // Headroom we keep available in the output buffer so the literal hot
+    // path can write through a raw pointer without per-byte capacity checks.
+    // When `cur` reaches `cap`, we sync, reserve another `HEADROOM` bytes,
+    // and re-acquire the pointer. A 4 KiB headroom amortizes the capacity
+    // check to ~once per 4 KiB of decoded literals.
+    const HEADROOM: usize = 4096;
+    if chunk.bytes.capacity() - chunk.bytes.len() < HEADROOM {
+        chunk.bytes.reserve(HEADROOM);
     }
+    let mut cap = chunk.bytes.capacity();
+    let mut ptr = chunk.bytes.as_mut_ptr();
+    let mut cur = chunk.bytes.len();
+
+    let result: Result<(), DeflateError> = 'outer: loop {
+        if let Err(e) = br.ensure_bits(NEEDED) {
+            break 'outer Err(e);
+        }
+        let sym = match lit.decode_filled(br) {
+            Ok(s) => s,
+            Err(e) => break 'outer Err(e),
+        };
+        if sym < 256 {
+            // Literal hot path: raw pointer write, no Vec::push round-trip.
+            if cur == cap {
+                unsafe { chunk.bytes.set_len(cur); }
+                chunk.bytes.reserve(HEADROOM);
+                cap = chunk.bytes.capacity();
+                ptr = chunk.bytes.as_mut_ptr();
+            }
+            unsafe { *ptr.add(cur) = sym as u8; }
+            cur += 1;
+        } else if sym == 256 {
+            break 'outer Ok(());
+        } else if sym <= 285 {
+            let li = (sym - 257) as usize;
+            let mut length = LENGTH_BASE[li] as usize;
+            let extra = LENGTH_EXTRA[li];
+            if extra > 0 {
+                length += br.peek_bits_unchecked(extra as u32) as usize;
+                br.consume(extra as u32);
+            }
+            let dsym = match dist.decode_filled(br) {
+                Ok(s) => s,
+                Err(e) => {
+                    unsafe { chunk.bytes.set_len(cur); }
+                    break 'outer Err(e);
+                }
+            };
+            if dsym >= 30 {
+                unsafe { chunk.bytes.set_len(cur); }
+                break 'outer Err(DeflateError::Invalid("distance symbol out of range"));
+            }
+            let di = dsym as usize;
+            let mut distance = DISTANCE_BASE[di] as usize;
+            let dextra = DISTANCE_EXTRA[di];
+            if dextra > 0 {
+                distance += br.peek_bits_unchecked(dextra as u32) as usize;
+                br.consume(dextra as u32);
+            }
+            if distance == 0 || distance > 32 * 1024 {
+                unsafe { chunk.bytes.set_len(cur); }
+                break 'outer Err(DeflateError::Invalid("distance out of range"));
+            }
+            // Sync our local `cur` into chunk.bytes so emit_back_ref sees
+            // the correct length. emit_back_ref may also reserve, so we
+            // refresh the pointer / capacity afterward.
+            unsafe { chunk.bytes.set_len(cur); }
+            if let Err(e) = emit_back_ref(chunk, distance, length) {
+                cur = chunk.bytes.len();
+                break 'outer Err(e);
+            }
+            cur = chunk.bytes.len();
+            // Ensure we still have HEADROOM of slack for the next literal run.
+            if cap - cur < HEADROOM {
+                chunk.bytes.reserve(HEADROOM);
+                cap = chunk.bytes.capacity();
+            }
+            ptr = chunk.bytes.as_mut_ptr();
+        } else {
+            unsafe { chunk.bytes.set_len(cur); }
+            break 'outer Err(DeflateError::Invalid("literal/length symbol out of range"));
+        }
+    };
+
+    unsafe { chunk.bytes.set_len(cur); }
+    result
 }
 
 /// Emit `length` bytes of a back-reference at `distance` from current
@@ -336,6 +390,7 @@ fn decode_block(
 /// that copies from a placeholder would silently produce a zero byte, and
 /// the eventual marker resolution would never visit that target.
 #[inline]
+#[allow(unsafe_code)]
 fn emit_back_ref(
     chunk: &mut SpeculativeChunk,
     distance: usize,
@@ -376,8 +431,42 @@ fn emit_back_ref(
     // guaranteed marker-free. Markers live at positions <= max_marker_pos,
     // so if the FIRST source byte (the lowest position) is past it, none of
     // the source bytes are markers.
+    //
+    // Inlined 8-byte unrolled copy. `chunk.bytes.reserve(length)` above
+    // guarantees `cap >= cur + length`. `distance >= length` ⇒ src+length ≤
+    // cur, so loads from src..src+length never touch [cur, cur+length).
     if distance >= length && chunk.cannot_be_marker(src as u32) {
-        chunk.bytes.extend_from_within(src..src + length);
+        unsafe {
+            let buf = chunk.bytes.as_mut_ptr();
+            if length >= 8 {
+                let mut n = length;
+                let mut sp = buf.add(src);
+                let mut dp = buf.add(cur);
+                while n >= 8 {
+                    let v = std::ptr::read_unaligned(sp as *const u64);
+                    std::ptr::write_unaligned(dp as *mut u64, v);
+                    sp = sp.add(8);
+                    dp = dp.add(8);
+                    n -= 8;
+                }
+                if n > 0 {
+                    let v = std::ptr::read_unaligned(
+                        buf.add(src + length - 8) as *const u64,
+                    );
+                    std::ptr::write_unaligned(
+                        buf.add(cur + length - 8) as *mut u64,
+                        v,
+                    );
+                }
+            } else {
+                let mut i = 0;
+                while i < length {
+                    *buf.add(cur + i) = *buf.add(src + i);
+                    i += 1;
+                }
+            }
+            chunk.bytes.set_len(cur + length);
+        }
         return Ok(());
     }
 

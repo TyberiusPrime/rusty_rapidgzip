@@ -91,10 +91,14 @@ impl<'a> BitReader<'a> {
         (self.buf & mask) as u32
     }
 
-    /// Ensure `bits_in_buffer >= n`. `n <= MAX_READ_BITS` is required.
+    /// Ensure `bits_in_buffer >= n`. `n <= 56` is required — the fast-path
+    /// load needs ≤8 bits of headroom in the 64-bit buffer to avoid an
+    /// undefined shift when topping up. Callers that want to consume more
+    /// than `MAX_READ_BITS` in one go must do so via `peek_bits_unchecked` +
+    /// `consume`, not `read`/`peek`.
     #[inline]
     fn refill(&mut self, n: u32) -> Result<(), DeflateError> {
-        debug_assert!(n <= MAX_READ_BITS);
+        debug_assert!(n <= 56);
         if self.bits >= n {
             return Ok(());
         }

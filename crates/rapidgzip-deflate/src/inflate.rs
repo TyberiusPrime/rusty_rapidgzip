@@ -143,6 +143,7 @@ pub fn read_dynamic_header(
     Ok((lit, dist))
 }
 
+#[allow(unsafe_code)]
 fn decode_block(
     br: &mut BitReader<'_>,
     out: &mut Vec<u8>,
@@ -151,63 +152,162 @@ fn decode_block(
 ) -> Result<(), DeflateError> {
     // One refill per iteration: worst-case symbol consumes
     //   15 (lit) + 5 (length-extra) + 15 (dist) + 13 (dist-extra) = 48 bits.
-    // Buffer holds ≤64 bits, so 48 always fits; after `ensure_bits`,
-    // `decode_filled` and `peek_bits_unchecked` are safe within the iteration.
     const NEEDED: u32 = 48;
-    loop {
-        br.ensure_bits(NEEDED)?;
-        let sym = lit.decode_filled(br)?;
-        match sym {
-            0..=255 => out.push(sym as u8),
-            256 => return Ok(()),
-            257..=285 => {
-                let li = (sym - 257) as usize;
-                let mut length = LENGTH_BASE[li] as usize;
-                let extra = LENGTH_EXTRA[li];
-                if extra > 0 {
-                    length += br.peek_bits_unchecked(extra as u32) as usize;
-                    br.consume(extra as u32);
-                }
-                let dsym = dist.decode_filled(br)?;
-                if dsym >= 30 {
-                    return Err(DeflateError::Invalid("distance symbol out of range"));
-                }
-                let di = dsym as usize;
-                let mut distance = DISTANCE_BASE[di] as usize;
-                let dextra = DISTANCE_EXTRA[di];
-                if dextra > 0 {
-                    distance += br.peek_bits_unchecked(dextra as u32) as usize;
-                    br.consume(dextra as u32);
-                }
-                if distance == 0 || distance > out.len() {
-                    return Err(DeflateError::Invalid(
-                        "back-reference distance out of bounds",
-                    ));
-                }
-                if distance > MAX_DISTANCE {
-                    return Err(DeflateError::Invalid("distance > 32 KiB"));
-                }
-                copy_back(out, distance, length);
-            }
-            _ => return Err(DeflateError::Invalid("literal/length symbol out of range")),
-        }
+    // See speculative::decode_block for the rationale of the raw-pointer
+    // literal hot path. We keep HEADROOM of slack between `cur` and `cap`
+    // so the per-literal capacity check is amortized.
+    const HEADROOM: usize = 4096;
+    if out.capacity() - out.len() < HEADROOM {
+        out.reserve(HEADROOM);
     }
+    let mut cap = out.capacity();
+    let mut ptr = out.as_mut_ptr();
+    let mut cur = out.len();
+
+    let result: Result<(), DeflateError> = 'outer: loop {
+        if let Err(e) = br.ensure_bits(NEEDED) {
+            break 'outer Err(e);
+        }
+        let sym = match lit.decode_filled(br) {
+            Ok(s) => s,
+            Err(e) => break 'outer Err(e),
+        };
+        if sym < 256 {
+            if cur == cap {
+                unsafe { out.set_len(cur); }
+                out.reserve(HEADROOM);
+                cap = out.capacity();
+                ptr = out.as_mut_ptr();
+            }
+            unsafe { *ptr.add(cur) = sym as u8; }
+            cur += 1;
+        } else if sym == 256 {
+            break 'outer Ok(());
+        } else if sym <= 285 {
+            let li = (sym - 257) as usize;
+            let mut length = LENGTH_BASE[li] as usize;
+            let extra = LENGTH_EXTRA[li];
+            if extra > 0 {
+                length += br.peek_bits_unchecked(extra as u32) as usize;
+                br.consume(extra as u32);
+            }
+            let dsym = match dist.decode_filled(br) {
+                Ok(s) => s,
+                Err(e) => {
+                    unsafe { out.set_len(cur); }
+                    break 'outer Err(e);
+                }
+            };
+            if dsym >= 30 {
+                unsafe { out.set_len(cur); }
+                break 'outer Err(DeflateError::Invalid("distance symbol out of range"));
+            }
+            let di = dsym as usize;
+            let mut distance = DISTANCE_BASE[di] as usize;
+            let dextra = DISTANCE_EXTRA[di];
+            if dextra > 0 {
+                distance += br.peek_bits_unchecked(dextra as u32) as usize;
+                br.consume(dextra as u32);
+            }
+            if distance == 0 || distance > cur {
+                unsafe { out.set_len(cur); }
+                break 'outer Err(DeflateError::Invalid(
+                    "back-reference distance out of bounds",
+                ));
+            }
+            if distance > MAX_DISTANCE {
+                unsafe { out.set_len(cur); }
+                break 'outer Err(DeflateError::Invalid("distance > 32 KiB"));
+            }
+            unsafe { out.set_len(cur); }
+            copy_back(out, distance, length);
+            cur = out.len();
+            if cap - cur < HEADROOM {
+                out.reserve(HEADROOM);
+                cap = out.capacity();
+            }
+            ptr = out.as_mut_ptr();
+        } else {
+            unsafe { out.set_len(cur); }
+            break 'outer Err(DeflateError::Invalid("literal/length symbol out of range"));
+        }
+    };
+
+    unsafe { out.set_len(cur); }
+    result
 }
 
 /// Copy `length` bytes from position `out.len() - distance` to the end of
 /// `out`. Overlapping copies are well-defined here: each byte is read after
 /// it's written for the run-length-encoding case (`distance == 1`).
 #[inline]
+#[allow(unsafe_code)]
 fn copy_back(out: &mut Vec<u8>, distance: usize, length: usize) {
     out.reserve(length);
-    let start = out.len() - distance;
+    let cur = out.len();
+    let start = cur - distance;
+    // Hot path: non-overlapping copy. Inlined 8-byte unrolled load/store
+    // avoids the libc memmove call that dominates the profile on text-heavy
+    // inputs (matches are typically 5–30 bytes, where the call overhead
+    // alone is comparable to the copy itself).
     if distance >= length {
-        // Non-overlapping: do it as a single extend.
-        let src_end = start + length;
-        out.extend_from_within(start..src_end);
+        unsafe {
+            let buf = out.as_mut_ptr();
+            if length >= 8 {
+                let mut n = length;
+                let mut sp = buf.add(start);
+                let mut dp = buf.add(cur);
+                while n >= 8 {
+                    let v = std::ptr::read_unaligned(sp as *const u64);
+                    std::ptr::write_unaligned(dp as *mut u64, v);
+                    sp = sp.add(8);
+                    dp = dp.add(8);
+                    n -= 8;
+                }
+                if n > 0 {
+                    // Overlapping tail store: re-copy the last 8 bytes from
+                    // the end. Safe because length >= 8 and src is fully
+                    // disjoint from dst (distance >= length).
+                    let v = std::ptr::read_unaligned(
+                        buf.add(start + length - 8) as *const u64,
+                    );
+                    std::ptr::write_unaligned(
+                        buf.add(cur + length - 8) as *mut u64,
+                        v,
+                    );
+                }
+            } else {
+                let mut i = 0;
+                while i < length {
+                    *buf.add(cur + i) = *buf.add(start + i);
+                    i += 1;
+                }
+            }
+            out.set_len(cur + length);
+        }
+    } else if distance == 1 {
+        // RLE: broadcast the single source byte. Common in fastq quality runs.
+        unsafe {
+            let b = *out.as_ptr().add(start);
+            let bcast = (b as u64).wrapping_mul(0x0101_0101_0101_0101);
+            let buf = out.as_mut_ptr();
+            let mut n = length;
+            let mut dp = buf.add(cur);
+            while n >= 8 {
+                std::ptr::write_unaligned(dp as *mut u64, bcast);
+                dp = dp.add(8);
+                n -= 8;
+            }
+            while n > 0 {
+                *dp = b;
+                dp = dp.add(1);
+                n -= 1;
+            }
+            out.set_len(cur + length);
+        }
     } else {
-        // Overlap: byte-by-byte. distance < length means we read bytes that
-        // were just written. distance == 1 is the all-same-byte run.
+        // 2 <= distance < length: short RLE pattern. Byte-by-byte is fine
+        // here — these are uncommon and short.
         for i in 0..length {
             let b = out[start + i];
             out.push(b);

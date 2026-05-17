@@ -127,25 +127,16 @@ impl HuffmanDecoder {
             }
             bl_count[l as usize] += 1;
         }
-        // Length 0 doesn't count.
         bl_count[0] = 0;
 
-        // Validate the tree is exactly complete (Kraft inequality with equality).
-        // Single-symbol trees are a special case allowed by zlib (rare in practice).
+        // Validate Kraft. We accept complete trees, the empty tree, and
+        // (when !strict) incomplete trees such as the fixed distance tree.
+        // Oversubscribed trees are always rejected.
         let mut total = 0u64;
         for l in 1..=(MAX_CODE_LEN as usize) {
             total += (bl_count[l] as u64) << (MAX_CODE_LEN as usize - l);
         }
         let full = 1u64 << MAX_CODE_LEN;
-        // We accept three categories of trees:
-        //   - complete  (Kraft sum == full code space) — the usual case
-        //   - empty     (no codes assigned) — encoder's way of saying
-        //                 "no distances used in this block"
-        //   - incomplete (Kraft sum < full) — happens for the fixed distance
-        //                 tree (30 codes of length 5, 2 slots reserved) and
-        //                 occasionally for short blocks. Decoding will error
-        //                 at lookup time if a missing prefix is queried.
-        // Oversubscribed trees (Kraft sum > full) are always rejected.
         let n_symbols: u32 = bl_count[1..].iter().sum();
         if n_symbols >= 2 && total > full {
             return Err(DeflateError::Invalid("oversubscribed huffman tree"));
@@ -154,46 +145,83 @@ impl HuffmanDecoder {
             return Err(DeflateError::Invalid("incomplete huffman tree (strict)"));
         }
 
-        // Compute first-code-per-length per RFC 1951 §3.2.2.
-        let mut next_code = [0u32; (MAX_CODE_LEN + 2) as usize];
-        let mut code = 0u32;
-        for l in 1..=(MAX_CODE_LEN + 1) as usize {
-            code = (code + bl_count[l - 1]) << 1;
-            next_code[l] = code;
+        // Counting-sort symbols into per-length buckets. The literal/length
+        // tree has up to 288 symbols; distance up to 30; code-length 19.
+        debug_assert!(lengths.len() <= 288);
+        let mut bucket_offset = [0u32; (MAX_CODE_LEN + 2) as usize];
+        for l in 1..=(MAX_CODE_LEN as usize) {
+            bucket_offset[l + 1] = bucket_offset[l] + bl_count[l];
+        }
+        let mut sorted_syms = [0u16; 288];
+        let mut cursors = bucket_offset;
+        for (sym, &len) in lengths.iter().enumerate() {
+            let l = len as usize;
+            if l != 0 {
+                sorted_syms[cursors[l] as usize] = sym as u16;
+                cursors[l] += 1;
+            }
         }
 
-        // Assign codes in symbol order, just as RFC 1951 prescribes.
-        for (sym, &len_u8) in lengths.iter().enumerate() {
-            let len = len_u8 as u32;
-            if len == 0 {
-                continue;
-            }
-            let canonical = next_code[len as usize];
-            next_code[len as usize] += 1;
-            let reversed = bit_reverse(canonical, len);
-
+        // Emit codes in length-then-symbol order, maintaining the reversed
+        // canonical code incrementally. Incrementing the canonical code by 1
+        // at width L corresponds to a carry propagating from the MSB of the
+        // L-bit reversed value toward the LSB — no per-symbol bit_reverse.
+        // Transitioning from length L to L+1 (`next_code[L+1] = (next_code[L]
+        // + bl_count[L]) << 1`) corresponds to one extra advance plus a free
+        // width extension since the new high bit is always 0.
+        let mut rev: u32 = 0;
+        let mut start = 0usize;
+        for l in 1..=(MAX_CODE_LEN as usize) {
+            let count = bl_count[l] as usize;
+            let len_u8 = l as u8;
+            let len = l as u32;
+            let high_bit = 1u32 << (len - 1);
             if len <= LUT_BITS {
-                // Fill every index whose low `len` bits match.
                 let stride = 1usize << len;
-                let mut idx = reversed as usize;
-                while idx < LUT_SIZE {
-                    lut[idx] = Entry {
-                        symbol: sym as u16,
-                        length: len_u8,
-                    };
-                    idx += stride;
+                for i in 0..count {
+                    let sym = sorted_syms[start + i];
+                    let mut idx = rev as usize;
+                    while idx < LUT_SIZE {
+                        lut[idx] = Entry { symbol: sym, length: len_u8 };
+                        idx += stride;
+                    }
+                    if i + 1 < count {
+                        let mut bit = high_bit;
+                        while rev & bit != 0 {
+                            rev ^= bit;
+                            bit >>= 1;
+                        }
+                        rev |= bit;
+                    }
                 }
             } else {
-                long_codes.push(LongCode {
-                    reversed,
-                    length: len_u8,
-                    symbol: sym as u16,
-                });
+                for i in 0..count {
+                    let sym = sorted_syms[start + i];
+                    long_codes.push(LongCode { reversed: rev, length: len_u8, symbol: sym });
+                    if i + 1 < count {
+                        let mut bit = high_bit;
+                        while rev & bit != 0 {
+                            rev ^= bit;
+                            bit >>= 1;
+                        }
+                        rev |= bit;
+                    }
+                }
+            }
+            start += count;
+            // Transition to length L+1: one more rev-increment if any code
+            // was emitted at this length. Width extension is free (new high
+            // bit is 0).
+            if count > 0 {
+                let mut bit = high_bit;
+                while rev & bit != 0 {
+                    rev ^= bit;
+                    bit >>= 1;
+                }
+                rev |= bit;
             }
         }
-        // Sort by length ascending so the linear scan terminates on first match
-        // when codes form a prefix tree of the LUT_BITS-prefix bucket.
-        long_codes.sort_by_key(|c| c.length);
+        // long_codes are pushed in length-ascending order by construction.
 
         Ok(())
     }
