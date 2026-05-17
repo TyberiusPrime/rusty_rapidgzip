@@ -141,26 +141,31 @@ pub fn parallel_decode_member(
     let mut crc = crc32fast::Hasher::new();
     let mut final_end_bit: Option<u64> = None;
 
-    while next_id < num_chunks as u64 {
+    'outer: while next_id < num_chunks as u64 {
         // Drain any ready chunk in order.
         while let Some(mut res) = reorder.remove(&next_id) {
             // Resolve markers against the tail of all previously emitted bytes.
             resolve_markers(&mut res.chunk, &prev_tail).map_err(Error::Deflate)?;
             uncompressed += res.chunk.bytes.len() as u64;
             crc.update(&res.chunk.bytes);
-
-            // Update prev_tail to the last 32 KiB of (prev_tail ++ this chunk).
             update_tail(&mut prev_tail, &res.chunk.bytes);
 
-            // Hand the bytes to the sink.
+            let saw_final = res.final_block;
+            let end_bit_of_this = res.end_bit;
+
             if sink.send(res.chunk.bytes).is_err() {
-                // Receiver gone — fold up early.
                 return Ok((uncompressed, body.len()));
             }
-            if res.final_block {
-                final_end_bit = Some(res.end_bit);
-            }
             next_id += 1;
+
+            if saw_final {
+                // Member ends here. Don't process any later chunks — they
+                // belong to a subsequent gzip member (multi-stream case) or
+                // are post-EOS junk; either way they don't contribute to
+                // this member's CRC/ISIZE.
+                final_end_bit = Some(end_bit_of_this);
+                break 'outer;
+            }
         }
         if next_id >= num_chunks as u64 {
             break;
@@ -172,9 +177,14 @@ pub fn parallel_decode_member(
         reorder.insert(res.id, res);
     }
 
+    // Drain any remaining results so workers can exit cleanly. Errors from
+    // post-final-block chunks are expected (the bits they decoded weren't
+    // a valid deflate stream — they were the next member's header / trailer
+    // bytes interpreted as deflate) and are intentionally discarded.
+    drop(result_rx);
+
     // Wait for the dispatch and worker threads.
     let _ = dispatch.join();
-    drop(result_rx);
     for h in worker_handles {
         let _ = h.join();
     }
@@ -200,12 +210,17 @@ pub fn parallel_decode_member(
         return Err(Error::Gzip(crate::GzipError::CrcMismatch {
             expected: crc_expected,
             got: crc_got,
+            member: 0, // parallel path only handles member 0
+            uncompressed,
+            trailer_byte: trailer_byte as u64,
         }));
     }
     if (uncompressed & 0xFFFF_FFFF) as u32 != isize_expected {
         return Err(Error::Gzip(crate::GzipError::IsizeMismatch {
             expected: isize_expected,
             got: uncompressed,
+            member: 0,
+            trailer_byte: trailer_byte as u64,
         }));
     }
 
@@ -265,3 +280,211 @@ fn update_tail(prev_tail: &mut Vec<u8>, new_bytes: &[u8]) {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{read_gz, Config};
+    use crossbeam_channel::bounded;
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    /// Build a single gz member via the system `gzip`. Drains stdout on a
+    /// worker thread to avoid pipe-buffer deadlock for big payloads.
+    fn gz_encode(payload: &[u8], level: u32) -> Vec<u8> {
+        let mut child = Command::new("gzip")
+            .args([&format!("-{level}"), "-c", "-n"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn gzip");
+        let mut stdin = child.stdin.take().unwrap();
+        let payload = payload.to_vec();
+        let writer = std::thread::spawn(move || stdin.write_all(&payload).unwrap());
+        let out = child.wait_with_output().expect("wait gzip");
+        writer.join().unwrap();
+        out.stdout
+    }
+
+    fn decode_via_read_gz(path: &std::path::Path, cfg: Config) -> Vec<u8> {
+        let (tx, rx) = bounded::<Vec<u8>>(8);
+        let path = path.to_owned();
+        let producer = std::thread::spawn(move || read_gz(&path, tx, cfg));
+        let mut out = Vec::new();
+        for chunk in rx {
+            out.extend_from_slice(&chunk);
+        }
+        producer.join().expect("producer").expect("read_gz");
+        out
+    }
+
+    fn write_tmp(name: &str, data: &[u8]) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("rapidgzip_rs_test_{name}"));
+        std::fs::write(&path, data).unwrap();
+        path
+    }
+
+    fn ascii_payload(n: usize) -> Vec<u8> {
+        let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut p = Vec::with_capacity(n);
+        while p.len() < n {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            p.push(((s >> 56) as u8 % 95) + 32);
+        }
+        p
+    }
+
+    fn sha(data: &[u8]) -> String {
+        let mut h = Sha256::new();
+        h.update(data);
+        hex::encode(h.finalize())
+    }
+
+    /// Same payload, parallel and serial paths must produce identical output.
+    #[test]
+    fn parallel_matches_serial_large() {
+        let payload = ascii_payload(8 * 1024 * 1024);
+        let gz = gz_encode(&payload, 6);
+        let path = write_tmp("par_vs_serial.gz", &gz);
+        for threads in [1usize, 2, 4] {
+            let out = decode_via_read_gz(
+                &path,
+                Config { num_threads: threads, chunk_size_bytes: 1 << 20 },
+            );
+            assert_eq!(sha(&out), sha(&payload), "threads={threads}");
+        }
+    }
+
+    /// Multi-stream: 3 gzip members concatenated. Each member uses a
+    /// different payload so we'd notice if the boundary between members
+    /// were dropped or duplicated.
+    #[test]
+    fn multistream_three_members() {
+        let a = ascii_payload(100_000);
+        let b = ascii_payload(200_017);
+        let c = ascii_payload(50_003);
+        let mut gz = gz_encode(&a, 6);
+        gz.extend_from_slice(&gz_encode(&b, 6));
+        gz.extend_from_slice(&gz_encode(&c, 6));
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&a);
+        expected.extend_from_slice(&b);
+        expected.extend_from_slice(&c);
+        let path = write_tmp("multi3.gz", &gz);
+        let out = decode_via_read_gz(
+            &path,
+            Config { num_threads: 4, chunk_size_bytes: 64 * 1024 },
+        );
+        assert_eq!(sha(&out), sha(&expected));
+    }
+
+    /// Large multi-stream: first member is big enough to trigger
+    /// multiple-chunk parallel decode, second member exercises the
+    /// "stop at BFINAL, hand off to serial multi-stream loop" path.
+    #[test]
+    fn multistream_large_then_small() {
+        let big = ascii_payload(4 * 1024 * 1024);
+        let small = ascii_payload(1000);
+        let mut gz = gz_encode(&big, 6);
+        gz.extend_from_slice(&gz_encode(&small, 6));
+        let mut expected = big.clone();
+        expected.extend_from_slice(&small);
+        let path = write_tmp("multi_big_small.gz", &gz);
+        let out = decode_via_read_gz(
+            &path,
+            Config { num_threads: 4, chunk_size_bytes: 1 << 20 },
+        );
+        assert_eq!(sha(&out), sha(&expected));
+    }
+
+    /// Tiny file: smaller than chunk_size. Parallel pipeline must degrade
+    /// gracefully to a single chunk.
+    #[test]
+    fn tiny_file() {
+        let payload = b"hello, world\n";
+        let gz = gz_encode(payload, 6);
+        let path = write_tmp("tiny.gz", &gz);
+        let out = decode_via_read_gz(
+            &path,
+            Config { num_threads: 4, chunk_size_bytes: 1 << 20 },
+        );
+        assert_eq!(out, payload);
+    }
+
+    /// Cross-product of {payload sizes} × {chunk sizes} × {thread counts}.
+    /// Catches off-by-one issues where chunk boundary lands at member
+    /// boundary, single-chunk degenerate cases, and high-contention paths.
+    #[test]
+    fn matrix_sizes_chunks_threads() {
+        for &size in &[1024usize, 65_536, 250_000, 1_000_000, 5_000_000] {
+            let payload = ascii_payload(size);
+            let gz = gz_encode(&payload, 6);
+            let path = write_tmp(&format!("matrix_{size}.gz"), &gz);
+            for &cs in &[64 * 1024usize, 1 << 20, 4 << 20] {
+                for &nt in &[1usize, 4] {
+                    let out = decode_via_read_gz(
+                        &path,
+                        Config { num_threads: nt, chunk_size_bytes: cs },
+                    );
+                    assert_eq!(
+                        sha(&out), sha(&payload),
+                        "size={size} chunk={cs} threads={nt}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Stored blocks (level 1 on incompressible data) and dynamic blocks
+    /// interleaved: the boundary finder skips over stored blocks, so a
+    /// worker may decode several block types in a single chunk.
+    #[test]
+    fn mixed_block_types() {
+        let mut payload = ascii_payload(500_000);
+        let mut s: u64 = 0xABCDEF0123456789;
+        for _ in 0..(500_000 / 8) {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            payload.extend_from_slice(&s.to_le_bytes());
+        }
+        payload.extend_from_slice(&ascii_payload(500_000));
+        let gz = gz_encode(&payload, 1);
+        let path = write_tmp("mixed.gz", &gz);
+        let out = decode_via_read_gz(
+            &path,
+            Config { num_threads: 4, chunk_size_bytes: 256 * 1024 },
+        );
+        assert_eq!(sha(&out), sha(&payload));
+    }
+
+    /// Gzip levels 1..9 should all decode correctly. Different levels
+    /// produce different block shapes and Huffman trees.
+    #[test]
+    fn all_gzip_levels() {
+        let payload = ascii_payload(2 * 1024 * 1024);
+        for level in 1..=9u32 {
+            let gz = gz_encode(&payload, level);
+            let path = write_tmp(&format!("level_{level}.gz"), &gz);
+            let out = decode_via_read_gz(
+                &path,
+                Config { num_threads: 4, chunk_size_bytes: 512 * 1024 },
+            );
+            assert_eq!(sha(&out), sha(&payload), "level={level}");
+        }
+    }
+
+    #[test]
+    fn update_tail_keeps_last_32k() {
+        let mut prev = Vec::new();
+        update_tail(&mut prev, &[1u8; 1000]);
+        assert_eq!(prev.len(), 1000);
+        update_tail(&mut prev, &[2u8; 50_000]);
+        assert_eq!(prev.len(), 32 * 1024);
+        assert!(prev.iter().all(|&b| b == 2));
+        let mut prev = vec![9u8; 30_000];
+        update_tail(&mut prev, &[7u8; 5_000]);
+        assert_eq!(prev.len(), 32 * 1024);
+        // Last 5000 bytes should be 7s.
+        assert!(prev[32 * 1024 - 5_000..].iter().all(|&b| b == 7));
+    }
+}

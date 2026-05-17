@@ -33,10 +33,30 @@ pub enum GzipError {
     ReservedFlags(u8),
     #[error("truncated gzip stream")]
     Truncated,
-    #[error("CRC32 mismatch: expected {expected:#x}, got {got:#x}")]
-    CrcMismatch { expected: u32, got: u32 },
-    #[error("ISIZE mismatch: expected {expected}, got {got}")]
-    IsizeMismatch { expected: u32, got: u64 },
+    #[error(
+        "CRC32 mismatch in member #{member} (uncompressed bytes: {uncompressed}, \
+         trailer at byte {trailer_byte}): expected {expected:#010x}, got {got:#010x}"
+    )]
+    CrcMismatch {
+        expected: u32,
+        got: u32,
+        /// 0-based index of the gzip member (most files have just one).
+        member: u32,
+        /// Total uncompressed bytes in this member.
+        uncompressed: u64,
+        /// Byte offset of the trailer in the input file.
+        trailer_byte: u64,
+    },
+    #[error(
+        "ISIZE mismatch in member #{member} (trailer at byte {trailer_byte}): \
+         expected {expected}, got {got}"
+    )]
+    IsizeMismatch {
+        expected: u32,
+        got: u64,
+        member: u32,
+        trailer_byte: u64,
+    },
     #[error("deflate: {0}")]
     Deflate(#[from] DeflateError),
 }
@@ -46,11 +66,13 @@ pub enum GzipError {
 pub fn decode_all(input: &[u8], out: &mut Vec<u8>) -> Result<u64, GzipError> {
     let mut pos = 0usize;
     let mut total = 0u64;
+    let mut member = 0u32;
     while pos < input.len() {
         let start_len = out.len();
-        let consumed = decode_one(&input[pos..], out)?;
+        let consumed = decode_one_indexed(&input[pos..], out, member)?;
         total += (out.len() - start_len) as u64;
         pos += consumed;
+        member += 1;
     }
     Ok(total)
 }
@@ -58,6 +80,16 @@ pub fn decode_all(input: &[u8], out: &mut Vec<u8>) -> Result<u64, GzipError> {
 /// Decode a single gzip member starting at `input[0]`. Appends decompressed
 /// bytes to `out`, returns the number of input bytes consumed.
 pub fn decode_one(input: &[u8], out: &mut Vec<u8>) -> Result<usize, GzipError> {
+    decode_one_indexed(input, out, 0)
+}
+
+/// Same as [`decode_one`] but stamps `member` index into error messages so
+/// multi-stream callers can pinpoint which member failed.
+pub fn decode_one_indexed(
+    input: &[u8],
+    out: &mut Vec<u8>,
+    member: u32,
+) -> Result<usize, GzipError> {
     let header_len = parse_header(input)?;
     let body_start = header_len;
 
@@ -88,6 +120,9 @@ pub fn decode_one(input: &[u8], out: &mut Vec<u8>) -> Result<usize, GzipError> {
         return Err(GzipError::CrcMismatch {
             expected: crc_expected,
             got: crc_got,
+            member,
+            uncompressed: decoded.len() as u64,
+            trailer_byte: trailer_start as u64,
         });
     }
     let isize_got = decoded.len() as u64;
@@ -95,6 +130,8 @@ pub fn decode_one(input: &[u8], out: &mut Vec<u8>) -> Result<usize, GzipError> {
         return Err(GzipError::IsizeMismatch {
             expected: isize_expected,
             got: isize_got,
+            member,
+            trailer_byte: trailer_start as u64,
         });
     }
 

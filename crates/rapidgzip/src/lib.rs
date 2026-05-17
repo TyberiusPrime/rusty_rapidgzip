@@ -89,12 +89,14 @@ pub fn read_gz(
     // Multi-stream: serially decode any remaining members. This keeps the
     // hot path (the giant first member) parallel while still handling
     // concatenated gzip files correctly.
+    let mut member: u32 = 1;
     while pos < bytes.len() {
         let mut decoded = Vec::new();
-        let consumed = decode_one(&bytes[pos..], &mut decoded)?;
+        let consumed = gzip::decode_one_indexed(&bytes[pos..], &mut decoded, member)?;
         total_uncompressed += decoded.len() as u64;
         send_in_chunks(&sink, &decoded, &mut chunks_sent);
         pos += consumed;
+        member += 1;
     }
 
     drop(sink);

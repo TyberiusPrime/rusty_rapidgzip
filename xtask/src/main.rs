@@ -117,6 +117,50 @@ fn build_corpus(dir: &Path, big: bool) -> Result<()> {
     // Fixed-Huffman block — small enough that gzip picks it.
     write_gz(dir, "fixed_small.gz", b"aaaaaaaaaa", 9)?;
 
+    // Large multi-stream: two big random payloads concatenated. This is the
+    // shape of files produced by pigz / parallel-gzip pipelines. Exercises
+    // the parallel pipeline's "stop at BFINAL, discard later chunks" path.
+    {
+        let payload_a = deterministic_ascii(8 * 1024 * 1024);
+        let payload_b = deterministic_ascii(8 * 1024 * 1024 + 999);
+        let mut combined = gz_encode(&payload_a, 6)?;
+        combined.extend_from_slice(&gz_encode(&payload_b, 6)?);
+        let path = dir.join("multistream_8m_x2.gz");
+        fs::write(&path, &combined)?;
+        let mut h = Sha256::new();
+        h.update(&payload_a);
+        h.update(&payload_b);
+        let digest = hex::encode(h.finalize());
+        fs::write(path.with_extension("gz.sha256"), digest)?;
+        println!("built {}", path.display());
+    }
+
+    // Many small members (10×): worst-case shape for parallel — first
+    // member is small enough that parallel decode barely benefits, and
+    // every subsequent member falls through to the serial multi-stream path.
+    {
+        let mut combined = Vec::new();
+        let mut h = Sha256::new();
+        for i in 0..10u32 {
+            let payload = deterministic_ascii(50_000 + (i * 137) as usize);
+            combined.extend_from_slice(&gz_encode(&payload, 6)?);
+            h.update(&payload);
+        }
+        let path = dir.join("multistream_many.gz");
+        fs::write(&path, &combined)?;
+        fs::write(path.with_extension("gz.sha256"), hex::encode(h.finalize()))?;
+        println!("built {}", path.display());
+    }
+
+    // Big single-member with random-base64 content (resembles real-world
+    // bioinformatics / text payloads that don't compress well). Hits many
+    // dynamic blocks → many boundary-finder calls → exercises false-positive
+    // rejection in the verifier.
+    {
+        let payload = deterministic_base64(32 * 1024 * 1024);
+        write_gz(dir, "base64_32m.gz", &payload, 6)?;
+    }
+
     if big {
         // Tier 2: heavy fixtures.
         write_gz(
