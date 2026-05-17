@@ -9,6 +9,7 @@
 //! into that same buffer — so the caller controls memory: trim it
 //! periodically if streaming long files.
 
+use crate::huffman::{HUFFDEC_EXCEPTIONAL, HUFFDEC_LITERAL};
 use crate::tables::*;
 use crate::{BitReader, DeflateError, HuffmanDecoder};
 
@@ -57,7 +58,7 @@ fn inflate_stored(br: &mut BitReader<'_>, out: &mut Vec<u8>) -> Result<(), Defla
 }
 
 fn inflate_fixed(br: &mut BitReader<'_>, out: &mut Vec<u8>) -> Result<(), DeflateError> {
-    let lit = HuffmanDecoder::from_lengths(&fixed_literal_lengths())?;
+    let lit = HuffmanDecoder::from_lengths_litlen(&fixed_literal_lengths())?;
     let dist = HuffmanDecoder::from_lengths(&fixed_distance_lengths())?;
     decode_block(br, out, &lit, &dist)
 }
@@ -138,7 +139,7 @@ pub fn read_dynamic_header(
         return Err(DeflateError::Invalid("EOB symbol has zero length"));
     }
 
-    let lit = HuffmanDecoder::from_lengths(&lengths[..hlit])?;
+    let lit = HuffmanDecoder::from_lengths_litlen(&lengths[..hlit])?;
     let dist = HuffmanDecoder::from_lengths(&lengths[hlit..])?;
     Ok((lit, dist))
 }
@@ -168,28 +169,32 @@ fn decode_block(
         if let Err(e) = br.ensure_bits(NEEDED) {
             break 'outer Err(e);
         }
-        let sym = match lit.decode_filled(br) {
-            Ok(s) => s,
+        let entry = match lit.lookup_filled(br) {
+            Ok(e) => e,
             Err(e) => break 'outer Err(e),
         };
-        if sym < 256 {
+        if entry & HUFFDEC_LITERAL != 0 {
             if cur == cap {
                 unsafe { out.set_len(cur); }
                 out.reserve(HEADROOM);
                 cap = out.capacity();
                 ptr = out.as_mut_ptr();
             }
-            unsafe { *ptr.add(cur) = sym as u8; }
+            unsafe { *ptr.add(cur) = (entry >> 16) as u8; }
             cur += 1;
-        } else if sym == 256 {
-            break 'outer Ok(());
-        } else if sym <= 285 {
-            let li = (sym - 257) as usize;
-            let mut length = LENGTH_BASE[li] as usize;
-            let extra = LENGTH_EXTRA[li];
+        } else if entry & HUFFDEC_EXCEPTIONAL != 0 {
+            if entry >> 16 == 0 {
+                break 'outer Ok(()); // EOB (sym 256)
+            }
+            unsafe { out.set_len(cur); }
+            break 'outer Err(DeflateError::Invalid("literal/length symbol out of range"));
+        } else {
+            let length_base = ((entry >> 16) & 0x1ff) as usize;
+            let extra = ((entry >> 8) & 0x1f) as u32;
+            let mut length = length_base;
             if extra > 0 {
-                length += br.peek_bits_unchecked(extra as u32) as usize;
-                br.consume(extra as u32);
+                length += br.peek_bits_unchecked(extra) as usize;
+                br.consume(extra);
             }
             let dsym = match dist.decode_filled(br) {
                 Ok(s) => s,
@@ -227,9 +232,6 @@ fn decode_block(
                 cap = out.capacity();
             }
             ptr = out.as_mut_ptr();
-        } else {
-            unsafe { out.set_len(cur); }
-            break 'outer Err(DeflateError::Invalid("literal/length symbol out of range"));
         }
     };
 

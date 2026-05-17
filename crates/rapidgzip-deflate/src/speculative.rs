@@ -35,16 +35,15 @@
 //! `O(32 KiB / mean_match_distance)` per chunk. After ~32 KiB of decoded
 //! output, every back-reference lands in-chunk and stops producing markers.
 
-use crate::tables::{
-    DISTANCE_BASE, DISTANCE_EXTRA, LENGTH_BASE, LENGTH_EXTRA,
-};
+use crate::huffman::{HUFFDEC_EXCEPTIONAL, HUFFDEC_LITERAL};
+use crate::tables::{DISTANCE_BASE, DISTANCE_EXTRA};
 use std::sync::LazyLock;
 
 use crate::{tables, BitReader, DeflateError, HuffmanDecoder};
 
 /// Fixed Huffman trees (RFC 1951 §3.2.6) never change. Build them once.
 static FIXED_LIT: LazyLock<HuffmanDecoder> = LazyLock::new(|| {
-    HuffmanDecoder::from_lengths(&tables::fixed_literal_lengths())
+    HuffmanDecoder::from_lengths_litlen(&tables::fixed_literal_lengths())
         .expect("fixed literal tree is well-formed")
 });
 static FIXED_DIST: LazyLock<HuffmanDecoder> = LazyLock::new(|| {
@@ -272,7 +271,7 @@ fn inflate_dynamic(
             _ => return Err(DeflateError::Invalid("bad code-length symbol")),
         }
     }
-    pool.lit.rebuild_from_lengths(&pool.lengths[..hlit], false)?;
+    pool.lit.rebuild_from_lengths_litlen(&pool.lengths[..hlit])?;
     pool.dist.rebuild_from_lengths(&pool.lengths[hlit..], false)?;
     let result = decode_block(br, chunk, &pool.lit, &pool.dist);
     chunk.decoder_pool = Some(pool);
@@ -306,11 +305,11 @@ fn decode_block(
         if let Err(e) = br.ensure_bits(NEEDED) {
             break 'outer Err(e);
         }
-        let sym = match lit.decode_filled(br) {
-            Ok(s) => s,
+        let entry = match lit.lookup_filled(br) {
+            Ok(e) => e,
             Err(e) => break 'outer Err(e),
         };
-        if sym < 256 {
+        if entry & HUFFDEC_LITERAL != 0 {
             // Literal hot path: raw pointer write, no Vec::push round-trip.
             if cur == cap {
                 unsafe { chunk.bytes.set_len(cur); }
@@ -318,17 +317,21 @@ fn decode_block(
                 cap = chunk.bytes.capacity();
                 ptr = chunk.bytes.as_mut_ptr();
             }
-            unsafe { *ptr.add(cur) = sym as u8; }
+            unsafe { *ptr.add(cur) = (entry >> 16) as u8; }
             cur += 1;
-        } else if sym == 256 {
-            break 'outer Ok(());
-        } else if sym <= 285 {
-            let li = (sym - 257) as usize;
-            let mut length = LENGTH_BASE[li] as usize;
-            let extra = LENGTH_EXTRA[li];
+        } else if entry & HUFFDEC_EXCEPTIONAL != 0 {
+            if entry >> 16 == 0 {
+                break 'outer Ok(()); // EOB (sym 256)
+            }
+            unsafe { chunk.bytes.set_len(cur); }
+            break 'outer Err(DeflateError::Invalid("literal/length symbol out of range"));
+        } else {
+            let length_base = ((entry >> 16) & 0x1ff) as usize;
+            let extra = ((entry >> 8) & 0x1f) as u32;
+            let mut length = length_base;
             if extra > 0 {
-                length += br.peek_bits_unchecked(extra as u32) as usize;
-                br.consume(extra as u32);
+                length += br.peek_bits_unchecked(extra) as usize;
+                br.consume(extra);
             }
             let dsym = match dist.decode_filled(br) {
                 Ok(s) => s,
@@ -367,9 +370,6 @@ fn decode_block(
                 cap = chunk.bytes.capacity();
             }
             ptr = chunk.bytes.as_mut_ptr();
-        } else {
-            unsafe { chunk.bytes.set_len(cur); }
-            break 'outer Err(DeflateError::Invalid("literal/length symbol out of range"));
         }
     };
 

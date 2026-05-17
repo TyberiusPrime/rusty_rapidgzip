@@ -1,125 +1,178 @@
-//! Canonical Huffman decoder for DEFLATE.
+//! Canonical Huffman decoder for DEFLATE, libdeflate-style packed entries.
 //!
 //! ## Bit ordering
 //!
-//! DEFLATE writes Huffman codes MSB-first: the first bit of the code is the
-//! highest-order bit. Our [`BitReader`] reads LSB-first. So when we read
-//! `L` bits from the stream, we get the **bit-reversed** code. The cleanest
-//! way to handle that is to build the LUT keyed by the bits-as-read (i.e.
-//! by the reversed code).
+//! DEFLATE writes Huffman codes MSB-first; our [`BitReader`] reads LSB-first.
+//! So when we read `L` bits from the stream we get the **bit-reversed** code,
+//! and we key the LUT by the reversed code.
 //!
-//! ## LUT layout
+//! ## Packed entry layout (`u32`)
 //!
-//! Indexed by `peek(LUT_BITS)`. Each entry is a [`Entry`] packing
-//! `(symbol, length)`. For codes shorter than `LUT_BITS`, every index whose
-//! low `length` bits equal the reversed code maps to the same symbol — that
-//! is, we store the entry at `(prefix << length) | reversed_code` for every
-//! `prefix`.
+//! Each LUT slot is a single `u32`. The **low byte** is the codeword length
+//! (i.e. how many bits the decoder must consume). That makes the post-decode
+//! step a single masked `br.consume(entry & 0xff)`.
 //!
-//! Codes longer than `LUT_BITS` are uncommon in DEFLATE (the literal/length
-//! tree max length is 15, the LUT is 10). For those we fall back to a small
-//! linear scan over the long-code table — a clean port target for Phase 5
-//! is to upgrade this to chained subtables if benchmarks demand it.
+//! Two encodings share the same physical layout; the caller picks which to
+//! build and which extractor to use:
+//!
+//! **`Simple`** (used for the precode and distance trees, and by the block
+//! finder's strict-verify path):
+//!
+//! ```text
+//!   bits 31..16: symbol value
+//!   bits 7..0:   codeword length
+//! ```
+//!
+//! Extract via [`HuffmanDecoder::decode`] / [`HuffmanDecoder::decode_filled`]
+//! — both return the `u16` symbol.
+//!
+//! **`LitLen`** (used for the literal/length tree, the hot path):
+//!
+//! ```text
+//!   Literal (sym 0..=255):
+//!     bit 31:      HUFFDEC_LITERAL (1)
+//!     bits 23..16: literal byte
+//!     bits 7..0:   codeword length
+//!
+//!   End-of-block (sym == 256):
+//!     bit 15:     HUFFDEC_EXCEPTIONAL (1)
+//!     bits 7..0:  codeword length
+//!
+//!   Length (sym 257..=285):
+//!     bits 24..16: length base value (3..=258, fits in 9 bits)
+//!     bits 12..8:  length-extra bit count (0..=5)
+//!     bits 7..0:   codeword length
+//! ```
+//!
+//! Extract via [`HuffmanDecoder::lookup_filled`], which returns the raw
+//! packed entry. The caller dispatches on the flag bits:
+//! `entry & HUFFDEC_LITERAL`, `entry & HUFFDEC_EXCEPTIONAL`, otherwise it is
+//! a length code with base/extra pre-baked into the entry.
+//!
+//! ## Long codes
+//!
+//! Codes longer than `LUT_BITS` go into a `long_codes` table with a small
+//! linear scan. libdeflate uses a chained subtable here — a follow-on phase
+//! can swap that in if profiles ever show it mattering (currently ~0.1%).
 
+use crate::tables::{LENGTH_BASE, LENGTH_EXTRA};
 use crate::{BitReader, DeflateError};
 
-/// LUT prefix length. 12 bits → 4096-entry LUT (~16 KiB), fits comfortably
-/// in L1d. Profile on a real bgzf workload shows `decode` dominates (~47%);
-/// going from 10 → 12 cuts the long-code fallback rate and shaves a peek
-/// of MAX_CODE_LEN bits in the common case. Revisit if cache pressure shows
-/// up under heavier multi-decoder mixes.
+/// LUT prefix length. 10 bits → 1024-entry × 4 B = 4 KiB LUT. Comfortable in
+/// L1d and the rebuild cost stays modest. 11 was tried and regressed because
+/// the doubled rebuild cost outweighed the long-code-fallback savings.
 pub const LUT_BITS: u32 = 10;
 const LUT_SIZE: usize = 1 << LUT_BITS;
 
 /// Maximum Huffman code length permitted by DEFLATE.
 pub const MAX_CODE_LEN: u32 = 15;
 
-/// Packed table entry.
-///
-/// - `length == 0`            → invalid (no code at that prefix)
-/// - `length <= LUT_BITS`     → direct hit; symbol is the decoded value
-/// - `length >  LUT_BITS`     → unused (this LUT only stores ≤ LUT_BITS;
-///                              longer codes go in `long_codes`)
-#[derive(Debug, Clone, Copy, Default)]
-struct Entry {
-    symbol: u16,
-    length: u8,
+// Packed-entry flag bits.
+pub const HUFFDEC_LITERAL: u32 = 1 << 31;
+pub const HUFFDEC_EXCEPTIONAL: u32 = 1 << 15;
+/// Reserved for the future chained-subtable encoding (Phase B).
+#[allow(dead_code)]
+pub const HUFFDEC_SUBTABLE_POINTER: u32 = 1 << 14;
+/// Low-byte mask: codeword length to consume.
+const LENGTH_MASK: u32 = 0xff;
+
+/// Which encoding the entries use. Affects only `build_into`; the decoder
+/// methods are encoding-agnostic except for which extractor the caller picks.
+#[derive(Debug, Clone, Copy)]
+pub enum Encoding {
+    Simple,
+    LitLen,
 }
 
-/// A `(reversed_bits, length, symbol)` triple for the long-code fallback.
 #[derive(Debug, Clone, Copy)]
 struct LongCode {
     reversed: u32,
     length: u8,
-    symbol: u16,
+    /// Packed entry to return on hit. Same layout as the LUT entries.
+    entry: u32,
 }
 
 #[derive(Debug)]
 pub struct HuffmanDecoder {
-    lut: Vec<Entry>,
-    /// Codes longer than LUT_BITS, sorted by length ascending. Linear scan
-    /// is fine — there are typically only a handful per tree.
+    lut: Vec<u32>,
     long_codes: Vec<LongCode>,
 }
 
 impl HuffmanDecoder {
-    /// Build a decoder from a vector of bit-lengths. `lengths[s] = 0` means
-    /// symbol `s` is not present in this tree. Accepts incomplete trees
-    /// (Kraft sum < full code space) — see comment in the body.
+    /// Build a `Simple`-encoded decoder. Accepts incomplete trees.
     pub fn from_lengths(lengths: &[u8]) -> Result<Self, DeflateError> {
         let mut out = Self::new_empty();
         out.rebuild_from_lengths(lengths, false)?;
         Ok(out)
     }
 
-    /// Strict variant: also reject incomplete trees with ≥2 symbols. Used by
-    /// the block finder, where an incomplete tree is a strong signal that
-    /// the candidate offset is a false positive (random bits parsing as a
-    /// header). Real DEFLATE encoders produce complete trees.
+    /// Strict `Simple` variant: rejects incomplete trees with ≥2 symbols.
+    /// Used by the block finder to reject false-positive candidate offsets.
     pub fn from_lengths_strict(lengths: &[u8]) -> Result<Self, DeflateError> {
         let mut out = Self::new_empty();
         out.rebuild_from_lengths(lengths, true)?;
         Ok(out)
     }
 
-    /// Allocate a decoder with empty buffers, ready to be reused via
-    /// [`Self::rebuild_from_lengths`]. The hot path allocates two of these
-    /// per worker and rebuilds them once per dynamic block, avoiding the
-    /// 1024-entry LUT allocation that would otherwise dominate decode time.
+    /// Build a `LitLen`-encoded decoder for the literal/length tree.
+    pub fn from_lengths_litlen(lengths: &[u8]) -> Result<Self, DeflateError> {
+        let mut out = Self::new_empty();
+        out.rebuild_from_lengths_litlen(lengths)?;
+        Ok(out)
+    }
+
+    /// Empty decoder, ready to be filled in place. Each worker keeps one of
+    /// these per role (literal / distance / precode) and rebuilds them once
+    /// per dynamic block — see the `DecoderPool` in `speculative.rs`.
     pub fn new_empty() -> Self {
         Self {
-            lut: vec![Entry::default(); LUT_SIZE],
+            lut: vec![0u32; LUT_SIZE],
             long_codes: Vec::new(),
         }
     }
 
-    /// Rebuild this decoder's tables in place from the given code-lengths.
-    /// Preserves the LUT allocation so successive dynamic blocks don't
-    /// re-pay the 8 KiB-per-tree allocation cost.
     pub fn rebuild_from_lengths(
         &mut self,
         lengths: &[u8],
         strict: bool,
     ) -> Result<(), DeflateError> {
-        Self::build_into(&mut self.lut, &mut self.long_codes, lengths, strict)
+        Self::build_into(
+            &mut self.lut,
+            &mut self.long_codes,
+            lengths,
+            strict,
+            Encoding::Simple,
+        )
+    }
+
+    pub fn rebuild_from_lengths_litlen(
+        &mut self,
+        lengths: &[u8],
+    ) -> Result<(), DeflateError> {
+        Self::build_into(
+            &mut self.lut,
+            &mut self.long_codes,
+            lengths,
+            false,
+            Encoding::LitLen,
+        )
     }
 
     fn build_into(
-        lut: &mut Vec<Entry>,
+        lut: &mut Vec<u32>,
         long_codes: &mut Vec<LongCode>,
         lengths: &[u8],
         strict: bool,
+        encoding: Encoding,
     ) -> Result<(), DeflateError> {
-        // Reuse buffers: clear entries in place rather than reallocating.
         if lut.len() != LUT_SIZE {
-            lut.resize(LUT_SIZE, Entry::default());
+            lut.resize(LUT_SIZE, 0);
         }
         for e in lut.iter_mut() {
-            *e = Entry::default();
+            *e = 0;
         }
         long_codes.clear();
 
-        // Count codes per length.
         let mut bl_count = [0u32; (MAX_CODE_LEN + 1) as usize];
         for &l in lengths {
             if l as u32 > MAX_CODE_LEN {
@@ -129,9 +182,6 @@ impl HuffmanDecoder {
         }
         bl_count[0] = 0;
 
-        // Validate Kraft. We accept complete trees, the empty tree, and
-        // (when !strict) incomplete trees such as the fixed distance tree.
-        // Oversubscribed trees are always rejected.
         let mut total = 0u64;
         for l in 1..=(MAX_CODE_LEN as usize) {
             total += (bl_count[l] as u64) << (MAX_CODE_LEN as usize - l);
@@ -145,8 +195,7 @@ impl HuffmanDecoder {
             return Err(DeflateError::Invalid("incomplete huffman tree (strict)"));
         }
 
-        // Counting-sort symbols into per-length buckets. The literal/length
-        // tree has up to 288 symbols; distance up to 30; code-length 19.
+        // Counting-sort symbols by length. Max alphabet is 288 (literal/length).
         debug_assert!(lengths.len() <= 288);
         let mut bucket_offset = [0u32; (MAX_CODE_LEN + 2) as usize];
         for l in 1..=(MAX_CODE_LEN as usize) {
@@ -162,13 +211,9 @@ impl HuffmanDecoder {
             }
         }
 
-        // Emit codes in length-then-symbol order, maintaining the reversed
-        // canonical code incrementally. Incrementing the canonical code by 1
-        // at width L corresponds to a carry propagating from the MSB of the
-        // L-bit reversed value toward the LSB — no per-symbol bit_reverse.
-        // Transitioning from length L to L+1 (`next_code[L+1] = (next_code[L]
-        // + bl_count[L]) << 1`) corresponds to one extra advance plus a free
-        // width extension since the new high bit is always 0.
+        // Emit codes in length-then-symbol order; maintain the reversed
+        // canonical code incrementally (see prior comment in git history for
+        // the carry-from-MSB derivation).
         let mut rev: u32 = 0;
         let mut start = 0usize;
         for l in 1..=(MAX_CODE_LEN as usize) {
@@ -180,9 +225,10 @@ impl HuffmanDecoder {
                 let stride = 1usize << len;
                 for i in 0..count {
                     let sym = sorted_syms[start + i];
+                    let entry = encode_entry(sym, len_u8, encoding);
                     let mut idx = rev as usize;
                     while idx < LUT_SIZE {
-                        lut[idx] = Entry { symbol: sym, length: len_u8 };
+                        lut[idx] = entry;
                         idx += stride;
                     }
                     if i + 1 < count {
@@ -197,7 +243,12 @@ impl HuffmanDecoder {
             } else {
                 for i in 0..count {
                     let sym = sorted_syms[start + i];
-                    long_codes.push(LongCode { reversed: rev, length: len_u8, symbol: sym });
+                    let entry = encode_entry(sym, len_u8, encoding);
+                    long_codes.push(LongCode {
+                        reversed: rev,
+                        length: len_u8,
+                        entry,
+                    });
                     if i + 1 < count {
                         let mut bit = high_bit;
                         while rev & bit != 0 {
@@ -209,9 +260,6 @@ impl HuffmanDecoder {
                 }
             }
             start += count;
-            // Transition to length L+1: one more rev-increment if any code
-            // was emitted at this length. Width extension is free (new high
-            // bit is 0).
             if count > 0 {
                 let mut bit = high_bit;
                 while rev & bit != 0 {
@@ -221,56 +269,95 @@ impl HuffmanDecoder {
                 rev |= bit;
             }
         }
-        // long_codes are pushed in length-ascending order by construction.
 
         Ok(())
     }
 
-    /// Decode the next symbol from `br`.
+    /// Simple-encoded decode. Returns the symbol value. Refills as needed.
     #[inline]
     pub fn decode(&self, br: &mut BitReader<'_>) -> Result<u16, DeflateError> {
-        let peeked = br.peek(LUT_BITS)?;
-        let entry = self.lut[peeked as usize];
-        if entry.length != 0 {
-            br.consume(entry.length as u32);
-            return Ok(entry.symbol);
-        }
-        self.decode_long(br)
+        let entry = self.lookup(br)?;
+        Ok((entry >> 16) as u16)
     }
 
-    /// Decode the next symbol assuming the caller has already ensured the
-    /// buffer has ≥ `MAX_CODE_LEN` bits. Skips the refill-and-Result of
-    /// [`Self::decode`] in the hot path — the inner inflate loop calls
-    /// `ensure_bits` once per iteration and then decodes multiple symbols
-    /// without further checks. Long-code fallback path peeks normally (rare).
+    /// Simple-encoded decode assuming the buffer already holds enough bits
+    /// (caller did `ensure_bits` once outside the inner loop).
     #[inline]
     pub fn decode_filled(&self, br: &mut BitReader<'_>) -> Result<u16, DeflateError> {
+        let entry = self.lookup_filled(br)?;
+        Ok((entry >> 16) as u16)
+    }
+
+    /// Return the raw packed entry. For the litlen hot path the caller
+    /// dispatches on the flag bits directly without re-extracting the symbol.
+    /// Caller must have ensured the buffer holds ≥ `MAX_CODE_LEN` bits.
+    #[inline]
+    pub fn lookup_filled(&self, br: &mut BitReader<'_>) -> Result<u32, DeflateError> {
         let peeked = br.peek_bits_unchecked(LUT_BITS);
         let entry = self.lut[peeked as usize];
-        if entry.length != 0 {
-            br.consume(entry.length as u32);
-            return Ok(entry.symbol);
+        let length = entry & LENGTH_MASK;
+        if length == 0 {
+            return self.lookup_long(br);
         }
-        self.decode_long(br)
+        br.consume(length);
+        Ok(entry)
+    }
+
+    #[inline]
+    fn lookup(&self, br: &mut BitReader<'_>) -> Result<u32, DeflateError> {
+        let peeked = br.peek(LUT_BITS)?;
+        let entry = self.lut[peeked as usize];
+        let length = entry & LENGTH_MASK;
+        if length == 0 {
+            return self.lookup_long(br);
+        }
+        br.consume(length);
+        Ok(entry)
     }
 
     #[cold]
-    fn decode_long(&self, br: &mut BitReader<'_>) -> Result<u16, DeflateError> {
-        // Need up to MAX_CODE_LEN bits; peek that many.
+    fn lookup_long(&self, br: &mut BitReader<'_>) -> Result<u32, DeflateError> {
         let bits = br.peek(MAX_CODE_LEN)?;
         for c in &self.long_codes {
             let mask = (1u32 << c.length) - 1;
             if (bits & mask) == c.reversed {
                 br.consume(c.length as u32);
-                return Ok(c.symbol);
+                return Ok(c.entry);
             }
         }
         Err(DeflateError::Invalid("no matching huffman code"))
     }
 }
 
-/// Reverse the low `len` bits of `v`. Used to convert RFC-1951 canonical
-/// codes (MSB-first on the wire) into LSB-first form for LUT indexing.
+/// Pack one (symbol, code-length) into the appropriate `u32` entry.
+fn encode_entry(sym: u16, length: u8, encoding: Encoding) -> u32 {
+    let len = length as u32;
+    match encoding {
+        Encoding::Simple => ((sym as u32) << 16) | len,
+        Encoding::LitLen => {
+            if sym < 256 {
+                HUFFDEC_LITERAL | ((sym as u32) << 16) | len
+            } else if sym == 256 {
+                HUFFDEC_EXCEPTIONAL | len
+            } else if sym <= 285 {
+                let li = (sym - 257) as usize;
+                let base = LENGTH_BASE[li] as u32;
+                let extra = LENGTH_EXTRA[li] as u32;
+                (base << 16) | (extra << 8) | len
+            } else {
+                // sym 286/287 are reserved by RFC 1951. Encode as exceptional
+                // with the symbol value retained in bits 31..16 so the hot
+                // path can tell them apart from EOB (sym 256), which has
+                // zeros there.
+                HUFFDEC_EXCEPTIONAL | ((sym as u32) << 16) | len
+            }
+        }
+    }
+}
+
+/// Reverse the low `len` bits of `v`. Used in tests; production builder uses
+/// incremental reversed-code maintenance.
+#[cfg(test)]
 fn bit_reverse(mut v: u32, len: u32) -> u32 {
     let mut out = 0u32;
     for _ in 0..len {
@@ -284,13 +371,6 @@ fn bit_reverse(mut v: u32, len: u32) -> u32 {
 mod tests {
     use super::*;
 
-    /// Build a known tiny tree: symbols A=0, B=1, C=2, D=3 with lengths
-    /// [2, 1, 3, 3]. Per RFC 1951 §3.2.2 the codes are:
-    ///   B = 0       (length 1)
-    ///   A = 10      (length 2)
-    ///   C = 110     (length 3)
-    ///   D = 111     (length 3)
-    /// On the wire, written MSB-first; we read LSB-first → reversed bits.
     fn tiny_tree() -> HuffmanDecoder {
         HuffmanDecoder::from_lengths(&[2, 1, 3, 3]).unwrap()
     }
@@ -306,18 +386,12 @@ mod tests {
     #[test]
     fn decode_tiny_tree() {
         let dec = tiny_tree();
-        // Encode B A C D D: codes are 0, 10, 110, 111, 111 (MSB first).
-        // Concatenated bit-stream MSB-first: 0 10 110 111 111
-        // = 0|10|110|111|111  (13 bits)
-        // Stored on wire LSB-first per byte: byte0 low bits first.
-        // Easier: build the byte buffer directly.
-        let mut bits: Vec<u8> = Vec::new(); // each 0/1
+        let mut bits: Vec<u8> = Vec::new();
         for code_str in ["0", "10", "110", "111", "111"] {
             for c in code_str.chars() {
                 bits.push((c == '1') as u8);
             }
         }
-        // Pack into bytes LSB-first.
         let mut bytes: Vec<u8> = Vec::new();
         let mut acc = 0u8;
         let mut nb = 0u32;
@@ -333,40 +407,27 @@ mod tests {
         if nb > 0 {
             bytes.push(acc);
         }
-        // Pad: DEFLATE always has a trailer (≥4 bytes for gzip CRC+ISIZE) so
-        // the decoder can safely peek LUT_BITS past the end of the symbol stream.
         bytes.extend_from_slice(&[0; 8]);
 
         let mut br = BitReader::new(&bytes);
-        assert_eq!(dec.decode(&mut br).unwrap(), 1); // B
-        assert_eq!(dec.decode(&mut br).unwrap(), 0); // A
-        assert_eq!(dec.decode(&mut br).unwrap(), 2); // C
-        assert_eq!(dec.decode(&mut br).unwrap(), 3); // D
-        assert_eq!(dec.decode(&mut br).unwrap(), 3); // D
+        assert_eq!(dec.decode(&mut br).unwrap(), 1);
+        assert_eq!(dec.decode(&mut br).unwrap(), 0);
+        assert_eq!(dec.decode(&mut br).unwrap(), 2);
+        assert_eq!(dec.decode(&mut br).unwrap(), 3);
+        assert_eq!(dec.decode(&mut br).unwrap(), 3);
     }
 
     #[test]
     fn rejects_oversubscribed() {
-        // Two length-1 codes covers 2/2 of length-1 space — fine alone, but
-        // adding a length-2 makes it oversubscribed.
         let err = HuffmanDecoder::from_lengths(&[1, 1, 2]).unwrap_err();
         assert!(matches!(err, DeflateError::Invalid(_)));
     }
 
     #[test]
     fn accepts_incomplete() {
-        // RFC 1951's fixed distance tree (30 length-5 codes, 2 slots unused)
-        // is technically incomplete; zlib emits it and the decoder must
-        // accept. Decoding a missing prefix errors at lookup time.
         let dec = HuffmanDecoder::from_lengths(&[2, 2, 2]).unwrap();
-        // The 4th 2-bit slot has no entry; decoding bits that map there errors.
-        let bytes = [0b11u8, 0, 0, 0, 0, 0, 0, 0, 0]; // padded
+        let bytes = [0b11u8, 0, 0, 0, 0, 0, 0, 0, 0];
         let mut br = BitReader::new(&bytes);
-        // The unused slot for our tree: its reversed-LSB bits — three codes
-        // at length 2 occupy three of {00, 01, 10, 11}. Per canonical
-        // assignment in symbol order: sym 0 → 00, sym 1 → 01, sym 2 → 10,
-        // and reversed-LSB of those is 00, 10, 01. Slot 11 (reversed) is
-        // unused. Reading bits 11 should error.
         assert!(dec.decode(&mut br).is_err());
     }
 
@@ -379,38 +440,61 @@ mod tests {
 
     #[test]
     fn fixed_literal_tree_smoke() {
-        // RFC 1951 §3.2.6 fixed Huffman: 8-bit codes for 0..=143 and 280..=287,
-        // 9-bit for 144..=255, 7-bit for 256..=279.
         let mut lengths = vec![0u8; 288];
         for i in 0..=143 { lengths[i] = 8; }
         for i in 144..=255 { lengths[i] = 9; }
         for i in 256..=279 { lengths[i] = 7; }
         for i in 280..=287 { lengths[i] = 8; }
         let dec = HuffmanDecoder::from_lengths(&lengths).unwrap();
-
-        // Fixed code for symbol 0 is the 8-bit canonical 00110000 (per zlib),
-        // = 0x30 MSB-first → reversed-LSB = 0x0C, but easiest sanity check:
-        // build a stream from a known encoding using deflate's fixed table and
-        // decode it. Pick: end-of-block symbol 256 has code 0000000 (7 bits).
-        // On the wire MSB-first 0000000 → LSB-first reads: 7 zero bits.
-        let bytes = [0u8; 8]; // padded so peek(LUT_BITS) won't EOF
+        let bytes = [0u8; 8];
         let mut br = BitReader::new(&bytes);
         assert_eq!(dec.decode(&mut br).unwrap(), 256);
     }
 
     #[test]
     fn long_code_path() {
-        // Construct a tree where one symbol has length > LUT_BITS to exercise
-        // the slow path. Use lengths covering the full 15-bit space.
-        // Build: 1 code at len 1, 1 at 2, 1 at 3, 1 at 4, …, 1 at 15, plus
-        // one extra at 15 to round out the tree.
-        // Counts: bl[1]=1, bl[2]=1, …, bl[14]=1, bl[15]=2 → total = 1*2^14 +
-        // 1*2^13 + … + 1*2^1 + 2*2^0 = 2^15. Complete.
         let mut lengths = Vec::new();
         for l in 1..=14u8 { lengths.push(l); }
         lengths.push(15);
         lengths.push(15);
         let dec = HuffmanDecoder::from_lengths(&lengths).unwrap();
-        assert!(!dec.long_codes.is_empty(), "expected long-code fallback to be exercised");
+        assert!(!dec.long_codes.is_empty());
+    }
+
+    #[test]
+    fn litlen_encoding_literal_byte() {
+        // Fixed-Huffman litlen tree: symbol 65 ('A') has 8-bit code.
+        let mut lengths = vec![0u8; 288];
+        for i in 0..=143 { lengths[i] = 8; }
+        for i in 144..=255 { lengths[i] = 9; }
+        for i in 256..=279 { lengths[i] = 7; }
+        for i in 280..=287 { lengths[i] = 8; }
+        let dec = HuffmanDecoder::from_lengths_litlen(&lengths).unwrap();
+        // Build a stream that decodes to literal 'A' (sym 65).
+        // Fixed code for 65 (canonical MSB-first): 65+48 = 113 = 0b01110001.
+        // Reversed for LSB read: 0b10001110 = 0x8E.
+        let bytes = [0x8Eu8, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut br = BitReader::new(&bytes);
+        br.ensure_bits(48).unwrap();
+        let entry = dec.lookup_filled(&mut br).unwrap();
+        assert_ne!(entry & HUFFDEC_LITERAL, 0, "expected literal flag set");
+        assert_eq!((entry >> 16) as u8, 65, "literal byte at bits 23..16");
+    }
+
+    #[test]
+    fn litlen_encoding_eob() {
+        let mut lengths = vec![0u8; 288];
+        for i in 0..=143 { lengths[i] = 8; }
+        for i in 144..=255 { lengths[i] = 9; }
+        for i in 256..=279 { lengths[i] = 7; }
+        for i in 280..=287 { lengths[i] = 8; }
+        let dec = HuffmanDecoder::from_lengths_litlen(&lengths).unwrap();
+        // EOB (sym 256) has 7-bit code 0b0000000 → seven zero bits.
+        let bytes = [0u8; 8];
+        let mut br = BitReader::new(&bytes);
+        br.ensure_bits(48).unwrap();
+        let entry = dec.lookup_filled(&mut br).unwrap();
+        assert_eq!(entry & HUFFDEC_LITERAL, 0);
+        assert_ne!(entry & HUFFDEC_EXCEPTIONAL, 0);
     }
 }
