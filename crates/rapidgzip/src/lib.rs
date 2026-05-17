@@ -22,6 +22,27 @@ pub struct Config {
     pub num_threads: usize,
     /// Approximate compressed bytes per work chunk.
     pub chunk_size_bytes: usize,
+    /// Print per-member / per-chunk diagnostics to stderr while decoding.
+    /// Off by default; CLI exposes `--verbose`. See [`Verbosity`].
+    pub verbose: Verbosity,
+}
+
+/// How chatty `read_gz` is on stderr.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Verbosity {
+    /// Silent (default).
+    #[default]
+    Off,
+    /// One line per member: which path (parallel / serial), boundary count,
+    /// uncompressed bytes. Plus a final summary.
+    On,
+}
+
+impl Verbosity {
+    #[inline]
+    pub fn is_on(self) -> bool {
+        matches!(self, Verbosity::On)
+    }
 }
 
 impl Default for Config {
@@ -29,6 +50,7 @@ impl Default for Config {
         Self {
             num_threads: 0,
             chunk_size_bytes: 4 * 1024 * 1024,
+            verbose: Verbosity::Off,
         }
     }
 }
@@ -68,6 +90,16 @@ pub fn read_gz(
     let path = path.as_ref();
     let bytes = fs::read(path)?;
     let compressed_bytes = bytes.len() as u64;
+    let verbose = config.verbose.is_on();
+    if verbose {
+        eprintln!(
+            "[rapidgzip] {}: {} compressed bytes, {} threads, chunk_size={}",
+            path.display(),
+            compressed_bytes,
+            if config.num_threads == 0 { "auto".to_string() } else { config.num_threads.to_string() },
+            config.chunk_size_bytes,
+        );
+    }
 
     let mut pos = 0usize;
     let mut total_uncompressed: u64 = 0;
@@ -85,14 +117,30 @@ pub fn read_gz(
         pipeline::parallel_decode_member(Arc::clone(&body), &counting_sink(&sink, &mut chunks_sent), &config)?;
     total_uncompressed += uncompressed;
     pos = body_start + body_consumed;
+    if verbose {
+        eprintln!(
+            "[rapidgzip] member 0 parallel: {uncompressed} uncompressed bytes from {body_consumed} compressed body bytes",
+        );
+    }
 
     // Multi-stream: serially decode any remaining members. This keeps the
     // hot path (the giant first member) parallel while still handling
     // concatenated gzip files correctly.
     let mut member: u32 = 1;
     while pos < bytes.len() {
+        if verbose {
+            eprintln!(
+                "[rapidgzip] member {member} serial fallback (parallel path is for member 0 only)",
+            );
+        }
         let mut decoded = Vec::new();
         let consumed = gzip::decode_one_indexed(&bytes[pos..], &mut decoded, member)?;
+        if verbose {
+            eprintln!(
+                "[rapidgzip] member {member} serial: {} uncompressed bytes from {consumed} compressed bytes",
+                decoded.len(),
+            );
+        }
         total_uncompressed += decoded.len() as u64;
         send_in_chunks(&sink, &decoded, &mut chunks_sent);
         pos += consumed;
@@ -100,6 +148,11 @@ pub fn read_gz(
     }
 
     drop(sink);
+    if verbose {
+        eprintln!(
+            "[rapidgzip] done: {member} member(s), {total_uncompressed} uncompressed bytes, {chunks_sent} output chunks",
+        );
+    }
     Ok(DecodeStats {
         compressed_bytes,
         uncompressed_bytes: total_uncompressed,

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::Parser;
 use crossbeam_channel::bounded;
-use rapidgzip::{read_gz, Config};
+use rapidgzip::{read_gz, Config, Verbosity};
 
 #[derive(Parser, Debug)]
 #[command(name = "rapidgzip-rs", version)]
@@ -20,6 +20,9 @@ struct Args {
     /// Approximate chunk size in bytes.
     #[arg(long, default_value_t = 4 * 1024 * 1024)]
     chunk_size: usize,
+    /// Print per-member / per-chunk diagnostics to stderr.
+    #[arg(short = 'v', long)]
+    verbose: bool,
 }
 
 fn main() -> Result<()> {
@@ -27,6 +30,7 @@ fn main() -> Result<()> {
     let cfg = Config {
         num_threads: args.threads,
         chunk_size_bytes: args.chunk_size,
+        verbose: if args.verbose { Verbosity::On } else { Verbosity::Off },
     };
 
     let (tx, rx) = bounded::<Vec<u8>>(16);

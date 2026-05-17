@@ -70,6 +70,7 @@ pub fn parallel_decode_member(
     config: &Config,
 ) -> Result<(u64, usize), Error> {
     let num_threads = effective_threads(config);
+    let verbose = config.verbose.is_on();
     let total_bits = (body.len() as u64) * 8;
     let chunk_bits = (config.chunk_size_bytes as u64).max(64 * 1024) * 8;
 
@@ -98,6 +99,17 @@ pub fn parallel_decode_member(
         work_items.push(WorkItem { id: i as u64, start_bit, end_bit_hint });
     }
     let num_chunks = work_items.len();
+    if verbose {
+        eprintln!(
+            "[rapidgzip] pipeline: {} boundaries found → {num_chunks} chunk(s), {num_threads} worker(s)",
+            boundaries.len(),
+        );
+        if num_chunks <= 1 {
+            eprintln!(
+                "[rapidgzip] pipeline: only one chunk — parallel path degrades to serial-equivalent decode",
+            );
+        }
+    }
 
     // Channels.
     let (work_tx, work_rx) = bounded::<WorkItem>(num_threads * 2);
@@ -350,7 +362,7 @@ mod tests {
         for threads in [1usize, 2, 4] {
             let out = decode_via_read_gz(
                 &path,
-                Config { num_threads: threads, chunk_size_bytes: 1 << 20 },
+                Config { num_threads: threads, chunk_size_bytes: 1 << 20, ..Config::default() },
             );
             assert_eq!(sha(&out), sha(&payload), "threads={threads}");
         }
@@ -374,7 +386,7 @@ mod tests {
         let path = write_tmp("multi3.gz", &gz);
         let out = decode_via_read_gz(
             &path,
-            Config { num_threads: 4, chunk_size_bytes: 64 * 1024 },
+            Config { num_threads: 4, chunk_size_bytes: 64 * 1024, ..Config::default() },
         );
         assert_eq!(sha(&out), sha(&expected));
     }
@@ -393,7 +405,7 @@ mod tests {
         let path = write_tmp("multi_big_small.gz", &gz);
         let out = decode_via_read_gz(
             &path,
-            Config { num_threads: 4, chunk_size_bytes: 1 << 20 },
+            Config { num_threads: 4, chunk_size_bytes: 1 << 20, ..Config::default() },
         );
         assert_eq!(sha(&out), sha(&expected));
     }
@@ -407,7 +419,7 @@ mod tests {
         let path = write_tmp("tiny.gz", &gz);
         let out = decode_via_read_gz(
             &path,
-            Config { num_threads: 4, chunk_size_bytes: 1 << 20 },
+            Config { num_threads: 4, chunk_size_bytes: 1 << 20, ..Config::default() },
         );
         assert_eq!(out, payload);
     }
@@ -425,7 +437,7 @@ mod tests {
                 for &nt in &[1usize, 4] {
                     let out = decode_via_read_gz(
                         &path,
-                        Config { num_threads: nt, chunk_size_bytes: cs },
+                        Config { num_threads: nt, chunk_size_bytes: cs, ..Config::default() },
                     );
                     assert_eq!(
                         sha(&out), sha(&payload),
@@ -452,7 +464,7 @@ mod tests {
         let path = write_tmp("mixed.gz", &gz);
         let out = decode_via_read_gz(
             &path,
-            Config { num_threads: 4, chunk_size_bytes: 256 * 1024 },
+            Config { num_threads: 4, chunk_size_bytes: 256 * 1024, ..Config::default() },
         );
         assert_eq!(sha(&out), sha(&payload));
     }
@@ -467,7 +479,7 @@ mod tests {
             let path = write_tmp(&format!("level_{level}.gz"), &gz);
             let out = decode_via_read_gz(
                 &path,
-                Config { num_threads: 4, chunk_size_bytes: 512 * 1024 },
+                Config { num_threads: 4, chunk_size_bytes: 512 * 1024, ..Config::default() },
             );
             assert_eq!(sha(&out), sha(&payload), "level={level}");
         }
