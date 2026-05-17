@@ -16,8 +16,11 @@
 //!
 //! ## Bounds & assumptions
 //!
-//! - Single-member gzip only. The caller (`read_gz`) detects multi-stream
-//!   and falls back to the serial path for those.
+//! - Handles multi-member gzip directly: at each BFINAL the worker consumes
+//!   the 8-byte trailer + the next gzip header and continues decoding into
+//!   the next member, recording a [`MemberBoundary`] at each transition. The
+//!   serializer keeps a running CRC32 + uncompressed counter per member and
+//!   validates the trailer at every boundary.
 //! - If the block finder fails to locate enough internal boundaries, we
 //!   silently degrade to fewer (or one) chunks. A degenerate decode is
 //!   serial-equivalent.
@@ -52,23 +55,46 @@ struct WorkResult {
     id: u64,
     chunk: SpeculativeChunk,
     /// Bit position after the worker stopped (start of next chunk if not
-    /// final, else the bit position immediately after BFINAL's block).
+    /// final, else the byte-aligned bit position immediately after the very
+    /// last member's trailer). Currently unused by the serializer but kept
+    /// for diagnostics.
+    #[allow(dead_code)]
     end_bit: u64,
+    /// Set when the worker reached real EOF after the last member's trailer.
     final_block: bool,
+    /// Member transitions encountered while decoding this chunk. Each entry
+    /// records where (in `chunk.bytes`) one member ends and the next begins,
+    /// plus the trailer (CRC32 / ISIZE) for the just-ended member.
+    member_boundaries: Vec<MemberBoundary>,
 }
 
-/// Decode the deflate body of a single gzip member in parallel.
+#[derive(Debug, Clone)]
+struct MemberBoundary {
+    /// Byte offset in `chunk.bytes` where the just-ended member's decoded
+    /// output ends. Stable across marker resolution.
+    byte_offset_in_chunk: usize,
+    crc_expected: u32,
+    isize_expected: u32,
+    /// Byte offset of the trailer in `body`. For error messages.
+    trailer_input_byte: u64,
+}
+
+/// Decode the deflate body of one or more concatenated gzip members in
+/// parallel.
 ///
-/// `body` is the slice from end-of-gzip-header to end-of-file. The caller
-/// has not yet consumed the trailer; this function consumes it.
+/// `body` is the slice from end-of-first-gzip-header to end-of-file. The
+/// caller has parsed and stripped only the *first* member's header; this
+/// function handles every member's trailer, every subsequent member's
+/// header, and validates CRC32 + ISIZE for each member as it streams.
 ///
-/// On success, returns `(uncompressed_bytes, body_bytes_consumed)` —
-/// `body_bytes_consumed` includes the 8-byte trailer.
+/// On success, returns `(total_uncompressed_bytes, body_bytes_consumed,
+/// chunks_sent)` where `chunks_sent` is the number of `Vec<u8>` chunks
+/// pushed onto `sink`.
 pub fn parallel_decode_member(
     body: Arc<Vec<u8>>,
     sink: &Sender<Vec<u8>>,
     config: &Config,
-) -> Result<(u64, usize), Error> {
+) -> Result<(u64, usize, u64), Error> {
     let num_threads = effective_threads(config);
     let verbose = config.verbose.is_on();
     let total_bits = (body.len() as u64) * 8;
@@ -144,99 +170,133 @@ pub fn parallel_decode_member(
     });
 
     // Serializer (run on the calling thread): receive results, reorder,
-    // resolve markers, stream bytes out, track CRC32 and uncompressed size.
+    // resolve markers, stream bytes out, validate every member's trailer.
     let mut reorder: std::collections::BTreeMap<u64, WorkResult> =
         std::collections::BTreeMap::new();
     let mut next_id: u64 = 0;
     let mut prev_tail: Vec<u8> = Vec::new();
-    let mut uncompressed: u64 = 0;
-    let mut crc = crc32fast::Hasher::new();
-    let mut final_end_bit: Option<u64> = None;
+    let mut total_uncompressed: u64 = 0;
+    let mut chunks_sent: u64 = 0;
+    let mut member_idx: u32 = 0;
+    let mut cur_crc = crc32fast::Hasher::new();
+    let mut cur_uncompressed: u64 = 0;
+    let mut final_byte_after_last_trailer: Option<usize> = None;
+    let mut last_err: Option<Error> = None;
 
     'outer: while next_id < num_chunks as u64 {
-        // Drain any ready chunk in order.
         while let Some(mut res) = reorder.remove(&next_id) {
-            // Resolve markers against the tail of all previously emitted bytes.
-            resolve_markers(&mut res.chunk, &prev_tail).map_err(Error::Deflate)?;
-            uncompressed += res.chunk.bytes.len() as u64;
-            crc.update(&res.chunk.bytes);
+            // Resolve markers against last 32 KiB of previously emitted bytes.
+            // Marker resolution targets back-refs that escaped the worker's
+            // own chunk; across a member boundary the LZ77 window resets, so
+            // no marker should fire that would mis-read prior-member bytes.
+            if let Err(e) = resolve_markers(&mut res.chunk, &prev_tail) {
+                last_err = Some(Error::Deflate(e));
+                break 'outer;
+            }
             update_tail(&mut prev_tail, &res.chunk.bytes);
 
+            // Walk this chunk's bytes piece-by-piece, splitting at each
+            // member boundary. CRC + ISIZE finalized & checked at each.
+            let bytes = &res.chunk.bytes;
+            let mut cursor = 0usize;
+            for mb in &res.member_boundaries {
+                let piece = &bytes[cursor..mb.byte_offset_in_chunk];
+                cur_crc.update(piece);
+                cur_uncompressed += piece.len() as u64;
+
+                let crc_got = std::mem::replace(
+                    &mut cur_crc,
+                    crc32fast::Hasher::new(),
+                )
+                .finalize();
+                if crc_got != mb.crc_expected {
+                    last_err = Some(Error::Gzip(crate::GzipError::CrcMismatch {
+                        expected: mb.crc_expected,
+                        got: crc_got,
+                        member: member_idx,
+                        uncompressed: cur_uncompressed,
+                        trailer_byte: mb.trailer_input_byte,
+                    }));
+                    break 'outer;
+                }
+                if (cur_uncompressed & 0xFFFF_FFFF) as u32 != mb.isize_expected {
+                    last_err = Some(Error::Gzip(crate::GzipError::IsizeMismatch {
+                        expected: mb.isize_expected,
+                        got: cur_uncompressed,
+                        member: member_idx,
+                        trailer_byte: mb.trailer_input_byte,
+                    }));
+                    break 'outer;
+                }
+                member_idx += 1;
+                cur_uncompressed = 0;
+                cursor = mb.byte_offset_in_chunk;
+            }
+            // Trailing bytes after the last boundary feed into the
+            // still-open current member.
+            let tail = &bytes[cursor..];
+            cur_crc.update(tail);
+            cur_uncompressed += tail.len() as u64;
+            total_uncompressed += bytes.len() as u64;
+
             let saw_final = res.final_block;
-            let end_bit_of_this = res.end_bit;
+            if let Some(mb) = res.member_boundaries.last() {
+                if saw_final {
+                    final_byte_after_last_trailer =
+                        Some(mb.trailer_input_byte as usize + 8);
+                }
+            }
 
             if sink.send(res.chunk.bytes).is_err() {
-                return Ok((uncompressed, body.len()));
+                return Ok((total_uncompressed, body.len(), chunks_sent));
             }
+            chunks_sent += 1;
             next_id += 1;
-
             if saw_final {
-                // Member ends here. Don't process any later chunks — they
-                // belong to a subsequent gzip member (multi-stream case) or
-                // are post-EOS junk; either way they don't contribute to
-                // this member's CRC/ISIZE.
-                final_end_bit = Some(end_bit_of_this);
                 break 'outer;
             }
         }
         if next_id >= num_chunks as u64 {
             break;
         }
-        let res = result_rx
-            .recv()
-            .map_err(|_| Error::Io(std::io::Error::other("worker channel closed")))?;
-        let res = res?;
-        reorder.insert(res.id, res);
+        let res = match result_rx.recv() {
+            Ok(r) => r,
+            Err(_) => {
+                last_err = Some(Error::Io(std::io::Error::other(
+                    "worker channel closed",
+                )));
+                break 'outer;
+            }
+        };
+        match res {
+            Ok(r) => {
+                reorder.insert(r.id, r);
+            }
+            Err(e) => {
+                last_err = Some(e);
+                break 'outer;
+            }
+        }
     }
 
-    // Drain any remaining results so workers can exit cleanly. Errors from
-    // post-final-block chunks are expected (the bits they decoded weren't
-    // a valid deflate stream — they were the next member's header / trailer
-    // bytes interpreted as deflate) and are intentionally discarded.
+    // Drain remaining results so workers exit cleanly. Errors from chunks
+    // past the final boundary may have been produced; we discard them.
     drop(result_rx);
-
-    // Wait for the dispatch and worker threads.
     let _ = dispatch.join();
     for h in worker_handles {
         let _ = h.join();
     }
 
-    // Find the trailer. final_end_bit is the bit position immediately after
-    // BFINAL block; byte-align then 8 bytes.
-    let body_end_bit = final_end_bit.ok_or_else(|| {
+    if let Some(e) = last_err {
+        return Err(e);
+    }
+
+    let body_consumed = final_byte_after_last_trailer.ok_or_else(|| {
         Error::Io(std::io::Error::other(
             "parallel decode produced no final block",
         ))
     })?;
-    let after_align_bit = (body_end_bit + 7) & !7;
-    let trailer_byte = (after_align_bit / 8) as usize;
-    if trailer_byte + 8 > body.len() {
-        return Err(Error::Gzip(crate::GzipError::Truncated));
-    }
-    let crc_expected = u32::from_le_bytes(body[trailer_byte..trailer_byte + 4].try_into().unwrap());
-    let isize_expected = u32::from_le_bytes(
-        body[trailer_byte + 4..trailer_byte + 8].try_into().unwrap(),
-    );
-    let crc_got = crc.finalize();
-    if crc_got != crc_expected {
-        return Err(Error::Gzip(crate::GzipError::CrcMismatch {
-            expected: crc_expected,
-            got: crc_got,
-            member: 0, // parallel path only handles member 0
-            uncompressed,
-            trailer_byte: trailer_byte as u64,
-        }));
-    }
-    if (uncompressed & 0xFFFF_FFFF) as u32 != isize_expected {
-        return Err(Error::Gzip(crate::GzipError::IsizeMismatch {
-            expected: isize_expected,
-            got: uncompressed,
-            member: 0,
-            trailer_byte: trailer_byte as u64,
-        }));
-    }
-
-    Ok((uncompressed, trailer_byte + 8))
+    Ok((total_uncompressed, body_consumed, chunks_sent))
 }
 
 fn decode_one_chunk(body: &[u8], item: &WorkItem) -> Result<WorkResult, Error> {
@@ -244,6 +304,8 @@ fn decode_one_chunk(body: &[u8], item: &WorkItem) -> Result<WorkResult, Error> {
     br.seek_to_bit(item.start_bit).map_err(Error::Deflate)?;
     let mut chunk = SpeculativeChunk::default();
     let mut final_block = false;
+    let mut member_boundaries: Vec<MemberBoundary> = Vec::new();
+
     loop {
         let pos = br.tell_bit();
         // Stop only between blocks, when we've already reached / passed the
@@ -253,16 +315,55 @@ fn decode_one_chunk(body: &[u8], item: &WorkItem) -> Result<WorkResult, Error> {
             break;
         }
         let bf = inflate_block_speculative(&mut br, &mut chunk).map_err(Error::Deflate)?;
-        if bf {
+        if !bf {
+            continue;
+        }
+
+        // Final block of a member — byte-align and read the 8-byte trailer.
+        br.byte_align();
+        let after_bit = br.tell_bit();
+        debug_assert_eq!(after_bit % 8, 0);
+        let trailer_byte = (after_bit / 8) as usize;
+        if trailer_byte + 8 > body.len() {
+            return Err(Error::Gzip(crate::GzipError::Truncated));
+        }
+        let crc_expected = u32::from_le_bytes(
+            body[trailer_byte..trailer_byte + 4].try_into().unwrap(),
+        );
+        let isize_expected = u32::from_le_bytes(
+            body[trailer_byte + 4..trailer_byte + 8].try_into().unwrap(),
+        );
+        member_boundaries.push(MemberBoundary {
+            byte_offset_in_chunk: chunk.bytes.len(),
+            crc_expected,
+            isize_expected,
+            trailer_input_byte: trailer_byte as u64,
+        });
+
+        let after_trailer = trailer_byte + 8;
+        if after_trailer >= body.len() {
+            // Real EOF — the very last member has been consumed.
             final_block = true;
+            br.seek_to_bit((after_trailer as u64) * 8)
+                .map_err(Error::Deflate)?;
             break;
         }
+
+        // Another member follows. Parse its gzip header and continue.
+        let header_len = crate::gzip::parse_header(&body[after_trailer..])
+            .map_err(Error::Gzip)?;
+        let next_block_byte = after_trailer + header_len;
+        br.seek_to_bit((next_block_byte as u64) * 8)
+            .map_err(Error::Deflate)?;
+        // Loop: next iteration will inflate the first block of the new member.
     }
+
     Ok(WorkResult {
         id: item.id,
         chunk,
         end_bit: br.tell_bit(),
         final_block,
+        member_boundaries,
     })
 }
 

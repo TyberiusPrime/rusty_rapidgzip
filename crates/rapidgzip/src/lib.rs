@@ -101,56 +101,19 @@ pub fn read_gz(
         );
     }
 
-    let mut pos = 0usize;
-    let mut total_uncompressed: u64 = 0;
-    let mut chunks_sent: u64 = 0;
+    // Parse only the *first* member's header here; the pipeline handles
+    // every subsequent member's header inline as it crosses BFINAL.
+    let header_len = gzip::parse_header(&bytes)?;
+    let body_start = header_len;
 
-    // Parse the first member header.
-    let header_len = gzip::parse_header(&bytes[pos..])?;
-    let body_start = pos + header_len;
-
-    // The pipeline needs the body in an Arc<Vec<u8>> for sharing across
-    // workers. We hand it the slice from `body_start` to end of file —
-    // it figures out where the trailer is via BFINAL.
     let body: Arc<Vec<u8>> = Arc::new(bytes[body_start..].to_vec());
-    let (uncompressed, body_consumed) =
-        pipeline::parallel_decode_member(Arc::clone(&body), &counting_sink(&sink, &mut chunks_sent), &config)?;
-    total_uncompressed += uncompressed;
-    pos = body_start + body_consumed;
-    if verbose {
-        eprintln!(
-            "[rapidgzip] member 0 parallel: {uncompressed} uncompressed bytes from {body_consumed} compressed body bytes",
-        );
-    }
-
-    // Multi-stream: serially decode any remaining members. This keeps the
-    // hot path (the giant first member) parallel while still handling
-    // concatenated gzip files correctly.
-    let mut member: u32 = 1;
-    while pos < bytes.len() {
-        if verbose {
-            eprintln!(
-                "[rapidgzip] member {member} serial fallback (parallel path is for member 0 only)",
-            );
-        }
-        let mut decoded = Vec::new();
-        let consumed = gzip::decode_one_indexed(&bytes[pos..], &mut decoded, member)?;
-        if verbose {
-            eprintln!(
-                "[rapidgzip] member {member} serial: {} uncompressed bytes from {consumed} compressed bytes",
-                decoded.len(),
-            );
-        }
-        total_uncompressed += decoded.len() as u64;
-        send_in_chunks(&sink, &decoded, &mut chunks_sent);
-        pos += consumed;
-        member += 1;
-    }
+    let (total_uncompressed, _body_consumed, chunks_sent) =
+        pipeline::parallel_decode_member(Arc::clone(&body), &sink, &config)?;
 
     drop(sink);
     if verbose {
         eprintln!(
-            "[rapidgzip] done: {member} member(s), {total_uncompressed} uncompressed bytes, {chunks_sent} output chunks",
+            "[rapidgzip] done: {total_uncompressed} uncompressed bytes, {chunks_sent} output chunks",
         );
     }
     Ok(DecodeStats {
@@ -161,29 +124,3 @@ pub fn read_gz(
     })
 }
 
-/// Wrap `sink` to bump `chunks_sent` on each successful send. Returns the
-/// original sender — the count is updated through the closure capture.
-fn counting_sink<'a>(
-    sink: &'a Sender<Vec<u8>>,
-    counter: &'a mut u64,
-) -> Sender<Vec<u8>> {
-    // crossbeam channels are cheap to clone (Arc internally); the workers
-    // need an owned Sender. We can't intercept sends without wrapping the
-    // type, so for now just return a clone. The counter is updated by the
-    // post-pipeline pass below.
-    let _ = counter;
-    sink.clone()
-}
-
-fn send_in_chunks(sink: &Sender<Vec<u8>>, data: &[u8], counter: &mut u64) {
-    const SINK_CHUNK: usize = 1 << 20;
-    let mut start = 0;
-    while start < data.len() {
-        let end = (start + SINK_CHUNK).min(data.len());
-        if sink.send(data[start..end].to_vec()).is_err() {
-            return;
-        }
-        *counter += 1;
-        start = end;
-    }
-}
