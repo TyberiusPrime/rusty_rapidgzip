@@ -102,7 +102,7 @@ pub fn decode_one(input: &[u8], out: &mut Vec<u8>) -> Result<usize, GzipError> {
 }
 
 /// Parse the gzip header, return its length in bytes.
-fn parse_header(input: &[u8]) -> Result<usize, GzipError> {
+pub(crate) fn parse_header(input: &[u8]) -> Result<usize, GzipError> {
     if input.len() < 10 {
         return Err(GzipError::Truncated);
     }

@@ -37,8 +37,20 @@
 //! a block header). Phase 4 absorbs these via a "did the chunk decode
 //! cleanly?" check and a serial-fallback path.
 
-use crate::inflate::read_dynamic_header;
-use crate::{BitReader, DeflateError};
+use crate::tables::{
+    CODE_LENGTH_ORDER, DISTANCE_BASE, DISTANCE_EXTRA, LENGTH_BASE, LENGTH_EXTRA,
+};
+use crate::{BitReader, DeflateError, HuffmanDecoder};
+
+/// Number of symbols we trial-decode after a header parse succeeds. A real
+/// block decodes a long, self-consistent symbol stream; a false-positive
+/// header (random bits that happened to parse) almost always produces
+/// an undecodable symbol within a handful of decodes.
+///
+/// 64 is enough in practice — a real header that produces 64 valid symbols
+/// is overwhelmingly likely to be a real block. Cost is small vs. the
+/// per-chunk decode that follows.
+const TRIAL_SYMBOLS: usize = 64;
 
 /// Bits of input checked by the prefilter LUT.
 const LUT_BITS: u32 = 13;
@@ -117,11 +129,7 @@ pub fn find_next_dynamic_block(
         };
         let step = NEXT_LUT[window as usize];
         if step == 0 {
-            // Looks like a candidate. Try to fully parse the header.
-            if verify.seek_to_bit(pos).is_ok()
-                && verify.read(3).is_ok() // BFINAL + BTYPE
-                && read_dynamic_header(&mut verify).is_ok()
-            {
+            if verify_candidate(&mut verify, pos) {
                 return Some(pos);
             }
             // False positive at the LUT layer: advance one bit.
@@ -132,6 +140,135 @@ pub fn find_next_dynamic_block(
     }
     let _: Result<(), DeflateError> = Ok(());
     None
+}
+
+/// Verify a candidate offset: parse the dynamic header (with **strict**
+/// Huffman validation — incomplete trees are rejected), then trial-decode
+/// up to [`TRIAL_SYMBOLS`] symbols. Returns true iff both succeed.
+///
+/// Strict validation is the difference between "this could be a real block
+/// header" and "these random bits happen to parse." Real encoders emit
+/// complete (Kraft-equal) trees; mid-block bits rarely do.
+fn verify_candidate(br: &mut BitReader<'_>, pos: u64) -> bool {
+    if br.seek_to_bit(pos).is_err() {
+        return false;
+    }
+    if br.read(3).is_err() {
+        return false;
+    }
+    let (lit, dist) = match read_dynamic_header_strict(br) {
+        Ok(pair) => pair,
+        Err(_) => return false,
+    };
+    trial_decode(br, &lit, &dist, TRIAL_SYMBOLS).is_ok()
+}
+
+/// Strict dynamic-Huffman header parser. Mirrors `inflate::read_dynamic_header`
+/// but uses [`HuffmanDecoder::from_lengths_strict`] so incomplete trees are
+/// rejected. We don't share the inflate version because the inflate path
+/// must tolerate the (legitimate) incomplete fixed distance tree; the
+/// block finder cannot.
+fn read_dynamic_header_strict(
+    br: &mut BitReader<'_>,
+) -> Result<(HuffmanDecoder, HuffmanDecoder), DeflateError> {
+    let hlit = br.read(5)? as usize + 257;
+    let hdist = br.read(5)? as usize + 1;
+    let hclen = br.read(4)? as usize + 4;
+    if hlit > 286 || hdist > 30 {
+        return Err(DeflateError::Invalid("strict: HLIT/HDIST out of range"));
+    }
+    let mut cl_lengths = [0u8; 19];
+    for i in 0..hclen {
+        cl_lengths[CODE_LENGTH_ORDER[i]] = br.read(3)? as u8;
+    }
+    let cl_decoder = HuffmanDecoder::from_lengths_strict(&cl_lengths)?;
+
+    let total = hlit + hdist;
+    let mut lengths = vec![0u8; total];
+    let mut i = 0;
+    while i < total {
+        let sym = cl_decoder.decode(br)?;
+        match sym {
+            0..=15 => {
+                lengths[i] = sym as u8;
+                i += 1;
+            }
+            16 => {
+                if i == 0 {
+                    return Err(DeflateError::Invalid("strict: code 16 with no previous"));
+                }
+                let n = (br.read(2)? as usize) + 3;
+                let prev = lengths[i - 1];
+                if i + n > total {
+                    return Err(DeflateError::Invalid("strict: code 16 overruns"));
+                }
+                for j in 0..n {
+                    lengths[i + j] = prev;
+                }
+                i += n;
+            }
+            17 => {
+                let n = (br.read(3)? as usize) + 3;
+                if i + n > total {
+                    return Err(DeflateError::Invalid("strict: code 17 overruns"));
+                }
+                i += n;
+            }
+            18 => {
+                let n = (br.read(7)? as usize) + 11;
+                if i + n > total {
+                    return Err(DeflateError::Invalid("strict: code 18 overruns"));
+                }
+                i += n;
+            }
+            _ => return Err(DeflateError::Invalid("strict: bad code-length symbol")),
+        }
+    }
+    if lengths[256] == 0 {
+        return Err(DeflateError::Invalid("strict: EOB symbol has zero length"));
+    }
+    let lit = HuffmanDecoder::from_lengths_strict(&lengths[..hlit])?;
+    let dist = HuffmanDecoder::from_lengths_strict(&lengths[hlit..])?;
+    Ok((lit, dist))
+}
+
+/// Decode up to `n_symbols` literal/length+distance pairs from `br`, just
+/// to verify that the trees produce a self-consistent symbol stream. We
+/// don't write any output. Returns `Ok` if at least `n_symbols` decode
+/// cleanly OR the stream ends with EOB before then.
+fn trial_decode(
+    br: &mut BitReader<'_>,
+    lit: &HuffmanDecoder,
+    dist: &HuffmanDecoder,
+    n_symbols: usize,
+) -> Result<(), DeflateError> {
+    for _ in 0..n_symbols {
+        let sym = lit.decode(br)?;
+        match sym {
+            0..=255 => {}
+            256 => return Ok(()),
+            257..=285 => {
+                let li = (sym - 257) as usize;
+                let extra = LENGTH_EXTRA[li];
+                if extra > 0 {
+                    br.read(extra as u32)?;
+                }
+                let _ = LENGTH_BASE[li];
+                let dsym = dist.decode(br)?;
+                if dsym >= 30 {
+                    return Err(DeflateError::Invalid("trial: distance symbol out of range"));
+                }
+                let di = dsym as usize;
+                let dextra = DISTANCE_EXTRA[di];
+                if dextra > 0 {
+                    br.read(dextra as u32)?;
+                }
+                let _ = DISTANCE_BASE[di];
+            }
+            _ => return Err(DeflateError::Invalid("trial: lit/len symbol out of range")),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

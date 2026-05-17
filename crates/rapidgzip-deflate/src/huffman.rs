@@ -62,8 +62,21 @@ pub struct HuffmanDecoder {
 
 impl HuffmanDecoder {
     /// Build a decoder from a vector of bit-lengths. `lengths[s] = 0` means
-    /// symbol `s` is not present in this tree.
+    /// symbol `s` is not present in this tree. Accepts incomplete trees
+    /// (Kraft sum < full code space) — see comment in the body.
     pub fn from_lengths(lengths: &[u8]) -> Result<Self, DeflateError> {
+        Self::from_lengths_with(lengths, false)
+    }
+
+    /// Strict variant: also reject incomplete trees with ≥2 symbols. Used by
+    /// the block finder, where an incomplete tree is a strong signal that
+    /// the candidate offset is a false positive (random bits parsing as a
+    /// header). Real DEFLATE encoders produce complete trees.
+    pub fn from_lengths_strict(lengths: &[u8]) -> Result<Self, DeflateError> {
+        Self::from_lengths_with(lengths, true)
+    }
+
+    fn from_lengths_with(lengths: &[u8], strict: bool) -> Result<Self, DeflateError> {
         // Count codes per length.
         let mut bl_count = [0u32; (MAX_CODE_LEN + 1) as usize];
         for &l in lengths {
@@ -95,7 +108,9 @@ impl HuffmanDecoder {
         if n_symbols >= 2 && total > full {
             return Err(DeflateError::Invalid("oversubscribed huffman tree"));
         }
-        let _ = n_symbols; // silence unused-warning if future refactors remove the check
+        if strict && n_symbols >= 2 && total != full {
+            return Err(DeflateError::Invalid("incomplete huffman tree (strict)"));
+        }
 
         // Compute first-code-per-length per RFC 1951 §3.2.2.
         let mut next_code = [0u32; (MAX_CODE_LEN + 2) as usize];
