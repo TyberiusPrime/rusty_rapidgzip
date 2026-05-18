@@ -9,6 +9,7 @@ pub mod block_finder;
 pub mod huffman;
 pub mod inflate;
 pub mod speculative;
+pub mod speculative_zlib;
 pub mod tables;
 
 pub use bitreader::BitReader;
@@ -19,6 +20,7 @@ pub use speculative::{
     inflate_block_speculative, inflate_speculative, resolve_markers, tail_window, Marker,
     SpeculativeChunk,
 };
+pub use speculative_zlib::SpeculativeZlibDecoder;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum DeflateError {

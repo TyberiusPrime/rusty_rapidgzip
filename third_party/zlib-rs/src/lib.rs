@@ -32,6 +32,9 @@ mod cpu_features;
 mod stable;
 mod weak_slice;
 
+#[cfg(feature = "std")]
+pub mod speculative;
+
 pub use stable::{Deflate, DeflateError, Inflate, InflateError, Status};
 
 pub use deflate::{DeflateConfig, Method, Strategy};

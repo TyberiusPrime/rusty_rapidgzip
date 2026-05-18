@@ -555,6 +555,17 @@ const INFLATE_FAST_MIN_HAVE: usize = 15;
 const INFLATE_FAST_MIN_LEFT: usize = 260;
 
 impl State<'_> {
+    /// Bits currently held in the bit buffer that have not been consumed yet.
+    pub(crate) fn bits_in_buffer(&self) -> u8 {
+        self.bit_reader.bits_in_buffer()
+    }
+
+    /// Inject `bits` low-order bits of `value` into the bit buffer.
+    /// Must be called before any input is consumed.
+    pub(crate) fn prime(&mut self, bits: u8, value: u64) {
+        self.bit_reader.prime(bits, value);
+    }
+
     // This logic is split into its own function for two reasons
     //
     // - We get to load state to the stack; doing this in all cases is expensive, but doing it just
@@ -844,6 +855,36 @@ impl State<'_> {
                             let mut copy = self.offset - copy;
 
                             if copy > self.window.have() {
+                                // Speculative (mid-stream) fast path: distance
+                                // reaches before the chunk's start. Instead of
+                                // erroring, emit markers and a placeholder per
+                                // byte. The caller resolves them once the
+                                // preceding chunk's tail is known.
+                                #[cfg(feature = "std")]
+                                if crate::speculative::is_active() {
+                                    let written_now = writer.len();
+                                    let needed_from_prefix =
+                                        self.offset - written_now - self.window.have();
+                                    let n = Ord::min(
+                                        Ord::min(needed_from_prefix, self.length),
+                                        left,
+                                    );
+                                    crate::speculative::record_match_prefix(
+                                        written_now,
+                                        self.offset,
+                                        n,
+                                    );
+                                    for _ in 0..n {
+                                        writer.push(0);
+                                    }
+                                    self.length -= n;
+                                    if self.length == 0 {
+                                        break 'top Mode::Len;
+                                    } else {
+                                        break 'top Mode::Match;
+                                    }
+                                }
+
                                 if self.flags.contains(Flags::SANE) {
                                     restore!();
                                     self.mode = Mode::Bad;
@@ -874,7 +915,10 @@ impl State<'_> {
                             copy
                         } else {
                             let copy = Ord::min(self.length, left);
+                            let dst_start = writer.len();
                             writer.copy_match(self.offset, copy);
+                            #[cfg(feature = "std")]
+                            crate::speculative::propagate_match(dst_start, self.offset, copy);
 
                             copy
                         };
@@ -1563,6 +1607,34 @@ impl State<'_> {
                                 let mut copy = self.offset - copy;
 
                                 if copy > self.window.have() {
+                                    #[cfg(feature = "std")]
+                                    if crate::speculative::is_active() {
+                                        let written_now = self.writer.len();
+                                        let needed_from_prefix =
+                                            self.offset - written_now - self.window.have();
+                                        let n = Ord::min(
+                                            Ord::min(needed_from_prefix, self.length),
+                                            left,
+                                        );
+                                        crate::speculative::record_match_prefix(
+                                            written_now,
+                                            self.offset,
+                                            n,
+                                        );
+                                        for _ in 0..n {
+                                            self.writer.push(0);
+                                        }
+                                        self.length -= n;
+                                        if self.length == 0 {
+                                            break 'blk Mode::Len;
+                                        } else {
+                                            // Stay in Mode::Match for the
+                                            // remaining bytes (which may also
+                                            // be over-distance).
+                                            mode = Mode::Match;
+                                            continue 'match_;
+                                        }
+                                    }
                                     if self.flags.contains(Flags::SANE) {
                                         mode = Mode::Bad;
                                         break 'label self.bad("invalid distance too far back\0");
@@ -1591,7 +1663,10 @@ impl State<'_> {
                                 copy
                             } else {
                                 let copy = Ord::min(self.length, left);
+                                let dst_start = self.writer.len();
                                 self.writer.copy_match(self.offset, copy);
+                                #[cfg(feature = "std")]
+                                crate::speculative::propagate_match(dst_start, self.offset, copy);
 
                                 copy
                             };
@@ -2047,6 +2122,17 @@ unsafe fn inflate_fast_help_impl<const FEATURES: usize>(state: &mut State, _star
                         if dist as usize > written {
                             // copy fropm the window
                             if (dist as usize - written) > state.window.have() {
+                                // Speculative mode: bail to the slow Mode::Match
+                                // path, which knows how to emit markers for the
+                                // over-distance portion.
+                                #[cfg(feature = "std")]
+                                if crate::speculative::is_active() {
+                                    state.length = len as usize;
+                                    state.offset = dist as usize;
+                                    state.mode = Mode::Match;
+                                    break 'outer;
+                                }
+
                                 if state.flags.contains(Flags::SANE) {
                                     bad = Some("invalid distance too far back\0");
                                     state.mode = Mode::Bad;
@@ -2102,15 +2188,30 @@ unsafe fn inflate_fast_help_impl<const FEATURES: usize>(state: &mut State, _star
 
                             if op < len as usize {
                                 // here we need some bytes from the output itself
+                                let dst_start = writer.len();
+                                let tail = len as usize - op;
                                 writer.copy_match_with_features::<FEATURES>(
                                     dist as usize,
-                                    len as usize - op,
+                                    tail,
+                                );
+                                #[cfg(feature = "std")]
+                                crate::speculative::propagate_match(
+                                    dst_start,
+                                    dist as usize,
+                                    tail,
                                 );
                             }
                         } else if extra_safe {
                             todo!()
                         } else {
-                            writer.copy_match_with_features::<FEATURES>(dist as usize, len as usize)
+                            let dst_start = writer.len();
+                            writer.copy_match_with_features::<FEATURES>(dist as usize, len as usize);
+                            #[cfg(feature = "std")]
+                            crate::speculative::propagate_match(
+                                dst_start,
+                                dist as usize,
+                                len as usize,
+                            );
                         }
                     } else if (op & 64) == 0 {
                         // 2nd level distance code

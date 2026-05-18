@@ -167,6 +167,22 @@ impl Inflate {
         }
     }
 
+    /// Bits currently held in the internal bit buffer that have not been
+    /// consumed yet. After a `decompress` call, the exact number of bits
+    /// consumed from the input is `total_in() * 8 - bits_in_buffer()`.
+    pub fn bits_in_buffer(&self) -> u8 {
+        self.inner.state.bits_in_buffer()
+    }
+
+    /// Inject `bits` low-order bits of `value` into the bit buffer. Must be
+    /// called only before any input has been consumed (i.e., immediately
+    /// after `new` or `reset`). Used to enter a deflate stream at an
+    /// arbitrary bit boundary: skip `start_bit / 8` input bytes, then prime
+    /// with the top `8 - (start_bit % 8)` bits of the next byte.
+    pub fn prime(&mut self, bits: u8, value: u64) {
+        self.inner.state.prime(bits, value);
+    }
+
     pub fn set_dictionary(&mut self, dictionary: &[u8]) -> Result<u32, InflateError> {
         match crate::inflate::set_dictionary(&mut self.inner, dictionary) {
             ReturnCode::Ok => Ok(self.inner.adler as u32),

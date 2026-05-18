@@ -144,6 +144,29 @@ impl SpeculativeChunk {
         }
     }
 
+    /// Append a batch of vendored-engine markers, translating their
+    /// `out_pos` from member-local (0-based at the engine's first output
+    /// byte) into chunk-local (0-based at `chunk.bytes[0]`).
+    pub fn bytes_offset_markers(
+        &mut self,
+        src: &[zlib_rs_vendored::speculative::MarkerRec],
+        base: u32,
+    ) {
+        if src.is_empty() {
+            return;
+        }
+        self.markers.reserve(src.len());
+        let mut last = self.max_marker_pos.unwrap_or(0);
+        for m in src {
+            let pos = m.out_pos + base;
+            self.markers.push(Marker { out_pos: pos, prefix_offset: m.prefix_offset });
+            if pos > last {
+                last = pos;
+            }
+        }
+        self.max_marker_pos = Some(last);
+    }
+
     /// `src` is in-range; check whether it is a marker. Caller has verified
     /// `cannot_be_marker(src) == false`. Returns `Some(prefix_offset)` if
     /// it is.
