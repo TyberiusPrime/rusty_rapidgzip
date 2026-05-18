@@ -566,7 +566,7 @@ pub fn parallel_decode_bgzf(
             // Per-worker zlib-rs state reused across all members. `reset()`
             // between members keeps the 32 KiB window allocated.
             let mut zdec = if use_zlib_rs {
-                Some((zlib_rs::Inflate::new(false, 15), Box::new([0u8; 65_536])))
+                Some((zlib_rs_vendored::Inflate::new(false, 15), Box::new([0u8; 65_536])))
             } else {
                 None
             };

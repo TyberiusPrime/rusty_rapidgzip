@@ -4,6 +4,7 @@ members = [
     "crates/rapidgzip-deflate",
     "crates/rapidgzip",
     "crates/rapidgzip-bin",
+    "third_party/zlib-rs",
     "xtask",
 ]
 
