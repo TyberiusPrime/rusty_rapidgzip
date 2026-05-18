@@ -77,6 +77,13 @@ impl Drop for ContextGuard<'_> {
     }
 }
 
+pub fn current_out_pos_offset() -> u32 {
+    let ptr = ACTIVE.with(|c| c.get());
+    if ptr.is_null() { return 0; }
+    let ctx = unsafe { &*ptr };
+    ctx.out_pos_offset
+}
+
 /// `true` if a context is installed on the current thread.
 #[inline(always)]
 pub fn is_active() -> bool {
@@ -153,14 +160,16 @@ pub fn propagate_match(written_at_match_start: usize, dist: usize, len: usize) {
         None => return,
         Some(m) => m as usize,
     };
-    // Source positions for k in 0..len are at (written_at_match_start + k) - dist.
-    // The lowest source pos is written_at_match_start - dist (if dist <= written_at_match_start;
-    // otherwise the over-distance hook already handled it and this should not be reached).
-    if written_at_match_start < dist {
-        // Defensive: shouldn't happen — over-distance is intercepted earlier.
+    // Source positions for k in 0..len are at (dst_start + k) - dist, in
+    // member-absolute coordinates. This works for both in-buffer copies
+    // (dist <= writer.len()) AND extend-from-window copies (dist > writer.len()
+    // but the source is still within member-output via the engine's window).
+    let dst_start = ctx.out_pos_offset as usize + written_at_match_start;
+    if dst_start < dist {
+        // Defensive: source would be before member start — over-distance hook
+        // should have handled this. Don't propagate.
         return;
     }
-    let dst_start = ctx.out_pos_offset as usize + written_at_match_start;
     let src_lo = dst_start - dist;
     if src_lo > max {
         return;
@@ -176,7 +185,6 @@ pub fn propagate_match(written_at_match_start: usize, dist: usize, len: usize) {
         if src_pos > new_max {
             break;
         }
-        // Lookup marker at src_pos. Binary search; markers are sorted by out_pos.
         let lookup =
             ctx.markers.binary_search_by_key(&(src_pos as u32), |m| m.out_pos);
         if let Ok(idx) = lookup {

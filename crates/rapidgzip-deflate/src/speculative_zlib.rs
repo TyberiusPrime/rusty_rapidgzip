@@ -34,7 +34,7 @@ pub struct SpeculativeZlibDecoder {
 }
 
 impl SpeculativeZlibDecoder {
-    pub const DEFAULT_SCRATCH: usize = 256 * 1024;
+    pub const DEFAULT_SCRATCH: usize = 4 * 1024 * 1024;
 
     pub fn new() -> Self {
         Self {
@@ -59,6 +59,23 @@ impl SpeculativeZlibDecoder {
         start_bit: u64,
         chunk: &mut SpeculativeChunk,
     ) -> Result<u64, DeflateError> {
+        self.decode_until(input, start_bit, u64::MAX, chunk)
+            .map(|(end_bit, _bf)| end_bit)
+    }
+
+    /// Decode the deflate stream starting at `start_bit`, stopping either
+    /// when BFINAL is reached (returns `hit_bfinal = true`, byte-aligned
+    /// end_bit) or when a block boundary at or past `end_bit_hint` is
+    /// reached (returns `hit_bfinal = false`). The latter case never
+    /// overshoots — the engine uses `InflateFlush::Block` so it stops
+    /// exactly between blocks.
+    pub fn decode_until(
+        &mut self,
+        input: &[u8],
+        start_bit: u64,
+        end_bit_hint: u64,
+        chunk: &mut SpeculativeChunk,
+    ) -> Result<(u64, bool), DeflateError> {
         let byte_off = (start_bit / 8) as usize;
         let bit_off = (start_bit % 8) as u8;
         if byte_off > input.len() {
@@ -95,6 +112,7 @@ impl SpeculativeZlibDecoder {
         // (e.g., ~64 KiB for BGZF; up to a chunk size for non-BGZF).
         let mut written: usize = 0;
         let mut feed_consumed: usize = 0;
+        let mut hit_bfinal = false;
         loop {
             if written == self.scratch.len() {
                 let new_len = (self.scratch.len() * 2).max(Self::DEFAULT_SCRATCH);
@@ -106,12 +124,14 @@ impl SpeculativeZlibDecoder {
             zlib_rs_vendored::speculative::set_out_pos_offset(written as u32);
             let total_out_before = self.engine.total_out();
             let total_in_before = self.engine.total_in();
+            // `InflateFlush::Block` returns `Ok` at every block boundary,
+            // so we can stop precisely at the chunk's `end_bit_hint`.
             let status = self
                 .engine
                 .decompress(
                     &feed[feed_consumed..],
                     &mut self.scratch[written..],
-                    InflateFlush::NoFlush,
+                    InflateFlush::Block,
                 )
                 .map_err(map_inflate_err)?;
             let produced =
@@ -119,9 +139,29 @@ impl SpeculativeZlibDecoder {
             feed_consumed += (self.engine.total_in() - total_in_before) as usize;
             written += produced;
 
+            // Was this an "at-a-block-boundary" Ok, or an "output-buffer-full" Ok?
+            // If we produced exactly `avail_out` and the buffer is now full,
+            // we are likely not at a block boundary — extend scratch and continue.
+            let buffer_was_full = produced > 0 && written == self.scratch.len();
             match status {
-                Status::StreamEnd => break,
-                Status::Ok => continue,
+                Status::StreamEnd => {
+                    hit_bfinal = true;
+                    break;
+                }
+                Status::Ok => {
+                    if buffer_was_full {
+                        // Don't treat as block boundary — just grow and continue.
+                        continue;
+                    }
+                    let bits_in_buf = self.engine.bits_in_buffer() as u64;
+                    let consumed = primed as u64
+                        + (feed_consumed as u64) * 8
+                        - bits_in_buf;
+                    if start_bit + consumed >= end_bit_hint {
+                        break;
+                    }
+                    continue;
+                }
                 Status::BufError => return Err(DeflateError::UnexpectedEof),
             }
         }
@@ -135,7 +175,7 @@ impl SpeculativeZlibDecoder {
         let bits_in_buf = self.engine.bits_in_buffer() as u64;
         let consumed_total_bits =
             primed as u64 + (feed_consumed as u64) * 8 - bits_in_buf;
-        Ok(start_bit + consumed_total_bits)
+        Ok((start_bit + consumed_total_bits, hit_bfinal))
     }
 }
 

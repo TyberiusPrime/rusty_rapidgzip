@@ -910,7 +910,14 @@ impl State<'_> {
                             copy = Ord::min(copy, self.length);
                             copy = Ord::min(copy, left);
 
+                            let dst_start = writer.len();
                             writer.extend_from_window(&self.window, from..from + copy);
+                            #[cfg(feature = "std")]
+                            crate::speculative::propagate_match(
+                                dst_start,
+                                self.offset,
+                                copy,
+                            );
 
                             copy
                         } else {
@@ -1657,8 +1664,11 @@ impl State<'_> {
                                 copy = Ord::min(copy, self.length);
                                 copy = Ord::min(copy, left);
 
+                                let dst_start = self.writer.len();
                                 self.writer
                                     .extend_from_window(&self.window, from..from + copy);
+                                #[cfg(feature = "std")]
+                                crate::speculative::propagate_match(dst_start, self.offset, copy);
 
                                 copy
                             } else {
@@ -2171,9 +2181,16 @@ unsafe fn inflate_fast_help_impl<const FEATURES: usize>(state: &mut State, _star
                                     // window, and part of it has wrapped around to the start. Copy
                                     // the end section here, the start section will be copied below.
                                     len -= op as u16;
+                                    let dst_start = writer.len();
                                     writer.extend_from_window_with_features::<FEATURES>(
                                         &state.window,
                                         from..from + op,
+                                    );
+                                    #[cfg(feature = "std")]
+                                    crate::speculative::propagate_match(
+                                        dst_start,
+                                        dist as usize,
+                                        op,
                                     );
                                     from = 0;
                                     op = window_next;
@@ -2181,9 +2198,16 @@ unsafe fn inflate_fast_help_impl<const FEATURES: usize>(state: &mut State, _star
                             }
 
                             let copy = Ord::min(op, len as usize);
+                            let dst_start_w = writer.len();
                             writer.extend_from_window_with_features::<FEATURES>(
                                 &state.window,
                                 from..from + copy,
+                            );
+                            #[cfg(feature = "std")]
+                            crate::speculative::propagate_match(
+                                dst_start_w,
+                                dist as usize,
+                                copy,
                             );
 
                             if op < len as usize {
