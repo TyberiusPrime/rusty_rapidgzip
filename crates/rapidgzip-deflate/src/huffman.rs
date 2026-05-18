@@ -76,6 +76,25 @@ pub const HUFFDEC_SUBTABLE_POINTER: u32 = 1 << 14;
 /// Low-byte mask: codeword length to consume.
 const LENGTH_MASK: u32 = 0xff;
 
+/// 64-byte-aligned fixed-size backing for the LUT. The hot decode loop
+/// reads one `u32` per iteration from a near-random index; pinning the
+/// base to a cacheline keeps every entry on a single line and avoids
+/// page-spanning loads when the LUT crosses a page boundary. rapidgzip
+/// uses `alignas(64)` for the same reason (see
+/// `HuffmanCodingShortBitsMultiCached.hpp` line 263).
+#[repr(C, align(64))]
+#[derive(Debug)]
+struct LutStorage([u32; LUT_SIZE]);
+
+impl LutStorage {
+    fn new_zeroed() -> Box<Self> {
+        // `Box::new([0u32; LUT_SIZE])` allocates on the stack first, then
+        // moves; for 1024 × 4 B = 4 KiB that's fine and the optimiser
+        // typically elides the move. Worth re-checking if LUT_SIZE grows.
+        Box::new(Self([0u32; LUT_SIZE]))
+    }
+}
+
 /// Which encoding the entries use. Affects only `build_into`; the decoder
 /// methods are encoding-agnostic except for which extractor the caller picks.
 #[derive(Debug, Clone, Copy)]
@@ -94,7 +113,7 @@ struct LongCode {
 
 #[derive(Debug)]
 pub struct HuffmanDecoder {
-    lut: Vec<u32>,
+    lut: Box<LutStorage>,
     long_codes: Vec<LongCode>,
 }
 
@@ -126,7 +145,7 @@ impl HuffmanDecoder {
     /// per dynamic block — see the `DecoderPool` in `speculative.rs`.
     pub fn new_empty() -> Self {
         Self {
-            lut: vec![0u32; LUT_SIZE],
+            lut: LutStorage::new_zeroed(),
             long_codes: Vec::new(),
         }
     }
@@ -137,7 +156,7 @@ impl HuffmanDecoder {
         strict: bool,
     ) -> Result<(), DeflateError> {
         Self::build_into(
-            &mut self.lut,
+            &mut self.lut.0,
             &mut self.long_codes,
             lengths,
             strict,
@@ -150,7 +169,7 @@ impl HuffmanDecoder {
         lengths: &[u8],
     ) -> Result<(), DeflateError> {
         Self::build_into(
-            &mut self.lut,
+            &mut self.lut.0,
             &mut self.long_codes,
             lengths,
             false,
@@ -159,15 +178,12 @@ impl HuffmanDecoder {
     }
 
     fn build_into(
-        lut: &mut Vec<u32>,
+        lut: &mut [u32; LUT_SIZE],
         long_codes: &mut Vec<LongCode>,
         lengths: &[u8],
         strict: bool,
         encoding: Encoding,
     ) -> Result<(), DeflateError> {
-        if lut.len() != LUT_SIZE {
-            lut.resize(LUT_SIZE, 0);
-        }
         for e in lut.iter_mut() {
             *e = 0;
         }
@@ -291,10 +307,10 @@ impl HuffmanDecoder {
     /// Return the raw packed entry. For the litlen hot path the caller
     /// dispatches on the flag bits directly without re-extracting the symbol.
     /// Caller must have ensured the buffer holds ≥ `MAX_CODE_LEN` bits.
-    #[inline]
+    #[inline(always)]
     pub fn lookup_filled(&self, br: &mut BitReader<'_>) -> Result<u32, DeflateError> {
         let peeked = br.peek_bits_unchecked(LUT_BITS);
-        let entry = self.lut[peeked as usize];
+        let entry = self.lut.0[peeked as usize];
         let length = entry & LENGTH_MASK;
         if length == 0 {
             return self.lookup_long(br);
@@ -303,10 +319,10 @@ impl HuffmanDecoder {
         Ok(entry)
     }
 
-    #[inline]
+    #[inline(always)]
     fn lookup(&self, br: &mut BitReader<'_>) -> Result<u32, DeflateError> {
         let peeked = br.peek(LUT_BITS)?;
-        let entry = self.lut[peeked as usize];
+        let entry = self.lut.0[peeked as usize];
         let length = entry & LENGTH_MASK;
         if length == 0 {
             return self.lookup_long(br);
@@ -319,7 +335,7 @@ impl HuffmanDecoder {
     /// inline with a manual bit buffer (no `&mut BitReader` round-trip).
     #[inline]
     pub(crate) fn lut_ptr(&self) -> *const u32 {
-        self.lut.as_ptr()
+        self.lut.0.as_ptr()
     }
 
     #[cold]

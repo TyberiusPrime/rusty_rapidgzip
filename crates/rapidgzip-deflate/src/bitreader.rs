@@ -85,7 +85,7 @@ impl<'a> BitReader<'a> {
     /// Peek the low `n` bits of the buffer without checking it has enough.
     /// **Caller must have ensured the buffer holds ≥ `n` bits.** Used by the
     /// inflate inner loop after a single `ensure_bits` per iteration.
-    #[inline]
+    #[inline(always)]
     pub fn peek_bits_unchecked(&self, n: u32) -> u32 {
         debug_assert!(self.bits >= n, "peek_bits_unchecked: buffer underfilled");
         let mask: u64 = (1u64 << n) - 1;
@@ -97,7 +97,7 @@ impl<'a> BitReader<'a> {
     /// undefined shift when topping up. Callers that want to consume more
     /// than `MAX_READ_BITS` in one go must do so via `peek_bits_unchecked` +
     /// `consume`, not `read`/`peek`.
-    #[inline]
+    #[inline(always)]
     fn refill(&mut self, n: u32) -> Result<(), DeflateError> {
         debug_assert!(n <= 56);
         if self.bits >= n {
@@ -131,7 +131,7 @@ impl<'a> BitReader<'a> {
     }
 
     /// Read `n` bits (0 ≤ n ≤ 32) LSB-first as the low bits of the return.
-    #[inline]
+    #[inline(always)]
     pub fn read(&mut self, n: u32) -> Result<u32, DeflateError> {
         if n == 0 {
             return Ok(0);
@@ -147,7 +147,7 @@ impl<'a> BitReader<'a> {
     /// Peek the next `n` bits without consuming. Caller must `consume(n)`
     /// once the actual length is known (Huffman decoder pattern).
     /// Returns `None` if input is exhausted before we can guarantee `n` bits.
-    #[inline]
+    #[inline(always)]
     pub fn peek(&mut self, n: u32) -> Result<u32, DeflateError> {
         debug_assert!(n <= MAX_READ_BITS);
         self.refill(n)?;
@@ -156,7 +156,7 @@ impl<'a> BitReader<'a> {
     }
 
     /// Consume `n` previously-peeked bits. `n` must be ≤ what was peeked.
-    #[inline]
+    #[inline(always)]
     pub fn consume(&mut self, n: u32) {
         debug_assert!(self.bits >= n);
         self.buf >>= n;

@@ -1,4 +1,6 @@
 /target
+**/target_claude
+librapidarchive/
 Cargo.lock.bak
 tests/corpus/*.gz
 tests/corpus/*.sha256

@@ -23,7 +23,9 @@ struct Args {
     /// Print per-member / per-chunk diagnostics to stderr.
     #[arg(short = 'v', long)]
     verbose: bool,
-    /// BGZF only: use zlib-rs (via flate2) for inflate. Diagnostic flag.
+    /// Use zlib-rs (via flate2) for inflate instead of our native deflate
+    /// decoder. Applies to both BGZF and regular gzip on the parallel and
+    /// serial paths.
     #[arg(long)]
     zlib_rs: bool,
 }
