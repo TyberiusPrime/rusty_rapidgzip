@@ -499,6 +499,10 @@ pub fn parallel_decode_bgzf(
 
     let num_threads = effective_threads(config);
     let verbose = config.verbose.is_on();
+    let use_zlib_rs = config.use_zlib_rs;
+    if verbose && use_zlib_rs {
+        eprintln!("[rapidgzip] bgzf: using zlib-rs backend (--zlib-rs)");
+    }
 
     // Walk member boundaries up front.
     let mut members: Vec<(usize, usize)> = Vec::new();
@@ -559,6 +563,13 @@ pub fn parallel_decode_bgzf(
         let file = Arc::clone(&file);
         let members_ref: Vec<(usize, usize)> = members.clone();
         workers.push(thread::spawn(move || {
+            // Per-worker zlib-rs state reused across all members. `reset()`
+            // between members keeps the 32 KiB window allocated.
+            let mut zdec = if use_zlib_rs {
+                Some((zlib_rs::Inflate::new(false, 15), Box::new([0u8; 65_536])))
+            } else {
+                None
+            };
             while let Ok((id, m_start, m_end)) = work_rx.recv() {
                 // BGZF blocks are ≤64 KiB uncompressed; preallocate to avoid
                 // Vec growth reallocations inside the inflate hot loop.
@@ -566,7 +577,18 @@ pub fn parallel_decode_bgzf(
                 let mut err: Option<Error> = None;
                 for mi in m_start..m_end {
                     let (s, e) = members_ref[mi];
-                    match crate::gzip::decode_one_indexed(&file[s..e], &mut out, mi as u32) {
+                    let res = if let Some((dec, scratch)) = zdec.as_mut() {
+                        crate::gzip::decode_one_indexed_zlib(
+                            &file[s..e],
+                            &mut out,
+                            mi as u32,
+                            dec,
+                            scratch.as_mut(),
+                        )
+                    } else {
+                        crate::gzip::decode_one_indexed(&file[s..e], &mut out, mi as u32)
+                    };
+                    match res {
                         Ok(_) => {}
                         Err(ge) => {
                             err = Some(Error::Gzip(ge));

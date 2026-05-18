@@ -23,6 +23,9 @@ struct Args {
     /// Print per-member / per-chunk diagnostics to stderr.
     #[arg(short = 'v', long)]
     verbose: bool,
+    /// BGZF only: use zlib-rs (via flate2) for inflate. Diagnostic flag.
+    #[arg(long)]
+    zlib_rs: bool,
 }
 
 fn main() -> Result<()> {
@@ -31,9 +34,11 @@ fn main() -> Result<()> {
         num_threads: args.threads,
         chunk_size_bytes: args.chunk_size,
         verbose: if args.verbose { Verbosity::On } else { Verbosity::Off },
+        use_zlib_rs: args.zlib_rs,
     };
 
     let (tx, rx) = bounded::<Vec<u8>>(16);
+    eprintln!("This is the new binary");
 
     let input = args.input.clone();
     let producer = std::thread::spawn(move || read_gz(&input, tx, cfg));

@@ -13,6 +13,8 @@ crc32fast.workspace = true
 crossbeam-channel.workspace = true
 thiserror.workspace = true
 memmap2.workspace = true
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+zlib-rs = "0.6"
 
 [dev-dependencies]
 sha2.workspace = true

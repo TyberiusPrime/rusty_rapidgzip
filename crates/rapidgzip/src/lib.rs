@@ -27,6 +27,9 @@ pub struct Config {
     /// Print per-member / per-chunk diagnostics to stderr while decoding.
     /// Off by default; CLI exposes `--verbose`. See [`Verbosity`].
     pub verbose: Verbosity,
+    /// If true, BGZF fast-path uses `zlib-rs` (via flate2) for inflate
+    /// instead of our in-house DEFLATE decoder. Diagnostic — A/B baseline.
+    pub use_zlib_rs: bool,
 }
 
 /// How chatty `read_gz` is on stderr.
@@ -53,6 +56,7 @@ impl Default for Config {
             num_threads: 0,
             chunk_size_bytes: 4 * 1024 * 1024,
             verbose: Verbosity::Off,
+            use_zlib_rs: false,
         }
     }
 }
