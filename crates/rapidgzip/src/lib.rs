@@ -13,7 +13,7 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender};
 use thiserror::Error;
 
 use pipeline::InputBytes;
@@ -30,6 +30,14 @@ pub struct Config {
     /// If true, BGZF fast-path uses `zlib-rs` (via flate2) for inflate
     /// instead of our in-house DEFLATE decoder. Diagnostic — A/B baseline.
     pub use_zlib_rs: bool,
+    /// Optional channel of recycled output buffers. When set, workers pull a
+    /// `Vec<u8>` from this channel (or allocate fresh if empty) to use as the
+    /// chunk's output buffer. The consumer of `sink` is expected to send the
+    /// drained `Vec` back to a paired sender once it's done with the bytes.
+    /// Within a few chunks of steady state every worker is reusing the same
+    /// pool of N buffers, so pages stay faulted-in and the per-chunk page
+    /// fault cost vanishes. No-op if `None`.
+    pub recycle_rx: Option<Receiver<Vec<u8>>>,
 }
 
 /// How chatty `read_gz` is on stderr.
@@ -57,6 +65,7 @@ impl Default for Config {
             chunk_size_bytes: 4 * 1024 * 1024,
             verbose: Verbosity::Off,
             use_zlib_rs: false,
+            recycle_rx: None,
         }
     }
 }

@@ -32,11 +32,21 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    // Recycle channel: drained output Vecs flow back to workers so pages
+    // stay faulted. Capacity ~= worker pool size; if it fills, drop the
+    // Vec rather than block stdout.
+    let recycle_cap = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        * 2;
+    let (recycle_tx, recycle_rx) = bounded::<Vec<u8>>(recycle_cap);
+
     let cfg = Config {
         num_threads: args.threads,
         chunk_size_bytes: args.chunk_size,
         verbose: if args.verbose { Verbosity::On } else { Verbosity::Off },
         use_zlib_rs: args.zlib_rs,
+        recycle_rx: Some(recycle_rx),
     };
 
     let (tx, rx) = bounded::<Vec<u8>>(16);
@@ -49,7 +59,12 @@ fn main() -> Result<()> {
     let mut out = stdout.lock();
     for chunk in rx {
         out.write_all(&chunk)?;
+        // Non-blocking: if the recycle channel is full, drop the Vec.
+        let _ = recycle_tx.try_send(chunk);
     }
+    // Close recycle_tx so any worker still blocked on recv exits cleanly
+    // (workers use try_recv though, so this is belt-and-braces).
+    drop(recycle_tx);
 
     producer.join().expect("producer thread panicked")?;
     Ok(())

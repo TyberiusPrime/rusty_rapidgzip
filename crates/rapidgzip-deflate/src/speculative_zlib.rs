@@ -25,21 +25,26 @@ use crate::DeflateError;
 use zlib_rs_vendored::speculative::{ContextGuard, SpeculativeContext};
 use zlib_rs_vendored::{Inflate, InflateError, InflateFlush, Status};
 
-/// One reusable engine instance + scratch output buffer. Re-used across
-/// chunks on a single worker thread to amortise the inflate state's window
-/// allocation (32 KiB) and the scratch buffer.
+/// One reusable engine instance. Re-used across chunks on a single worker
+/// thread to amortise the inflate state's window allocation (32 KiB).
+///
+/// The output buffer is supplied by the caller via `chunk.bytes` and is
+/// written into directly — no intermediate scratch. The caller is expected
+/// to recycle `chunk.bytes` across chunks (via the pipeline's recycle
+/// channel) so its pages stay faulted-in.
 pub struct SpeculativeZlibDecoder {
     engine: Inflate,
-    scratch: Vec<u8>,
 }
 
 impl SpeculativeZlibDecoder {
-    pub const DEFAULT_SCRATCH: usize = 4 * 1024 * 1024;
+    /// Step size for growing `chunk.bytes` when the engine wants more
+    /// output room. Chosen so most members fit in 1–2 grows; a 4 MiB step
+    /// matches the typical chunk size.
+    pub const GROW_STEP: usize = 4 * 1024 * 1024;
 
     pub fn new() -> Self {
         Self {
             engine: Inflate::new(false, 15),
-            scratch: vec![0u8; Self::DEFAULT_SCRATCH],
         }
     }
 
@@ -101,22 +106,40 @@ impl SpeculativeZlibDecoder {
         let mut ctx = SpeculativeContext::default();
         let guard = ContextGuard::new(&mut ctx);
 
-        // Keep the entire member's output in `scratch` so that all
-        // back-refs are in-buffer (the engine never has to read from its
-        // 32 KiB Window). This avoids needing to instrument window-source
-        // copies for marker propagation — propagation through `copy_match`
-        // (already instrumented) covers everything.
+        // Decode directly into chunk.bytes. We grow the Vec's len (with
+        // zeros) so the engine can write into the slice, then truncate
+        // back at the end. When chunk.bytes was recycled by the pipeline,
+        // its pages are already faulted in, so the resize is a cheap
+        // length-bump rather than a page-fault parade.
         //
-        // We grow `scratch` if a single decompress call runs out of output
-        // room. This is rare in practice: a member's output is bounded
-        // (e.g., ~64 KiB for BGZF; up to a chunk size for non-BGZF).
+        // Keep the entire member's output contiguous so that most
+        // back-refs land in-buffer (the engine never has to read from
+        // its 32 KiB Window). Window-source copies are also instrumented
+        // for marker propagation, so spilling to the window is correct;
+        // it's just slower.
         let mut written: usize = 0;
         let mut feed_consumed: usize = 0;
         let mut hit_bfinal = false;
         loop {
-            if written == self.scratch.len() {
-                let new_len = (self.scratch.len() * 2).max(Self::DEFAULT_SCRATCH);
-                self.scratch.resize(new_len, 0);
+            // Ensure spare room beyond chunk_base + written. We reserve
+            // capacity and bump `len` *without* zero-filling: zlib-rs only
+            // writes to the output buffer (never reads from uninit bytes
+            // before writing them), so handing it uninit memory is safe.
+            // Zero-filling on a 4 MiB grow shows up as several seconds of
+            // usr time on a multi-GB stream.
+            let needed = chunk_base + written + Self::GROW_STEP;
+            if chunk.bytes.len() < needed {
+                if chunk.bytes.capacity() < needed {
+                    chunk.bytes.reserve(needed - chunk.bytes.len());
+                }
+                // SAFETY: capacity is now >= needed. Bytes in
+                // [chunk.bytes.len(), needed) are uninitialized; the
+                // engine writes into them sequentially and only reads
+                // back from positions it has already written within the
+                // current call (DEFLATE in-buffer back-refs read from
+                // bytes the engine just emitted, never beyond `written`).
+                #[allow(unsafe_code)]
+                unsafe { chunk.bytes.set_len(needed); }
             }
             // Marker positions must be member-absolute; the engine's
             // per-call `writer.len()` resets between calls when the window
@@ -126,11 +149,12 @@ impl SpeculativeZlibDecoder {
             let total_in_before = self.engine.total_in();
             // `InflateFlush::Block` returns `Ok` at every block boundary,
             // so we can stop precisely at the chunk's `end_bit_hint`.
+            let avail_out = chunk.bytes.len() - (chunk_base + written);
             let status = self
                 .engine
                 .decompress(
                     &feed[feed_consumed..],
-                    &mut self.scratch[written..],
+                    &mut chunk.bytes[chunk_base + written..],
                     InflateFlush::Block,
                 )
                 .map_err(map_inflate_err)?;
@@ -140,9 +164,9 @@ impl SpeculativeZlibDecoder {
             written += produced;
 
             // Was this an "at-a-block-boundary" Ok, or an "output-buffer-full" Ok?
-            // If we produced exactly `avail_out` and the buffer is now full,
-            // we are likely not at a block boundary — extend scratch and continue.
-            let buffer_was_full = produced > 0 && written == self.scratch.len();
+            // If we produced exactly `avail_out`, we are likely not at a
+            // block boundary — extend chunk.bytes and continue.
+            let buffer_was_full = produced > 0 && produced == avail_out;
             match status {
                 Status::StreamEnd => {
                     hit_bfinal = true;
@@ -150,7 +174,6 @@ impl SpeculativeZlibDecoder {
                 }
                 Status::Ok => {
                     if buffer_was_full {
-                        // Don't treat as block boundary — just grow and continue.
                         continue;
                     }
                     let bits_in_buf = self.engine.bits_in_buffer() as u64;
@@ -165,7 +188,7 @@ impl SpeculativeZlibDecoder {
                 Status::BufError => return Err(DeflateError::UnexpectedEof),
             }
         }
-        chunk.bytes.extend_from_slice(&self.scratch[..written]);
+        chunk.bytes.truncate(chunk_base + written);
 
         // Drop the guard so we can stop borrowing ctx mutably.
         drop(guard);

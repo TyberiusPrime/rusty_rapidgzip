@@ -132,6 +132,7 @@ pub fn parallel_decode_member(
     let num_threads = effective_threads(config);
     let verbose = config.verbose.is_on();
     let use_zlib_rs = config.use_zlib_rs;
+    let recycle_rx = config.recycle_rx.clone();
     if verbose && use_zlib_rs {
         eprintln!("[rapidgzip] pipeline: using zlib-rs speculative backend (--zlib-rs)");
     }
@@ -229,14 +230,20 @@ pub fn parallel_decode_member(
         let input = Arc::clone(&input);
         let work_rx = work_rx.clone();
         let result_tx = result_tx.clone();
+        let recycle_rx = recycle_rx.clone();
         let handle = thread::spawn(move || {
             let body = &input.as_slice()[body_offset..];
-            // Per-worker reusable zlib-rs decoder (amortises engine state +
-            // scratch buffer across many chunks). Only allocated if enabled.
+            // Per-worker reusable zlib-rs decoder (amortises engine state
+            // across many chunks). Only allocated if enabled.
             let mut zdec: Option<SpeculativeZlibDecoder> =
                 if use_zlib_rs { Some(SpeculativeZlibDecoder::new()) } else { None };
             while let Ok(item) = work_rx.recv() {
-                let res = decode_one_chunk(body, &item, zdec.as_mut());
+                // Try to pull a recycled output buffer; pages on it are
+                // warm so subsequent writes don't take page faults.
+                let recycled = recycle_rx
+                    .as_ref()
+                    .and_then(|r| r.try_recv().ok());
+                let res = decode_one_chunk(body, &item, zdec.as_mut(), recycled);
                 if result_tx.send(res).is_err() {
                     return;
                 }
@@ -390,10 +397,15 @@ fn decode_one_chunk(
     body: &[u8],
     item: &WorkItem,
     zdec: Option<&mut SpeculativeZlibDecoder>,
+    recycled_bytes: Option<Vec<u8>>,
 ) -> Result<WorkResult, Error> {
     let mut br = BitReader::new(body);
     br.seek_to_bit(item.start_bit).map_err(Error::Deflate)?;
     let mut chunk = SpeculativeChunk::default();
+    if let Some(mut v) = recycled_bytes {
+        v.clear();
+        chunk.bytes = v;
+    }
     // Optimistic pre-allocate: assume ~3x compression ratio. Worst case
     // (incompressible / stored blocks) we over-reserve harmlessly; common
     // case avoids the cascade of doublings.
