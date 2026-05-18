@@ -90,6 +90,16 @@ pub fn is_active() -> bool {
     ACTIVE.with(|c| !c.get().is_null())
 }
 
+/// Snapshot the active context pointer once. Hot inflate paths call this at
+/// the top of the function and then pass the snapshot to
+/// [`propagate_match_cached`] for every back-ref, avoiding a TLS load per
+/// match. The pointer remains valid for the duration of the active
+/// `ContextGuard` — i.e., for the whole `decompress` call.
+#[inline(always)]
+pub fn cache_active_ptr() -> *mut SpeculativeContext {
+    ACTIVE.with(|c| c.get())
+}
+
 /// Set the active context's `out_pos_offset`. The caller must update this
 /// before each `decompress` call so the engine's per-call `writer.len()`
 /// values translate into member-absolute marker positions. No-op if no
@@ -148,14 +158,27 @@ pub fn record_match_prefix(
 /// Called *unconditionally* by the engine on the in-buffer back-ref paths.
 /// Fast early-out: if a context is not active, or the source range is
 /// strictly above `max_marker_pos`, returns immediately with no work.
-#[inline]
+#[inline(always)]
 pub fn propagate_match(written_at_match_start: usize, dist: usize, len: usize) {
-    let ptr = ACTIVE.with(|c| c.get());
-    if ptr.is_null() {
+    propagate_match_cached(cache_active_ptr(), written_at_match_start, dist, len);
+}
+
+/// Same as [`propagate_match`] but uses a pre-snapshotted context pointer
+/// (see [`cache_active_ptr`]). The hot loops in `inflate_fast_help_impl`
+/// and `dispatch` call this once per back-ref so the TLS load happens
+/// once per `decompress` call instead of once per match.
+#[inline(always)]
+pub fn propagate_match_cached(
+    ctx_ptr: *mut SpeculativeContext,
+    written_at_match_start: usize,
+    dist: usize,
+    len: usize,
+) {
+    if ctx_ptr.is_null() {
         return;
     }
     // SAFETY: see record_match_prefix.
-    let ctx = unsafe { &mut *ptr };
+    let ctx = unsafe { &mut *ctx_ptr };
     let max = match ctx.max_marker_pos {
         None => return,
         Some(m) => m as usize,

@@ -576,6 +576,11 @@ impl State<'_> {
     // It unfortunately does duplicate the code for some of the states; deduplicating it by having
     // more of the states call this function is slower.
     fn len_and_friends(&mut self) -> ControlFlow<ReturnCode, ()> {
+        // Snapshot the speculative-context TLS pointer once for the whole
+        // call so the back-ref hot loop below avoids a TLS load per match.
+        #[cfg(feature = "std")]
+        let spec_ctx = crate::speculative::cache_active_ptr();
+
         let avail_in = self.bit_reader.bytes_remaining();
         let avail_out = self.writer.remaining();
 
@@ -913,7 +918,8 @@ impl State<'_> {
                             let dst_start = writer.len();
                             writer.extend_from_window(&self.window, from..from + copy);
                             #[cfg(feature = "std")]
-                            crate::speculative::propagate_match(
+                            crate::speculative::propagate_match_cached(
+                                spec_ctx,
                                 dst_start,
                                 self.offset,
                                 copy,
@@ -925,7 +931,12 @@ impl State<'_> {
                             let dst_start = writer.len();
                             writer.copy_match(self.offset, copy);
                             #[cfg(feature = "std")]
-                            crate::speculative::propagate_match(dst_start, self.offset, copy);
+                            crate::speculative::propagate_match_cached(
+                                spec_ctx,
+                                dst_start,
+                                self.offset,
+                                copy,
+                            );
 
                             copy
                         };
@@ -949,6 +960,11 @@ impl State<'_> {
     fn dispatch(&mut self) -> ReturnCode {
         // Note: All early returns must save mode into self.mode again.
         let mut mode = self.mode;
+
+        // Snapshot the speculative-context TLS pointer once for the whole
+        // call so the back-ref hot loops below avoid a TLS load per match.
+        #[cfg(feature = "std")]
+        let spec_ctx = crate::speculative::cache_active_ptr();
 
         macro_rules! pull_byte {
             ($self:expr) => {
@@ -1668,7 +1684,12 @@ impl State<'_> {
                                 self.writer
                                     .extend_from_window(&self.window, from..from + copy);
                                 #[cfg(feature = "std")]
-                                crate::speculative::propagate_match(dst_start, self.offset, copy);
+                                crate::speculative::propagate_match_cached(
+                                    spec_ctx,
+                                    dst_start,
+                                    self.offset,
+                                    copy,
+                                );
 
                                 copy
                             } else {
@@ -1676,7 +1697,12 @@ impl State<'_> {
                                 let dst_start = self.writer.len();
                                 self.writer.copy_match(self.offset, copy);
                                 #[cfg(feature = "std")]
-                                crate::speculative::propagate_match(dst_start, self.offset, copy);
+                                crate::speculative::propagate_match_cached(
+                                    spec_ctx,
+                                    dst_start,
+                                    self.offset,
+                                    copy,
+                                );
 
                                 copy
                             };
@@ -2013,6 +2039,11 @@ unsafe fn inflate_fast_help_impl<const FEATURES: usize>(state: &mut State, _star
     let mut writer = Writer::new(&mut []);
     core::mem::swap(&mut writer, &mut state.writer);
 
+    // Snapshot the speculative-context TLS pointer once so the hot back-ref
+    // loop below avoids a TLS load per match.
+    #[cfg(feature = "std")]
+    let spec_ctx = crate::speculative::cache_active_ptr();
+
     let lcode = state.len_table_ref();
     let dcode = state.dist_table_ref();
 
@@ -2187,7 +2218,8 @@ unsafe fn inflate_fast_help_impl<const FEATURES: usize>(state: &mut State, _star
                                         from..from + op,
                                     );
                                     #[cfg(feature = "std")]
-                                    crate::speculative::propagate_match(
+                                    crate::speculative::propagate_match_cached(
+                                        spec_ctx,
                                         dst_start,
                                         dist as usize,
                                         op,
@@ -2204,7 +2236,8 @@ unsafe fn inflate_fast_help_impl<const FEATURES: usize>(state: &mut State, _star
                                 from..from + copy,
                             );
                             #[cfg(feature = "std")]
-                            crate::speculative::propagate_match(
+                            crate::speculative::propagate_match_cached(
+                                spec_ctx,
                                 dst_start_w,
                                 dist as usize,
                                 copy,
@@ -2219,7 +2252,8 @@ unsafe fn inflate_fast_help_impl<const FEATURES: usize>(state: &mut State, _star
                                     tail,
                                 );
                                 #[cfg(feature = "std")]
-                                crate::speculative::propagate_match(
+                                crate::speculative::propagate_match_cached(
+                                    spec_ctx,
                                     dst_start,
                                     dist as usize,
                                     tail,
@@ -2231,7 +2265,8 @@ unsafe fn inflate_fast_help_impl<const FEATURES: usize>(state: &mut State, _star
                             let dst_start = writer.len();
                             writer.copy_match_with_features::<FEATURES>(dist as usize, len as usize);
                             #[cfg(feature = "std")]
-                            crate::speculative::propagate_match(
+                            crate::speculative::propagate_match_cached(
+                                spec_ctx,
                                 dst_start,
                                 dist as usize,
                                 len as usize,
