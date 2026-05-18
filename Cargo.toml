@@ -37,3 +37,13 @@ debug = "line-tables-only"
 [profile.bench]
 lto = "thin"
 codegen-units = 1
+
+# For samply / perf. Inherits release perf characteristics but emits full
+# debug info + frame pointers so call stacks resolve cleanly. Build with
+# `cargo build --profile profiling -p rapidgzip-bin` →
+# `./target_claude/profiling/rapidgzip-rs`.
+[profile.profiling]
+inherits = "release"
+debug = "full"
+strip = false
+force-frame-pointers = true

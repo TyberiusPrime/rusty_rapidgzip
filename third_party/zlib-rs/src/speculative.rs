@@ -202,19 +202,56 @@ pub fn propagate_match_cached(
     // are themselves freshly-written destination bytes (which may have just
     // become markers in this very loop). The position formula handles both
     // by using absolute output positions: src_pos(k) = dst_start - dist + k.
+    //
+    // src_pos is strictly monotonically increasing in k, so instead of one
+    // binary_search per byte (O(len · log markers)), we do a single
+    // `partition_point` to find the first marker with `out_pos >= src_lo`,
+    // then advance that cursor linearly as k advances. Newly-pushed markers
+    // land at the end of `ctx.markers` with `out_pos = dst_start + k` —
+    // strictly greater than every existing marker — so the array stays
+    // sorted and the cursor can flow into them on overlap copies.
+    let mut cursor = ctx
+        .markers
+        .partition_point(|m| (m.out_pos as usize) < src_lo);
     let mut new_max = max;
     for k in 0..len {
         let src_pos = (dst_start + k).wrapping_sub(dist);
         if src_pos > new_max {
             break;
         }
-        let lookup =
-            ctx.markers.binary_search_by_key(&(src_pos as u32), |m| m.out_pos);
-        if let Ok(idx) = lookup {
-            let po = ctx.markers[idx].prefix_offset;
+        // Skip markers whose out_pos is below src_pos. Bounded by
+        // ctx.markers.len() which we may grow inside this loop.
+        let markers_len = ctx.markers.len();
+        while cursor < markers_len
+            && (ctx.markers[cursor].out_pos as usize) < src_pos
+        {
+            cursor += 1;
+        }
+        if cursor >= markers_len {
+            // No more existing markers in range. Future iterations can
+            // only hit markers we push *during* this loop; those land at
+            // (dst_start + k') with k' <= current k, so out_pos
+            // <= dst_start + k < src_pos for any future k where src_pos
+            // > dst_start + k_pushed. In particular for non-overlap
+            // (dist >= len), src_pos < dst_start always and no new
+            // markers can match — safe to stop.
+            //
+            // For overlap (dist < len): once k >= dist, src_pos can equal
+            // out_pos of just-pushed markers. The cursor would already be
+            // pointing at the first such marker (since we extended
+            // ctx.markers and `markers_len` is now stale). Refresh and
+            // continue checking instead of breaking.
+            if k + 1 < len && (dst_start + k + 1).wrapping_sub(dist) <= new_max {
+                continue;
+            }
+            break;
+        }
+        if (ctx.markers[cursor].out_pos as usize) == src_pos {
+            let po = ctx.markers[cursor].prefix_offset;
             let new_pos = (dst_start + k) as u32;
             ctx.markers.push(MarkerRec { out_pos: new_pos, prefix_offset: po });
             new_max = new_pos as usize;
+            cursor += 1;
         }
     }
     ctx.max_marker_pos = Some(new_max as u32);
