@@ -134,7 +134,10 @@ pub fn parallel_decode_member(
     let use_zlib_rs = config.use_zlib_rs;
     let recycle_rx = config.recycle_rx.clone();
     if verbose && use_zlib_rs {
-        eprintln!("[rapidgzip] pipeline: using zlib-rs speculative backend (--zlib-rs)");
+        eprintln!(
+            "[rapidgzip +{:.2}s] pipeline: using zlib-rs speculative backend (--zlib-rs)",
+            crate::elapsed_since_start(),
+        );
     }
     let total_bits = (body.len() as u64) * 8;
     let chunk_bits = (config.chunk_size_bytes as u64).max(64 * 1024) * 8;
@@ -190,7 +193,8 @@ pub fn parallel_decode_member(
     }
     if verbose {
         eprintln!(
-            "[rapidgzip] pipeline: scanned in {:.3}s",
+            "[rapidgzip +{:.2}s] pipeline: scanned in {:.3}s",
+            crate::elapsed_since_start(),
             t_scan.elapsed().as_secs_f64(),
         );
     }
@@ -208,12 +212,14 @@ pub fn parallel_decode_member(
     let num_chunks = work_items.len();
     if verbose {
         eprintln!(
-            "[rapidgzip] pipeline: {} boundaries found → {num_chunks} chunk(s), {num_threads} worker(s)",
+            "[rapidgzip +{:.2}s] pipeline: {} boundaries found → {num_chunks} chunk(s), {num_threads} worker(s)",
+            crate::elapsed_since_start(),
             boundaries.len(),
         );
         if num_chunks <= 1 {
             eprintln!(
-                "[rapidgzip] pipeline: only one chunk — parallel path degrades to serial-equivalent decode",
+                "[rapidgzip +{:.2}s] pipeline: only one chunk — parallel path degrades to serial-equivalent decode",
+                crate::elapsed_since_start(),
             );
         }
     }
@@ -553,7 +559,10 @@ pub fn parallel_decode_bgzf(
     let verbose = config.verbose.is_on();
     let use_zlib_rs = config.use_zlib_rs;
     if verbose && use_zlib_rs {
-        eprintln!("[rapidgzip] bgzf: using zlib-rs backend (--zlib-rs)");
+        eprintln!(
+            "[rapidgzip +{:.2}s] bgzf: using zlib-rs backend (--zlib-rs)",
+            crate::elapsed_since_start(),
+        );
     }
 
     // Walk member boundaries up front.
@@ -596,7 +605,8 @@ pub fn parallel_decode_bgzf(
 
     if verbose {
         eprintln!(
-            "[rapidgzip] bgzf: {} members → {} batch(es), {} worker(s)",
+            "[rapidgzip +{:.2}s] bgzf: {} members → {} batch(es), {} worker(s)",
+            crate::elapsed_since_start(),
             members.len(),
             batches.len(),
             num_threads,

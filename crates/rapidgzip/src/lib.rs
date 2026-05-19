@@ -9,9 +9,20 @@ pub mod pipeline;
 
 pub use gzip::{decode_all, decode_one, GzipError};
 
+static VERBOSE_START: OnceLock<Instant> = OnceLock::new();
+
+/// Seconds elapsed since the first verbose log site fired (process-wide).
+pub fn elapsed_since_start() -> f64 {
+    VERBOSE_START
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_secs_f64()
+}
+
 use std::fs::File;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use crossbeam_channel::{Receiver, Sender};
 use thiserror::Error;
@@ -116,7 +127,8 @@ pub fn read_gz(
     let input = Arc::new(InputBytes::Mapped(mmap));
     if verbose {
         eprintln!(
-            "[rapidgzip] {}: mmaped {} bytes in {:.3}s, {} threads, chunk_size={}",
+            "[rapidgzip +{:.2}s] {}: mmaped {} bytes in {:.3}s, {} threads, chunk_size={}",
+            elapsed_since_start(),
             path.display(),
             compressed_bytes,
             t_open.elapsed().as_secs_f64(),
@@ -130,7 +142,10 @@ pub fn read_gz(
     // and we can decode them in parallel without speculation or markers.
     let (total_uncompressed, chunks_sent) = if gzip::parse_bgzf_block_size(input.as_slice()).is_some() {
         if verbose {
-            eprintln!("[rapidgzip] bgzf detected — using fast path");
+            eprintln!(
+                "[rapidgzip +{:.2}s] bgzf detected — using fast path",
+                elapsed_since_start(),
+            );
         }
         pipeline::parallel_decode_bgzf(Arc::clone(&input), &sink, &config)?
     } else {
@@ -145,7 +160,8 @@ pub fn read_gz(
     drop(sink);
     if verbose {
         eprintln!(
-            "[rapidgzip] done: {total_uncompressed} uncompressed bytes, {chunks_sent} output chunks",
+            "[rapidgzip +{:.2}s] done: {total_uncompressed} uncompressed bytes, {chunks_sent} output chunks",
+            elapsed_since_start(),
         );
     }
     Ok(DecodeStats {

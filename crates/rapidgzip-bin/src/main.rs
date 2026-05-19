@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::Parser;
 use crossbeam_channel::bounded;
-use rapidgzip::{read_gz, Config, Verbosity};
+use rapidgzip::{elapsed_since_start, read_gz, Config, Verbosity};
 
 #[derive(Parser, Debug)]
 #[command(name = "rapidgzip-rs", version)]
@@ -57,8 +57,33 @@ fn main() -> Result<()> {
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
+    let start = std::time::Instant::now();
+    let mut last_report = start;
+    let mut bytes_since_last: u64 = 0;
+    let mut total_bytes: u64 = 0;
     for chunk in rx {
         out.write_all(&chunk)?;
+        bytes_since_last += chunk.len() as u64;
+        total_bytes += chunk.len() as u64;
+        if args.verbose {
+            let now = std::time::Instant::now();
+            let elapsed = now.duration_since(last_report);
+            if elapsed.as_secs_f64() >= 1.0 {
+                let mbps = (bytes_since_last as f64) / elapsed.as_secs_f64() / (1024.0 * 1024.0);
+                let avg = (total_bytes as f64)
+                    / now.duration_since(start).as_secs_f64()
+                    / (1024.0 * 1024.0);
+                eprintln!(
+                    "[rapidgzip +{:.2}s] {:.1} MB/s (avg {:.1} MB/s, {:.1} MB total)",
+                    elapsed_since_start(),
+                    mbps,
+                    avg,
+                    total_bytes as f64 / (1024.0 * 1024.0),
+                );
+                last_report = now;
+                bytes_since_last = 0;
+            }
+        }
         // Non-blocking: if the recycle channel is full, drop the Vec.
         let _ = recycle_tx.try_send(chunk);
     }
