@@ -41,7 +41,7 @@ fn bench_throughput(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(meta.len()));
         group.bench_with_input(BenchmarkId::from_parameter(&name), &path, |b, path| {
             b.iter(|| {
-                let (tx, rx) = bounded::<Vec<u8>>(16);
+                let (tx, rx) = bounded::<std::sync::Arc<Vec<u8>>>(16);
                 let p = path.clone();
                 let h = std::thread::spawn(move || {
                     rapidgzip::read_gz(&p, tx, rapidgzip::Config::default())

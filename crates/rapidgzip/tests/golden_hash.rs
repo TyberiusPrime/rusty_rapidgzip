@@ -45,7 +45,7 @@ fn fixtures() -> Vec<(PathBuf, String)> {
 }
 
 fn decode_and_hash(path: &Path) -> anyhow::Result<String> {
-    let (tx, rx) = bounded::<Vec<u8>>(16);
+    let (tx, rx) = bounded::<std::sync::Arc<Vec<u8>>>(16);
     let path_owned = path.to_owned();
     let producer = std::thread::spawn(move || {
         rapidgzip::read_gz(&path_owned, tx, rapidgzip::Config::default())
@@ -53,7 +53,7 @@ fn decode_and_hash(path: &Path) -> anyhow::Result<String> {
 
     let mut h = Sha256::new();
     for chunk in rx {
-        h.update(&chunk);
+        h.update(&**chunk);
     }
     producer.join().expect("producer panicked")?;
     Ok(hex::encode(h.finalize()))

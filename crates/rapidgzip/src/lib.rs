@@ -43,12 +43,16 @@ pub struct Config {
     pub use_zlib_rs: bool,
     /// Optional channel of recycled output buffers. When set, workers pull a
     /// `Vec<u8>` from this channel (or allocate fresh if empty) to use as the
-    /// chunk's output buffer. The consumer of `sink` is expected to send the
-    /// drained `Vec` back to a paired sender once it's done with the bytes.
-    /// Within a few chunks of steady state every worker is reusing the same
-    /// pool of N buffers, so pages stay faulted-in and the per-chunk page
-    /// fault cost vanishes. No-op if `None`.
+    /// chunk's output buffer. Within a few chunks of steady state every
+    /// worker is reusing the same pool of N buffers, so pages stay
+    /// faulted-in and the per-chunk page fault cost vanishes. No-op if `None`.
     pub recycle_rx: Option<Receiver<Vec<u8>>>,
+    /// Sender paired with `recycle_rx`. The pipeline forwards drained
+    /// `Vec<u8>` buffers here after their bytes have been streamed AND
+    /// CRC-validated. The pipeline (not the consumer of `sink`) owns the
+    /// recycle return path because `sink` emits `Arc<Vec<u8>>` shared with
+    /// the CRC validator, and only the pipeline knows when both refs drop.
+    pub recycle_tx: Option<Sender<Vec<u8>>>,
 }
 
 /// How chatty `read_gz` is on stderr.
@@ -77,6 +81,7 @@ impl Default for Config {
             verbose: Verbosity::Off,
             use_zlib_rs: false,
             recycle_rx: None,
+            recycle_tx: None,
         }
     }
 }
@@ -110,7 +115,7 @@ pub enum Error {
 /// without changing the signature.
 pub fn read_gz(
     path: impl AsRef<Path>,
-    sink: Sender<Vec<u8>>,
+    sink: Sender<Arc<Vec<u8>>>,
     config: Config,
 ) -> Result<DecodeStats, Error> {
     let path = path.as_ref();

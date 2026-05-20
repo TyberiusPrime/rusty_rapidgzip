@@ -122,7 +122,7 @@ struct MemberBoundary {
 pub fn parallel_decode_member(
     input: Arc<InputBytes>,
     body_offset: usize,
-    sink: &Sender<Vec<u8>>,
+    sink: &Sender<Arc<Vec<u8>>>,
     config: &Config,
 ) -> Result<(u64, usize, u64), Error> {
     // Inside this function `body` is the deflate body — the slice of `input`
@@ -133,6 +133,7 @@ pub fn parallel_decode_member(
     let verbose = config.verbose.is_on();
     let use_zlib_rs = config.use_zlib_rs;
     let recycle_rx = config.recycle_rx.clone();
+    let recycle_tx_for_crc = config.recycle_tx.clone();
     if verbose && use_zlib_rs {
         eprintln!(
             "[rapidgzip +{:.2}s] pipeline: using zlib-rs speculative backend (--zlib-rs)",
@@ -269,17 +270,80 @@ pub fn parallel_decode_member(
         }
     });
 
+    // Dedicated CRC validator thread. Receives resolved chunks in chunk_id
+    // order from the serializer; runs the running CRC32 + per-member
+    // validation off the serializer's critical path. The bytes are shared
+    // via Arc — main writes them to stdout in parallel with this validation.
+    let (crc_tx, crc_rx) = bounded::<(Arc<Vec<u8>>, Vec<MemberBoundary>)>(num_threads * 2);
+    let crc_handle: thread::JoinHandle<Result<(), Error>> = thread::spawn(move || {
+        let mut cur_crc = crc32fast::Hasher::new();
+        let mut cur_uncompressed: u64 = 0;
+        let mut member_idx: u32 = 0;
+        for (bytes_arc, member_boundaries) in crc_rx {
+            let bytes: &[u8] = &bytes_arc;
+            let mut cursor = 0usize;
+            for mb in &member_boundaries {
+                let piece = &bytes[cursor..mb.byte_offset_in_chunk];
+                cur_crc.update(piece);
+                cur_uncompressed += piece.len() as u64;
+
+                let crc_got = std::mem::replace(
+                    &mut cur_crc,
+                    crc32fast::Hasher::new(),
+                )
+                .finalize();
+                if crc_got != mb.crc_expected {
+                    return Err(Error::Gzip(crate::GzipError::CrcMismatch {
+                        expected: mb.crc_expected,
+                        got: crc_got,
+                        member: member_idx,
+                        uncompressed: cur_uncompressed,
+                        trailer_byte: mb.trailer_input_byte,
+                    }));
+                }
+                if (cur_uncompressed & 0xFFFF_FFFF) as u32 != mb.isize_expected {
+                    return Err(Error::Gzip(crate::GzipError::IsizeMismatch {
+                        expected: mb.isize_expected,
+                        got: cur_uncompressed,
+                        member: member_idx,
+                        trailer_byte: mb.trailer_input_byte,
+                    }));
+                }
+                member_idx += 1;
+                cur_uncompressed = 0;
+                cursor = mb.byte_offset_in_chunk;
+            }
+            let tail = &bytes[cursor..];
+            cur_crc.update(tail);
+            cur_uncompressed += tail.len() as u64;
+
+            // Recycle the inner Vec back to the worker pool if main has
+            // already finished writing this chunk. CRC is typically the
+            // slower of the two consumers, so try_unwrap usually succeeds
+            // here. If main is still holding the Arc we drop our ref and
+            // skip recycle for this one — main will drop without recycling
+            // (it doesn't have the recycle_tx) and the Vec is freed.
+            drop(member_boundaries);
+            if let (Some(tx), Ok(mut v)) = (
+                recycle_tx_for_crc.as_ref(),
+                Arc::try_unwrap(bytes_arc),
+            ) {
+                v.clear();
+                let _ = tx.try_send(v);
+            }
+        }
+        Ok(())
+    });
+
     // Serializer (run on the calling thread): receive results, reorder,
-    // resolve markers, stream bytes out, validate every member's trailer.
+    // resolve markers, stream bytes out. CRC validation happens on the
+    // CRC thread above; we just forward the resolved bytes.
     let mut reorder: std::collections::BTreeMap<u64, WorkResult> =
         std::collections::BTreeMap::new();
     let mut next_id: u64 = 0;
     let mut prev_tail: Vec<u8> = Vec::new();
     let mut total_uncompressed: u64 = 0;
     let mut chunks_sent: u64 = 0;
-    let mut member_idx: u32 = 0;
-    let mut cur_crc = crc32fast::Hasher::new();
-    let mut cur_uncompressed: u64 = 0;
     let mut final_byte_after_last_trailer: Option<usize> = None;
     let mut last_err: Option<Error> = None;
 
@@ -295,49 +359,7 @@ pub fn parallel_decode_member(
             }
             update_tail(&mut prev_tail, &res.chunk.bytes);
 
-            // Walk this chunk's bytes piece-by-piece, splitting at each
-            // member boundary. CRC + ISIZE finalized & checked at each.
-            let bytes = &res.chunk.bytes;
-            let mut cursor = 0usize;
-            for mb in &res.member_boundaries {
-                let piece = &bytes[cursor..mb.byte_offset_in_chunk];
-                cur_crc.update(piece);
-                cur_uncompressed += piece.len() as u64;
-
-                let crc_got = std::mem::replace(
-                    &mut cur_crc,
-                    crc32fast::Hasher::new(),
-                )
-                .finalize();
-                if crc_got != mb.crc_expected {
-                    last_err = Some(Error::Gzip(crate::GzipError::CrcMismatch {
-                        expected: mb.crc_expected,
-                        got: crc_got,
-                        member: member_idx,
-                        uncompressed: cur_uncompressed,
-                        trailer_byte: mb.trailer_input_byte,
-                    }));
-                    break 'outer;
-                }
-                if (cur_uncompressed & 0xFFFF_FFFF) as u32 != mb.isize_expected {
-                    last_err = Some(Error::Gzip(crate::GzipError::IsizeMismatch {
-                        expected: mb.isize_expected,
-                        got: cur_uncompressed,
-                        member: member_idx,
-                        trailer_byte: mb.trailer_input_byte,
-                    }));
-                    break 'outer;
-                }
-                member_idx += 1;
-                cur_uncompressed = 0;
-                cursor = mb.byte_offset_in_chunk;
-            }
-            // Trailing bytes after the last boundary feed into the
-            // still-open current member.
-            let tail = &bytes[cursor..];
-            cur_crc.update(tail);
-            cur_uncompressed += tail.len() as u64;
-            total_uncompressed += bytes.len() as u64;
+            total_uncompressed += res.chunk.bytes.len() as u64;
 
             let saw_final = res.final_block;
             if let Some(mb) = res.member_boundaries.last() {
@@ -347,7 +369,14 @@ pub fn parallel_decode_member(
                 }
             }
 
-            if sink.send(res.chunk.bytes).is_err() {
+            let bytes_arc = Arc::new(res.chunk.bytes);
+            // Send to CRC thread first, then to sink. If CRC thread has
+            // exited (error), its channel send fails — we'll surface that
+            // when joining.
+            let _ = crc_tx.send((Arc::clone(&bytes_arc), res.member_boundaries));
+            if sink.send(bytes_arc).is_err() {
+                drop(crc_tx);
+                let _ = crc_handle.join();
                 return Ok((total_uncompressed, body.len(), chunks_sent));
             }
             chunks_sent += 1;
@@ -387,9 +416,17 @@ pub fn parallel_decode_member(
         let _ = h.join();
     }
 
+    // Close CRC channel and join. Surface CRC errors over any serializer
+    // error (serializer-side errors are non-CRC paths like marker resolution).
+    drop(crc_tx);
+    let crc_result = crc_handle.join().unwrap_or_else(|_| {
+        Err(Error::Io(std::io::Error::other("crc thread panicked")))
+    });
+
     if let Some(e) = last_err {
         return Err(e);
     }
+    crc_result?;
 
     let body_consumed = final_byte_after_last_trailer.ok_or_else(|| {
         Error::Io(std::io::Error::other(
@@ -550,7 +587,7 @@ fn update_tail(prev_tail: &mut Vec<u8>, new_bytes: &[u8]) {
 /// Returns `(total_uncompressed, chunks_sent)`.
 pub fn parallel_decode_bgzf(
     file: Arc<InputBytes>,
-    sink: &Sender<Vec<u8>>,
+    sink: &Sender<Arc<Vec<u8>>>,
     config: &Config,
 ) -> Result<(u64, u64), Error> {
     use std::collections::BTreeMap;
@@ -696,7 +733,7 @@ pub fn parallel_decode_bgzf(
                 pending.insert(id, bytes);
                 while let Some(bytes) = pending.remove(&next_id) {
                     total_uncompressed += bytes.len() as u64;
-                    if sink.send(bytes).is_err() {
+                    if sink.send(Arc::new(bytes)).is_err() {
                         last_err = Some(Error::Io(std::io::Error::new(
                             std::io::ErrorKind::BrokenPipe,
                             "sink closed",
@@ -752,7 +789,7 @@ mod tests {
     }
 
     fn decode_via_read_gz(path: &std::path::Path, cfg: Config) -> Vec<u8> {
-        let (tx, rx) = bounded::<Vec<u8>>(8);
+        let (tx, rx) = bounded::<Arc<Vec<u8>>>(8);
         let path = path.to_owned();
         let producer = std::thread::spawn(move || read_gz(&path, tx, cfg));
         let mut out = Vec::new();
@@ -837,7 +874,7 @@ mod tests {
         // We need to capture chunks even when CRC fails. Hack: read until
         // producer dies, ignore the error result.
         let collect = |use_zlib_rs: bool| -> Vec<u8> {
-            let (tx, rx) = unbounded::<Vec<u8>>();
+            let (tx, rx) = unbounded::<Arc<Vec<u8>>>();
             let p2 = path.clone();
             let producer = std::thread::spawn(move || {
                 let _ = read_gz(

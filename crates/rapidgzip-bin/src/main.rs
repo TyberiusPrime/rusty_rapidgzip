@@ -3,6 +3,7 @@
 
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
@@ -47,9 +48,10 @@ fn main() -> Result<()> {
         verbose: if args.verbose { Verbosity::On } else { Verbosity::Off },
         use_zlib_rs: args.zlib_rs,
         recycle_rx: Some(recycle_rx),
+        recycle_tx: Some(recycle_tx.clone()),
     };
 
-    let (tx, rx) = bounded::<Vec<u8>>(16);
+    let (tx, rx) = bounded::<Arc<Vec<u8>>>(16);
     eprintln!("This is the new binary");
 
     let input = args.input.clone();
@@ -84,8 +86,12 @@ fn main() -> Result<()> {
                 bytes_since_last = 0;
             }
         }
-        // Non-blocking: if the recycle channel is full, drop the Vec.
-        let _ = recycle_tx.try_send(chunk);
+        // Recycle the inner Vec only if no other Arc reference is live (the
+        // CRC validator may still hold one). When it doesn't, the Vec just
+        // gets dropped here and the worker allocates fresh next iteration.
+        if let Ok(v) = Arc::try_unwrap(chunk) {
+            let _ = recycle_tx.try_send(v);
+        }
     }
     // Close recycle_tx so any worker still blocked on recv exits cleanly
     // (workers use try_recv though, so this is belt-and-braces).
