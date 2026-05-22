@@ -83,12 +83,6 @@ struct WorkItem {
 struct WorkResult {
     id: u64,
     chunk: SpeculativeChunk,
-    /// Bit position after the worker stopped (start of next chunk if not
-    /// final, else the byte-aligned bit position immediately after the very
-    /// last member's trailer). Currently unused by the serializer but kept
-    /// for diagnostics.
-    #[allow(dead_code)]
-    end_bit: u64,
     /// Set when the worker reached real EOF after the last member's trailer.
     final_block: bool,
     /// Member transitions encountered while decoding this chunk. Each entry
@@ -543,7 +537,6 @@ fn decode_one_chunk(
     Ok(WorkResult {
         id: item.id,
         chunk,
-        end_bit: br.tell_bit(),
         final_block,
         member_boundaries,
     })

@@ -16,7 +16,6 @@ use rapidgzip_deflate::{inflate, BitReader, DeflateError};
 const GZ_MAGIC: [u8; 2] = [0x1f, 0x8b];
 const CM_DEFLATE: u8 = 8;
 
-const FTEXT: u8 = 1 << 0;
 const FHCRC: u8 = 1 << 1;
 const FEXTRA: u8 = 1 << 2;
 const FNAME: u8 = 1 << 3;
@@ -241,7 +240,6 @@ pub(crate) fn parse_header(input: &[u8]) -> Result<usize, GzipError> {
         }
         pos += 2;
     }
-    let _ = FTEXT; // declared for completeness; semantic is "ASCII hint"
     Ok(pos)
 }
 

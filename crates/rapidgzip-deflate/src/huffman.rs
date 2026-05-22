@@ -70,9 +70,6 @@ pub const MAX_CODE_LEN: u32 = 15;
 // Packed-entry flag bits.
 pub const HUFFDEC_LITERAL: u32 = 1 << 31;
 pub const HUFFDEC_EXCEPTIONAL: u32 = 1 << 15;
-/// Reserved for the future chained-subtable encoding (Phase B).
-#[allow(dead_code)]
-pub const HUFFDEC_SUBTABLE_POINTER: u32 = 1 << 14;
 /// Low-byte mask: codeword length to consume.
 const LENGTH_MASK: u32 = 0xff;
 
