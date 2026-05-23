@@ -300,10 +300,6 @@ mod tests {
         let payload = ascii_payload(4 * 1024 * 1024);
         let body = deflate_via_gzip(&payload, 6);
 
-        // Find a non-final block boundary using our existing block-finder.
-        // We need a start_bit that lands at some non-zero offset (not just
-        // the head of the stream). Use our serial decoder to record block
-        // starts.
         let mut padded = body.clone();
         padded.extend_from_slice(&[0u8; 16]);
         let mut starts: Vec<u64> = Vec::new();
@@ -320,12 +316,11 @@ mod tests {
         }
         assert!(starts.len() >= 3, "need at least 2 non-final blocks");
 
-        // Decode head with the serial path (it has full history).
+        // Decode the head with the serial path — it knows the full history.
         let split_a = starts[1];
         let mut chunk0 = SpeculativeChunk::default();
         {
             let mut br = crate::BitReader::new(&padded);
-            // Read blocks until we hit split_a.
             loop {
                 if br.tell_bit() >= split_a {
                     break;
@@ -335,91 +330,21 @@ mod tests {
         }
         assert!(chunk0.is_resolved());
 
-        // Sanity check: our own speculative inflate works from this bit offset.
-        {
-            let mut br = crate::BitReader::new(&padded);
-            for _ in 0..split_a {
-                br.read(1).unwrap();
-            }
-            let mut sc = SpeculativeChunk::default();
-            crate::speculative::inflate_speculative(&mut br, &mut sc).unwrap();
-        }
-
-        // Decode the rest speculatively (it does NOT decode just one block —
-        // decode_member runs until BFINAL).
+        // Decode the rest speculatively from split_a.
         let mut dec = SpeculativeZlibDecoder::new();
         let mut chunk1 = SpeculativeChunk::default();
-        eprintln!("split_a = {} (byte {}, bit_off {})", split_a, split_a / 8, split_a % 8);
         let _end = dec.decode_member(&padded, split_a, &mut chunk1).unwrap();
 
-        // Cross-check against our own speculative decoder.
-        let mut ref_chunk = SpeculativeChunk::default();
-        {
-            let mut br = crate::BitReader::new(&padded);
-            for _ in 0..split_a {
-                br.read(1).unwrap();
-            }
-            crate::speculative::inflate_speculative(&mut br, &mut ref_chunk).unwrap();
-        }
-        eprintln!(
-            "chunk1.bytes.len = {}, ref_chunk.bytes.len = {}",
-            chunk1.bytes.len(),
-            ref_chunk.bytes.len()
-        );
-        eprintln!(
-            "chunk1.markers = {}, ref_chunk.markers = {}",
-            chunk1.markers.len(),
-            ref_chunk.markers.len()
-        );
-
-        // Find first byte-content mismatch (placeholders should match between
-        // the two decoders even before resolve, as long as marker positions are
-        // identical).
-        let mut found_diff = None;
-        for (i, (a, b)) in chunk1.bytes.iter().zip(&ref_chunk.bytes).enumerate() {
-            if a != b {
-                found_diff = Some(i);
-                break;
-            }
-        }
-        if let Some(p) = found_diff {
-            eprintln!("byte diff at chunk1 offset {}: zlib={} ref={}", p, chunk1.bytes[p], ref_chunk.bytes[p]);
-        }
-
-        // Marker diff
-        let zlib_set: std::collections::BTreeSet<u32> = chunk1.markers.iter().map(|m| m.out_pos).collect();
-        let ref_set: std::collections::BTreeSet<u32> = ref_chunk.markers.iter().map(|m| m.out_pos).collect();
-        let extra_in_zlib: Vec<_> = zlib_set.difference(&ref_set).collect();
-        let missing_in_zlib: Vec<_> = ref_set.difference(&zlib_set).collect();
-        eprintln!("markers extra in zlib: {} (first 10: {:?})", extra_in_zlib.len(), extra_in_zlib.iter().take(10).collect::<Vec<_>>());
-        eprintln!("markers missing in zlib: {} (first 10: {:?})", missing_in_zlib.len(), missing_in_zlib.iter().take(10).collect::<Vec<_>>());
-
-        // Resolve chunk1 against chunk0's tail.
-        let tail = crate::speculative::tail_window(&chunk0);
-        resolve_markers(&mut chunk1, tail).unwrap();
+        // Resolve chunk1 against chunk0's tail (last 32 KiB).
+        let tail_start = chunk0.bytes.len().saturating_sub(32 * 1024);
+        resolve_markers(&mut chunk1, &chunk0.bytes[tail_start..]).unwrap();
 
         let mut stitched = chunk0.bytes.clone();
         stitched.extend_from_slice(&chunk1.bytes);
         assert_eq!(stitched.len(), payload.len(), "length mismatch");
-        let first_mismatch = stitched
-            .iter()
-            .zip(&payload)
-            .position(|(a, b)| a != b);
-        if let Some(p) = first_mismatch {
-            let in_chunk1 = p as i64 - chunk0.bytes.len() as i64;
-            eprintln!(
-                "mismatch at byte {} (chunk1 offset {}): got {} ({:?}), expected {} ({:?})",
-                p, in_chunk1, stitched[p], stitched[p] as char,
-                payload[p], payload[p] as char
-            );
-            let mismatch_count = stitched
-                .iter()
-                .zip(&payload)
-                .filter(|(a, b)| a != b)
-                .count();
-            eprintln!("total mismatches: {}", mismatch_count);
-            eprintln!("chunk0 len = {}, chunk1 markers = {}", chunk0.bytes.len(), chunk1.markers.len());
-        }
-        assert!(first_mismatch.is_none(), "stitched != original");
+        assert!(
+            stitched.iter().zip(&payload).all(|(a, b)| a == b),
+            "stitched != original"
+        );
     }
 }

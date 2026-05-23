@@ -16,10 +16,7 @@ pub use bitreader::BitReader;
 pub use block_finder::find_next_dynamic_block;
 pub use huffman::HuffmanDecoder;
 pub use inflate::{inflate, inflate_block, read_dynamic_header};
-pub use speculative::{
-    inflate_block_speculative, inflate_speculative, resolve_markers, tail_window, Marker,
-    SpeculativeChunk,
-};
+pub use speculative::{resolve_markers, Marker, SpeculativeChunk};
 pub use speculative_zlib::SpeculativeZlibDecoder;
 
 #[derive(Debug, Error, PartialEq, Eq)]

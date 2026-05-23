@@ -64,7 +64,7 @@ impl std::ops::Deref for InputBytes {
 }
 
 use rapidgzip_deflate::{
-    find_next_dynamic_block, inflate_block_speculative, resolve_markers,
+    find_next_dynamic_block, resolve_markers,
     BitReader, SpeculativeChunk, SpeculativeZlibDecoder,
 };
 
@@ -125,15 +125,8 @@ pub fn parallel_decode_member(
     let body: &[u8] = &input.as_slice()[body_offset..];
     let num_threads = effective_threads(config);
     let verbose = config.verbose.is_on();
-    let use_zlib_rs = config.use_zlib_rs;
     let recycle_rx = config.recycle_rx.clone();
     let recycle_tx_for_crc = config.recycle_tx.clone();
-    if verbose && use_zlib_rs {
-        eprintln!(
-            "[rapidgzip +{:.2}s] pipeline: using zlib-rs speculative backend (--zlib-rs)",
-            crate::elapsed_since_start(),
-        );
-    }
     let total_bits = (body.len() as u64) * 8;
     let chunk_bits = (config.chunk_size_bytes as u64).max(64 * 1024) * 8;
 
@@ -235,16 +228,15 @@ pub fn parallel_decode_member(
         let handle = thread::spawn(move || {
             let body = &input.as_slice()[body_offset..];
             // Per-worker reusable zlib-rs decoder (amortises engine state
-            // across many chunks). Only allocated if enabled.
-            let mut zdec: Option<SpeculativeZlibDecoder> =
-                if use_zlib_rs { Some(SpeculativeZlibDecoder::new()) } else { None };
+            // across many chunks).
+            let mut zdec = SpeculativeZlibDecoder::new();
             while let Ok(item) = work_rx.recv() {
                 // Try to pull a recycled output buffer; pages on it are
                 // warm so subsequent writes don't take page faults.
                 let recycled = recycle_rx
                     .as_ref()
                     .and_then(|r| r.try_recv().ok());
-                let res = decode_one_chunk(body, &item, zdec.as_mut(), recycled);
+                let res = decode_one_chunk(body, &item, &mut zdec, recycled);
                 if result_tx.send(res).is_err() {
                     return;
                 }
@@ -433,7 +425,7 @@ pub fn parallel_decode_member(
 fn decode_one_chunk(
     body: &[u8],
     item: &WorkItem,
-    zdec: Option<&mut SpeculativeZlibDecoder>,
+    zdec: &mut SpeculativeZlibDecoder,
     recycled_bytes: Option<Vec<u8>>,
 ) -> Result<WorkResult, Error> {
     let mut br = BitReader::new(body);
@@ -454,41 +446,16 @@ fn decode_one_chunk(
     let mut final_block = false;
     let mut member_boundaries: Vec<MemberBoundary> = Vec::new();
 
-    // Outer loop drives one member at a time. Inside, either the in-tree
-    // block-level speculative inflater runs block-by-block, or the
-    // zlib-rs backend runs the whole member's blocks in one call (it
-    // stops between blocks at `end_bit_hint` itself, so no overshoot).
-    let mut zdec = zdec;
     loop {
         let pos = br.tell_bit();
         if pos >= item.end_bit_hint {
             break;
         }
 
-        let hit_bfinal = if let Some(dec) = zdec.as_deref_mut() {
-            let (new_end, bf) = dec
-                .decode_until(body, pos, item.end_bit_hint, &mut chunk)
-                .map_err(Error::Deflate)?;
-            br.seek_to_bit(new_end).map_err(Error::Deflate)?;
-            bf
-        } else {
-            // Block-by-block in-tree path. Walk blocks of the current
-            // member until BFINAL or until we cross end_bit_hint.
-            let mut bfinal = false;
-            loop {
-                let p = br.tell_bit();
-                if p >= item.end_bit_hint {
-                    break;
-                }
-                let bf = inflate_block_speculative(&mut br, &mut chunk)
-                    .map_err(Error::Deflate)?;
-                if bf {
-                    bfinal = true;
-                    break;
-                }
-            }
-            bfinal
-        };
+        let (new_end, hit_bfinal) = zdec
+            .decode_until(body, pos, item.end_bit_hint, &mut chunk)
+            .map_err(Error::Deflate)?;
+        br.seek_to_bit(new_end).map_err(Error::Deflate)?;
 
         if !hit_bfinal {
             // Stopped at a block boundary at/past end_bit_hint — done.
@@ -587,13 +554,6 @@ pub fn parallel_decode_bgzf(
 
     let num_threads = effective_threads(config);
     let verbose = config.verbose.is_on();
-    let use_zlib_rs = config.use_zlib_rs;
-    if verbose && use_zlib_rs {
-        eprintln!(
-            "[rapidgzip +{:.2}s] bgzf: using zlib-rs backend (--zlib-rs)",
-            crate::elapsed_since_start(),
-        );
-    }
 
     // Walk member boundaries up front.
     let mut members: Vec<(usize, usize)> = Vec::new();
@@ -657,11 +617,7 @@ pub fn parallel_decode_bgzf(
         workers.push(thread::spawn(move || {
             // Per-worker zlib-rs state reused across all members. `reset()`
             // between members keeps the 32 KiB window allocated.
-            let mut zdec = if use_zlib_rs {
-                Some((zlib_rs_vendored::Inflate::new(false, 15), Box::new([0u8; 65_536])))
-            } else {
-                None
-            };
+            let mut zdec = (zlib_rs_vendored::Inflate::new(false, 15), Box::new([0u8; 65_536]));
             while let Ok((id, m_start, m_end)) = work_rx.recv() {
                 // BGZF blocks are ≤64 KiB uncompressed; preallocate to avoid
                 // Vec growth reallocations inside the inflate hot loop.
@@ -669,17 +625,14 @@ pub fn parallel_decode_bgzf(
                 let mut err: Option<Error> = None;
                 for mi in m_start..m_end {
                     let (s, e) = members_ref[mi];
-                    let res = if let Some((dec, scratch)) = zdec.as_mut() {
-                        crate::gzip::decode_one_indexed_zlib(
-                            &file[s..e],
-                            &mut out,
-                            mi as u32,
-                            dec,
-                            scratch.as_mut(),
-                        )
-                    } else {
-                        crate::gzip::decode_one_indexed(&file[s..e], &mut out, mi as u32)
-                    };
+                    let (dec, scratch) = &mut zdec;
+                    let res = crate::gzip::decode_one_indexed_zlib(
+                        &file[s..e],
+                        &mut out,
+                        mi as u32,
+                        dec,
+                        scratch.as_mut(),
+                    );
                     match res {
                         Ok(_) => {}
                         Err(ge) => {
@@ -843,126 +796,18 @@ mod tests {
                 Config {
                     num_threads: threads,
                     chunk_size_bytes: 4 * 1024 * 1024,
-                    use_zlib_rs: true,
                     ..Config::default()
                 },
             );
-            assert_eq!(sha(&out), sha(&expected), "threads={threads} zlib-rs multi");
+            assert_eq!(sha(&out), sha(&expected), "threads={threads}");
         }
-    }
-
-    /// Bypass CRC and compare the raw bytes emitted by the zlib-rs
-    /// backend against the in-tree backend on a single 1MB level-9
-    /// member, multi-chunk path.
-    #[test]
-    fn zlib_rs_vs_in_tree_raw_bytes() {
-        use crossbeam_channel::unbounded;
-        let mut p = ascii_payload(1_048_576);
-        let suffix = b"==MEMBER-0==";
-        let cut = p.len() - suffix.len();
-        p[cut..].copy_from_slice(suffix);
-        let gz = gz_encode(&p, 9);
-        let path = write_tmp("zlib_rs_raw_compare.gz", &gz);
-
-        // We need to capture chunks even when CRC fails. Hack: read until
-        // producer dies, ignore the error result.
-        let collect = |use_zlib_rs: bool| -> Vec<u8> {
-            let (tx, rx) = unbounded::<Arc<Vec<u8>>>();
-            let p2 = path.clone();
-            let producer = std::thread::spawn(move || {
-                let _ = read_gz(
-                    &p2,
-                    tx,
-                    Config {
-                        num_threads: 1,
-                        chunk_size_bytes: 256 * 1024,
-                        use_zlib_rs,
-                        ..Config::default()
-                    },
-                );
-            });
-            let mut out = Vec::new();
-            for c in rx {
-                out.extend_from_slice(&c);
-            }
-            let _ = producer.join();
-            out
-        };
-        let out_intree = collect(false);
-        let out_zlib = collect(true);
-        eprintln!("intree.len={}, zlib.len={}", out_intree.len(), out_zlib.len());
-        let common = out_intree.len().min(out_zlib.len());
-        let mut first_diff = None;
-        for i in 0..common {
-            if out_intree[i] != out_zlib[i] {
-                first_diff = Some(i);
-                break;
-            }
-        }
-        if let Some(i) = first_diff {
-            let lo = i.saturating_sub(4);
-            let hi = (i + 12).min(common);
-            eprintln!(
-                "first diff at {} intree={:?} zlib={:?}",
-                i, &out_intree[lo..hi], &out_zlib[lo..hi]
-            );
-        }
-        assert!(first_diff.is_none(), "first diff at {:?}", first_diff);
-        assert_eq!(out_intree.len(), out_zlib.len());
-    }
-
-    /// Compare zlib-rs vs in-tree path byte-by-byte on a single 1MB
-    /// member at level 9, with a chunk size that forces multiple
-    /// speculative chunks within the member. Pinpoints whether the bug
-    /// is in the zlib-rs wrapper.
-    #[test]
-    fn zlib_rs_vs_in_tree_byte_compare() {
-        let mut p = ascii_payload(1_048_576);
-        let suffix = b"==MEMBER-0==";
-        let cut = p.len() - suffix.len();
-        p[cut..].copy_from_slice(suffix);
-        let gz = gz_encode(&p, 9);
-        let path = write_tmp("zlib_rs_compare.gz", &gz);
-        let cfg_zlib = Config {
-            num_threads: 1,
-            chunk_size_bytes: 256 * 1024,
-            use_zlib_rs: true,
-            ..Config::default()
-        };
-        let cfg_intree = Config {
-            num_threads: 1,
-            chunk_size_bytes: 256 * 1024,
-            use_zlib_rs: false,
-            ..Config::default()
-        };
-        let out_zlib = decode_via_read_gz(&path, cfg_zlib);
-        let out_intree = decode_via_read_gz(&path, cfg_intree);
-        assert_eq!(out_intree, p, "in-tree path must match original");
-        // Find first diff between zlib-rs and in-tree.
-        let mut first_diff = None;
-        for (i, (a, b)) in out_zlib.iter().zip(&out_intree).enumerate() {
-            if a != b {
-                first_diff = Some(i);
-                break;
-            }
-        }
-        if let Some(i) = first_diff {
-            let lo = i.saturating_sub(8);
-            let hi = (i + 16).min(out_zlib.len()).min(out_intree.len());
-            eprintln!(
-                "first diff at byte {}: zlib_rs[{}..{}]={:?} in_tree[{}..{}]={:?}",
-                i, lo, hi, &out_zlib[lo..hi], lo, hi, &out_intree[lo..hi]
-            );
-        }
-        assert_eq!(out_zlib.len(), out_intree.len(), "length mismatch");
-        assert_eq!(first_diff, None, "byte mismatch");
     }
 
     /// Repro of real-world CRC failure: many ~1MB members at level 9
     /// (compressed members are smaller, packing more per 4MB chunk so
     /// boundaries land at varied positions).
     #[test]
-    fn zlib_rs_backend_multistream_level9() {
+    fn multistream_level9() {
         let mut gz = Vec::new();
         let mut expected = Vec::new();
         for i in 0..30u32 {
@@ -973,7 +818,7 @@ mod tests {
             expected.extend_from_slice(&p);
             gz.extend_from_slice(&gz_encode(&p, 9));
         }
-        let path = write_tmp("zlib_rs_multistream_l9.gz", &gz);
+        let path = write_tmp("multistream_l9.gz", &gz);
         for threads in [1usize, 4] {
             for chunk_sz in [256usize * 1024, 1 << 20, 4 << 20] {
                 let out = decode_via_read_gz(
@@ -981,7 +826,6 @@ mod tests {
                     Config {
                         num_threads: threads,
                         chunk_size_bytes: chunk_sz,
-                        use_zlib_rs: true,
                         ..Config::default()
                     },
                 );
@@ -990,25 +834,23 @@ mod tests {
         }
     }
 
-    /// zlib-rs backend on the speculative parallel path produces the same
-    /// bytes as the in-tree backend, across a payload large enough to span
+    /// Parallel decode produces correct output across a large payload spanning
     /// many chunk boundaries.
     #[test]
-    fn zlib_rs_backend_matches_in_tree() {
+    fn parallel_large_payload() {
         let payload = ascii_payload(8 * 1024 * 1024);
         let gz = gz_encode(&payload, 6);
-        let path = write_tmp("zlib_rs_backend.gz", &gz);
+        let path = write_tmp("parallel_large.gz", &gz);
         for threads in [1usize, 4] {
             let out = decode_via_read_gz(
                 &path,
                 Config {
                     num_threads: threads,
                     chunk_size_bytes: 1 << 20,
-                    use_zlib_rs: true,
                     ..Config::default()
                 },
             );
-            assert_eq!(sha(&out), sha(&payload), "threads={threads} zlib-rs");
+            assert_eq!(sha(&out), sha(&payload), "threads={threads}");
         }
     }
 

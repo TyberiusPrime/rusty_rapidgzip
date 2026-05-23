@@ -24,11 +24,6 @@ struct Args {
     /// Print per-member / per-chunk diagnostics to stderr.
     #[arg(short = 'v', long)]
     verbose: bool,
-    /// Use zlib-rs (via flate2) for inflate instead of our native deflate
-    /// decoder. Applies to both BGZF and regular gzip on the parallel and
-    /// serial paths.
-    #[arg(long)]
-    zlib_rs: bool,
 }
 
 fn main() -> Result<()> {
@@ -46,7 +41,6 @@ fn main() -> Result<()> {
         num_threads: args.threads,
         chunk_size_bytes: args.chunk_size,
         verbose: if args.verbose { Verbosity::On } else { Verbosity::Off },
-        use_zlib_rs: args.zlib_rs,
         recycle_rx: Some(recycle_rx),
         recycle_tx: Some(recycle_tx.clone()),
     };
