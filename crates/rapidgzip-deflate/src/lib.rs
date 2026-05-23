@@ -1,6 +1,6 @@
 //! DEFLATE primitives for rapidgzip_rs.
 
-#![deny(unsafe_code)] // Phase-5 hot paths opt in locally via `#[allow(unsafe_code)]`.
+#![deny(unsafe_code)] // Hot paths opt in locally via `#[allow(unsafe_code)]`.
 
 use thiserror::Error;
 

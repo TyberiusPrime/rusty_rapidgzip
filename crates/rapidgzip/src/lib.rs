@@ -1,8 +1,4 @@
 //! Streaming, parallel gzip decoder.
-//!
-//! Phase 0 stub. The real `read_gz` lands in phase 4. Until then this exposes
-//! a placeholder that delegates to a serial decode path (also unimplemented),
-//! so that the test harness can be wired up against the API shape.
 
 pub mod gzip;
 pub mod pipeline;
@@ -103,12 +99,6 @@ pub enum Error {
 /// Decode `path` and stream decompressed bytes to `sink` in stream order.
 ///
 /// Blocks until EOF or first error. The sink is closed when this returns.
-///
-/// **Phase 1**: this is a single-threaded implementation that reads the
-/// entire file into memory and runs the serial gzip decoder on it. It
-/// matches the eventual API exactly so callers and tests can be written
-/// against it now. Phase 4 swaps the body for the parallel pipeline
-/// without changing the signature.
 pub fn read_gz(
     path: impl AsRef<Path>,
     sink: Sender<Arc<Vec<u8>>>,

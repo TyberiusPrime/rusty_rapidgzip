@@ -6,7 +6,7 @@
 //!    compressed body for dynamic-Huffman block boundaries at roughly
 //!    `chunk_size_bytes` intervals. Produces a list of bit offsets.
 //! 2. **Workers**: each takes one `(chunk_id, start_bit, end_bit_hint)` and
-//!    runs [`inflate_block_speculative`] block-by-block until `end_bit_hint`
+//!    decodes blocks until `end_bit_hint`
 //!    is reached or BFINAL is seen. Emits a `SpeculativeChunk`.
 //! 3. **Serializer**: receives chunks out of order, buffers them in a
 //!    `BTreeMap`, and processes them in `chunk_id` order — resolves markers
@@ -25,9 +25,8 @@
 //!   silently degrade to fewer (or one) chunks. A degenerate decode is
 //!   serial-equivalent.
 //! - On any worker error, the whole pipeline returns that error. We don't
-//!   attempt false-boundary recovery in this phase; the block finder's
-//!   full-header verification keeps false positives extremely rare in
-//!   practice. Phase 5 can add a serial-fallback for the affected range.
+//!   attempt false-boundary recovery; the block finder's full-header
+//!   verification keeps false positives extremely rare in practice.
 
 use std::sync::Arc;
 use std::thread;
@@ -130,9 +129,9 @@ pub fn parallel_decode_member(
     let total_bits = (body.len() as u64) * 8;
     let chunk_bits = (config.chunk_size_bytes as u64).max(64 * 1024) * 8;
 
-    // Phase 4a: find block boundaries in parallel. Pick fixed target offsets
-    // every `chunk_bits` and search each in parallel; each search is local
-    // and independent — the only post-step is dedup + sort.
+    // Find block boundaries in parallel. Pick fixed target offsets every
+    // `chunk_bits` and search each in parallel; each search is local and
+    // independent — the only post-step is dedup + sort.
     let t_scan = std::time::Instant::now();
     let mut boundaries: Vec<u64> = vec![0];
     {

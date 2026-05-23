@@ -1,9 +1,8 @@
 //! Serial DEFLATE inflate (RFC 1951).
 //!
-//! Window-known mode only — i.e., the decoder is initialized with the prior
-//! 32 KiB (or empty if at start of stream) and decodes block-by-block,
-//! resolving back-references against the running output. Phase 2 will add
-//! a separate "no-window / speculative" path that emits markers.
+//! Window-known mode: decodes block-by-block, resolving back-references
+//! against the running output. The speculative (no-window) path that handles
+//! mid-stream worker entry is in `speculative_zlib`.
 //!
 //! Output is appended to a caller-owned `Vec<u8>`. Back-references look
 //! into that same buffer — so the caller controls memory: trim it

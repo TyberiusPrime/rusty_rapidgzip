@@ -1,9 +1,5 @@
 //! Throughput bench: read every fixture in `tests/corpus/` and feed it
 //! through `read_gz` into a /dev/null sink. Reports bytes/second.
-//!
-//! Phase 0: the decoder is a stub, so this currently times argument
-//! validation. Kept here so phase 1+ can iterate on perf without rebuilding
-//! the harness.
 
 use std::fs;
 use std::path::PathBuf;
@@ -50,7 +46,7 @@ fn bench_throughput(c: &mut Criterion) {
                 for chunk in rx {
                     total += chunk.len() as u64;
                 }
-                let _ = h.join().unwrap(); // ignore stub error in phase 0
+                let _ = h.join().unwrap();
                 total
             });
         });

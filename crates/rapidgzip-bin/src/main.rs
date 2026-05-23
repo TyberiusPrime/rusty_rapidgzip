@@ -1,5 +1,4 @@
-//! `rapidgzip-rs` CLI. Phase 0 stub: parses args, calls `read_gz`, copies
-//! channel output to stdout. The decoder itself is not implemented yet.
+//! `rapidgzip-rs` CLI: parses args, calls `read_gz`, copies channel output to stdout.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -46,7 +45,6 @@ fn main() -> Result<()> {
     };
 
     let (tx, rx) = bounded::<Arc<Vec<u8>>>(16);
-    eprintln!("This is the new binary");
 
     let input = args.input.clone();
     let producer = std::thread::spawn(move || read_gz(&input, tx, cfg));

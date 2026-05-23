@@ -1,9 +1,9 @@
 //! Locate dynamic-Huffman DEFLATE block boundaries by bit-level scanning.
 //!
-//! The parallel pipeline (phase 4) chops the compressed stream at near-fixed
-//! byte boundaries and hands each chunk to a worker. Workers don't know
-//! where the next block actually starts, so they call [`find_next_dynamic_block`]
-//! to scan forward bit-by-bit until they find a plausible block header.
+//! The parallel pipeline chops the compressed stream at near-fixed byte
+//! boundaries and hands each chunk to a worker. Workers don't know where the
+//! next block actually starts, so they call [`find_next_dynamic_block`] to
+//! scan forward bit-by-bit until they find a plausible block header.
 //!
 //! ## What we look for
 //!
@@ -34,8 +34,8 @@
 //!
 //! False positives at the second stage are still possible (the first ~150
 //! bytes of any random data have a tiny but nonzero chance of validating as
-//! a block header). Phase 4 absorbs these via a "did the chunk decode
-//! cleanly?" check and a serial-fallback path.
+//! a block header). The pipeline absorbs these via a "did the chunk decode
+//! cleanly?" check.
 
 use crate::tables::{
     CODE_LENGTH_ORDER, DISTANCE_BASE, DISTANCE_EXTRA, LENGTH_BASE, LENGTH_EXTRA,

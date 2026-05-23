@@ -12,9 +12,8 @@
 //!
 //! ## Why slice-only (no `Read`)
 //!
-//! For Phase 1 the gzip-framing layer buffers / memory-maps the input and
-//! hands us a slice. That keeps the bit-level hot path branch-free. The
-//! parallel pipeline (phase 4) will hand each worker its own slice anyway.
+//! The gzip-framing layer memory-maps the input and hands each worker a
+//! sub-slice. That keeps the bit-level hot path branch-free.
 
 use crate::DeflateError;
 

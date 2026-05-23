@@ -2,9 +2,6 @@
 //! sibling `<name>.gz.sha256`, decode via `read_gz` and compare sha256 of
 //! the streamed-out bytes to the recorded ground truth.
 //!
-//! Phase 0: every test is `#[ignore]`-marked because the decoder is a stub.
-//! Run with `cargo test -- --ignored` once phase 1 lands.
-//!
 //! The corpus is built by `cargo run -p xtask -- build-corpus`. Tests skip
 //! cleanly if no corpus is present, so a fresh checkout doesn't fail CI just
 //! because nobody ran xtask yet.
