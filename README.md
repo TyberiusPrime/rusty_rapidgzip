@@ -31,7 +31,8 @@ No random access, no `Read`/`Seek`, no upstream-compatible `.gzi`.
 - `xtask/` — corpus management & golden-hash test harness.
 - `tests/corpus/` — test gz files (gitignored, fetched/built by xtask).
 
-## Phases
+## Status
 
-See the conversation export in `/project/2026-05-09-085803-*.txt` for
-the full plan. Currently in **Phase 0**.
+In beta. Claude vibed up a working architecture and optimized it to be 
+within spitting distance (25%ish) of rapidgzip's (c++) performance
+
