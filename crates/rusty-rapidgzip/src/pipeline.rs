@@ -607,6 +607,7 @@ pub fn parallel_decode_bgzf(
     let (result_tx, result_rx) =
         bounded::<Result<(u64, Vec<u8>), Error>>(num_threads * 2);
 
+    let engine = crate::gzip::InflateEngine::from_env();
     let mut workers = Vec::with_capacity(num_threads);
     for _ in 0..num_threads {
         let work_rx = work_rx.clone();
@@ -624,14 +625,28 @@ pub fn parallel_decode_bgzf(
                 let mut err: Option<Error> = None;
                 for mi in m_start..m_end {
                     let (s, e) = members_ref[mi];
-                    let (dec, scratch) = &mut zdec;
-                    let res = crate::gzip::decode_one_indexed_zlib(
-                        &file[s..e],
-                        &mut out,
-                        mi as u32,
-                        dec,
-                        scratch.as_mut(),
-                    );
+                    let res = match engine {
+                        crate::gzip::InflateEngine::Zlib => {
+                            let (dec, scratch) = &mut zdec;
+                            crate::gzip::decode_one_indexed_zlib(
+                                &file[s..e],
+                                &mut out,
+                                mi as u32,
+                                dec,
+                                scratch.as_mut(),
+                            )
+                        }
+                        crate::gzip::InflateEngine::Safe => {
+                            crate::gzip::decode_one_indexed_safe(
+                                &file[s..e], &mut out, mi as u32,
+                            ).map(|n| { let _ = n; n })
+                        }
+                        crate::gzip::InflateEngine::Intree => {
+                            crate::gzip::decode_one_indexed(
+                                &file[s..e], &mut out, mi as u32,
+                            )
+                        }
+                    };
                     match res {
                         Ok(_) => {}
                         Err(ge) => {

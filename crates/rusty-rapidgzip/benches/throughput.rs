@@ -40,7 +40,7 @@ fn bench_throughput(c: &mut Criterion) {
                 let (tx, rx) = bounded::<std::sync::Arc<Vec<u8>>>(16);
                 let p = path.clone();
                 let h = std::thread::spawn(move || {
-                    rapidgzip::read_gz(&p, tx, rapidgzip::Config::default())
+                    rusty_rapidgzip::read_gz(&p, tx, rusty_rapidgzip::Config::default())
                 });
                 let mut total: u64 = 0;
                 for chunk in rx {

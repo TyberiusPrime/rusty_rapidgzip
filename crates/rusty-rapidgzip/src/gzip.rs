@@ -11,7 +11,37 @@
 
 use thiserror::Error;
 
-use rusty_rapidgzip_deflate::{inflate, BitReader, DeflateError};
+use rusty_rapidgzip_deflate::{inflate, safe_inflate, BitReader, DeflateError};
+
+/// Which DEFLATE engine to use for the framed-gzip and BGZF paths.
+///
+/// The speculative parallel pipeline always uses the in-tree zlib-rs engine
+/// (it's the only one with marker-resolution support); this selector controls
+/// the *window-known* serial paths only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InflateEngine {
+    /// In-tree rapidgzip-deflate inflater (perf-tuned, contains `unsafe`).
+    #[default]
+    Intree,
+    /// Vendored zlib-rs engine (also contains `unsafe`).
+    Zlib,
+    /// Pure-safe puff-style inflater. Currently slower; here for safety and
+    /// as the target for iterative perf work.
+    Safe,
+}
+
+impl InflateEngine {
+    /// Read `RAPIDGZIP_INFLATE` and resolve to an engine. Unknown values
+    /// fall back to the in-tree engine (the historical default).
+    pub fn from_env() -> Self {
+        match std::env::var("RAPIDGZIP_INFLATE").as_deref() {
+            Ok("safe") => Self::Safe,
+            Ok("zlib") => Self::Zlib,
+            Ok("intree") => Self::Intree,
+            _ => Self::default(),
+        }
+    }
+}
 
 const GZ_MAGIC: [u8; 2] = [0x1f, 0x8b];
 const CM_DEFLATE: u8 = 8;
@@ -89,6 +119,14 @@ pub fn decode_one_indexed(
     out: &mut Vec<u8>,
     member: u32,
 ) -> Result<usize, GzipError> {
+    // Engine dispatch for the serial path. `Zlib` falls through to in-tree
+    // here because the existing zlib helper expects a fixed-size scratch
+    // buffer suited only to BGZF blocks; the standalone bench binary uses
+    // the zlib engine directly for apples-to-apples comparison.
+    if let InflateEngine::Safe = InflateEngine::from_env() {
+        return decode_one_indexed_safe(input, out, member);
+    }
+
     let header_len = parse_header(input)?;
     let body_start = header_len;
 
@@ -134,6 +172,50 @@ pub fn decode_one_indexed(
         });
     }
 
+    Ok(trailer_start + 8)
+}
+
+/// Same as [`decode_one_indexed`] but uses the pure-safe `safe_inflate`
+/// engine. Returns input bytes consumed (header + body + 8-byte trailer).
+pub fn decode_one_indexed_safe(
+    input: &[u8],
+    out: &mut Vec<u8>,
+    member: u32,
+) -> Result<usize, GzipError> {
+    let header_len = parse_header(input)?;
+    let initial_out_len = out.len();
+    let body_bytes = safe_inflate::inflate_into(&input[header_len..], out)?;
+
+    let trailer_start = header_len + body_bytes;
+    if trailer_start + 8 > input.len() {
+        return Err(GzipError::Truncated);
+    }
+    let crc_expected = u32::from_le_bytes(
+        input[trailer_start..trailer_start + 4].try_into().unwrap(),
+    );
+    let isize_expected = u32::from_le_bytes(
+        input[trailer_start + 4..trailer_start + 8].try_into().unwrap(),
+    );
+    let decoded = &out[initial_out_len..];
+    let crc_got = crc32fast::hash(decoded);
+    if crc_got != crc_expected {
+        return Err(GzipError::CrcMismatch {
+            expected: crc_expected,
+            got: crc_got,
+            member,
+            uncompressed: decoded.len() as u64,
+            trailer_byte: trailer_start as u64,
+        });
+    }
+    let isize_got = decoded.len() as u64;
+    if (isize_got & 0xFFFF_FFFF) as u32 != isize_expected {
+        return Err(GzipError::IsizeMismatch {
+            expected: isize_expected,
+            got: isize_got,
+            member,
+            trailer_byte: trailer_start as u64,
+        });
+    }
     Ok(trailer_start + 8)
 }
 
@@ -196,7 +278,7 @@ pub fn decode_one_indexed_zlib(
 }
 
 /// Parse the gzip header, return its length in bytes.
-pub(crate) fn parse_header(input: &[u8]) -> Result<usize, GzipError> {
+pub fn parse_header(input: &[u8]) -> Result<usize, GzipError> {
     if input.len() < 10 {
         return Err(GzipError::Truncated);
     }

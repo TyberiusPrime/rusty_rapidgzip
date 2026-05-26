@@ -8,6 +8,7 @@ pub mod bitreader;
 pub mod block_finder;
 pub mod huffman;
 pub mod inflate;
+pub mod safe_inflate;
 pub mod speculative;
 pub mod speculative_zlib;
 pub mod tables;

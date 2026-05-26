@@ -462,6 +462,8 @@ dependencies = [
  "clap",
  "crossbeam-channel",
  "rusty-rapidgzip",
+ "rusty-rapidgzip-deflate",
+ "rusty-rapidgzip-inflate",
 ]
 
 [[package]]

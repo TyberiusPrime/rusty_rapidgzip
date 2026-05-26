@@ -45,7 +45,7 @@ fn decode_and_hash(path: &Path) -> anyhow::Result<String> {
     let (tx, rx) = bounded::<std::sync::Arc<Vec<u8>>>(16);
     let path_owned = path.to_owned();
     let producer = std::thread::spawn(move || {
-        rapidgzip::read_gz(&path_owned, tx, rapidgzip::Config::default())
+        rusty_rapidgzip::read_gz(&path_owned, tx, rusty_rapidgzip::Config::default())
     });
 
     let mut h = Sha256::new();
