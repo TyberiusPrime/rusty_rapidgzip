@@ -410,47 +410,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rapidgzip"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "crc32fast",
- "criterion",
- "crossbeam-channel",
- "hex",
- "memmap2",
- "rapidgzip-deflate",
- "rapidgzip-inflate",
- "sha2",
- "thiserror",
-]
-
-[[package]]
-name = "rapidgzip-bin"
-version = "0.0.1"
-dependencies = [
- "anyhow",
- "clap",
- "crossbeam-channel",
- "rapidgzip",
-]
-
-[[package]]
-name = "rapidgzip-deflate"
-version = "0.0.1"
-dependencies = [
- "rapidgzip-inflate",
- "thiserror",
-]
-
-[[package]]
-name = "rapidgzip-inflate"
-version = "0.0.1"
-dependencies = [
- "zlib-rs",
-]
-
-[[package]]
 name = "regex"
 version = "1.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -478,6 +437,47 @@ name = "regex-syntax"
 version = "0.8.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
+
+[[package]]
+name = "rusty-rapidgzip"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "crc32fast",
+ "criterion",
+ "crossbeam-channel",
+ "hex",
+ "memmap2",
+ "rusty-rapidgzip-deflate",
+ "rusty-rapidgzip-inflate",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
+name = "rusty-rapidgzip-bin"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "crossbeam-channel",
+ "rusty-rapidgzip",
+]
+
+[[package]]
+name = "rusty-rapidgzip-deflate"
+version = "0.0.1"
+dependencies = [
+ "rusty-rapidgzip-inflate",
+ "thiserror",
+]
+
+[[package]]
+name = "rusty-rapidgzip-inflate"
+version = "0.0.1"
+dependencies = [
+ "zlib-rs",
+]
 
 [[package]]
 name = "same-file"

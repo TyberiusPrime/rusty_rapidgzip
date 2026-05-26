@@ -22,8 +22,8 @@
 use crate::speculative::SpeculativeChunk;
 use crate::DeflateError;
 
-use rapidgzip_inflate::speculative::{ContextGuard, SpeculativeContext};
-use rapidgzip_inflate::{Inflate, InflateError, InflateFlush, Status};
+use rusty_rapidgzip_inflate::speculative::{ContextGuard, SpeculativeContext};
+use rusty_rapidgzip_inflate::{Inflate, InflateError, InflateFlush, Status};
 
 /// One reusable engine instance. Re-used across chunks on a single worker
 /// thread to amortise the inflate state's window allocation (32 KiB).
@@ -144,7 +144,7 @@ impl SpeculativeZlibDecoder {
             // Marker positions must be member-absolute; the engine's
             // per-call `writer.len()` resets between calls when the window
             // flushes. Update the offset before each call.
-            rapidgzip_inflate::speculative::set_out_pos_offset(written as u32);
+            rusty_rapidgzip_inflate::speculative::set_out_pos_offset(written as u32);
             let total_out_before = self.engine.total_out();
             let total_in_before = self.engine.total_in();
             // `InflateFlush::Block` returns `Ok` at every block boundary,

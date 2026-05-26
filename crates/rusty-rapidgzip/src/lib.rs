@@ -93,7 +93,7 @@ pub enum Error {
     #[error("gzip: {0}")]
     Gzip(#[from] GzipError),
     #[error("deflate: {0}")]
-    Deflate(#[from] rapidgzip_deflate::DeflateError),
+    Deflate(#[from] rusty_rapidgzip_deflate::DeflateError),
 }
 
 /// Decode `path` and stream decompressed bytes to `sink` in stream order.

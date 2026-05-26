@@ -62,7 +62,7 @@ impl std::ops::Deref for InputBytes {
     }
 }
 
-use rapidgzip_deflate::{
+use rusty_rapidgzip_deflate::{
     find_next_dynamic_block, resolve_markers,
     BitReader, SpeculativeChunk, SpeculativeZlibDecoder,
 };
@@ -616,7 +616,7 @@ pub fn parallel_decode_bgzf(
         workers.push(thread::spawn(move || {
             // Per-worker zlib-rs state reused across all members. `reset()`
             // between members keeps the 32 KiB window allocated.
-            let mut zdec = (rapidgzip_inflate::Inflate::new(false, 15), Box::new([0u8; 65_536]));
+            let mut zdec = (rusty_rapidgzip_inflate::Inflate::new(false, 15), Box::new([0u8; 65_536]));
             while let Ok((id, m_start, m_end)) = work_rx.recv() {
                 // BGZF blocks are ≤64 KiB uncompressed; preallocate to avoid
                 // Vec growth reallocations inside the inflate hot loop.

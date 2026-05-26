@@ -7,7 +7,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use clap::Parser;
 use crossbeam_channel::bounded;
-use rapidgzip::{elapsed_since_start, read_gz, Config, Verbosity};
+use rusty_rapidgzip::{elapsed_since_start, read_gz, Config, Verbosity};
 
 #[derive(Parser, Debug)]
 #[command(name = "rapidgzip-rs", version)]

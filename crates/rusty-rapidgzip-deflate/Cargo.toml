@@ -1,5 +1,5 @@
 [package]
-name = "rapidgzip-deflate"
+name = "rusty-rapidgzip-deflate"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,4 +9,4 @@ description = "DEFLATE decoder primitives (bit reader, Huffman, inflate, specula
 
 [dependencies]
 thiserror.workspace = true
-rapidgzip-inflate.workspace = true
+rusty-rapidgzip-inflate.workspace = true

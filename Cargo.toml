@@ -1,10 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/rapidgzip-deflate",
-    "crates/rapidgzip",
-    "crates/rapidgzip-bin",
-    "crates/rapidgzip-inflate",
+    "crates/rusty-rapidgzip-deflate",
+    "crates/rusty-rapidgzip",
+    "crates/rusty-rapidgzip-bin",
+    "crates/rusty-rapidgzip-inflate",
     "xtask",
 ]
 
@@ -13,12 +13,12 @@ version = "0.0.1"
 edition = "2021"
 rust-version = "1.80"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/TyberiusPrime/rapidgzip_rs"
+repository = "https://github.com/TyberiusPrime/rusty-rapidgzip"
 
 [workspace.dependencies]
-rapidgzip-deflate = { path = "crates/rapidgzip-deflate" }
-rapidgzip = { path = "crates/rapidgzip" }
-rapidgzip-inflate = { path = "crates/rapidgzip-inflate" }
+rusty-rapidgzip-deflate = { path = "crates/rusty-rapidgzip-deflate" }
+rusty-rapidgzip = { path = "crates/rusty-rapidgzip" }
+rusty-rapidgzip-inflate = { path = "crates/rusty-rapidgzip-inflate" }
 
 crc32fast = "1.4"
 crossbeam-channel = "0.5"

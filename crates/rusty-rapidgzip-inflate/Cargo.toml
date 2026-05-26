@@ -1,5 +1,5 @@
 [package]
-name = "rapidgzip-inflate"
+name = "rusty-rapidgzip-inflate"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

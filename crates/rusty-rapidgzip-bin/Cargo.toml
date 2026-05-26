@@ -1,18 +1,18 @@
 [package]
-name = "rapidgzip-bin"
+name = "rusty-rapidgzip-bin"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "CLI for rapidgzip_rs."
+description = "CLI for rusty-rapidgzip"
 
 [[bin]]
-name = "rapidgzip-rs"
+name = "rusty-rapidgzip-rs"
 path = "src/main.rs"
 
 [dependencies]
-rapidgzip.workspace = true
+rusty-rapidgzip.workspace = true
 crossbeam-channel.workspace = true
 clap.workspace = true
 anyhow.workspace = true

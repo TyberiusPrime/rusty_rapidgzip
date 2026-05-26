@@ -55,13 +55,13 @@ impl Inflate {
         self.total_out
     }
 
-    pub fn error_message(&self) -> Option<&'static str> {
-        if self.inner.msg.is_null() {
-            None
-        } else {
-            unsafe { core::ffi::CStr::from_ptr(self.inner.msg).to_str() }.ok()
-        }
-    }
+    // pub fn error_message(&self) -> Option<&'static str> {
+    //     if self.inner.msg.is_null() {
+    //         None
+    //     } else {
+    //         unsafe { core::ffi::CStr::from_ptr(self.inner.msg).to_str() }.ok()
+    //     }
+    // }
 
     pub fn new(zlib_header: bool, window_bits: u8) -> Self {
         let config = InflateConfig {

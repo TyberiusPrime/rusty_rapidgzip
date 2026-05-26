@@ -75,7 +75,7 @@ impl SpeculativeChunk {
     /// byte) into chunk-local (0-based at `chunk.bytes[0]`).
     pub fn bytes_offset_markers(
         &mut self,
-        src: &[rapidgzip_inflate::speculative::MarkerRec],
+        src: &[rusty_rapidgzip_inflate::speculative::MarkerRec],
         base: u32,
     ) {
         if src.is_empty() {

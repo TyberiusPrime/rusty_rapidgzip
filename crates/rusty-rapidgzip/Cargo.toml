@@ -1,5 +1,5 @@
 [package]
-name = "rapidgzip"
+name = "rusty-rapidgzip"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,12 +8,12 @@ repository.workspace = true
 description = "Streaming, parallel gzip decoder. Inspired by rapidgzip / pugz."
 
 [dependencies]
-rapidgzip-deflate.workspace = true
+rusty-rapidgzip-deflate.workspace = true
+rusty-rapidgzip-inflate.workspace = true
 crc32fast.workspace = true
 crossbeam-channel.workspace = true
 thiserror.workspace = true
 memmap2.workspace = true
-rapidgzip-inflate.workspace = true
 
 [dev-dependencies]
 sha2.workspace = true
