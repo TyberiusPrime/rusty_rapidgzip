@@ -2,7 +2,7 @@
 //!
 //! This is the perf-tuned path: zlib-rs decodes faster than our in-tree
 //! decoder. The vendored engine has been patched to consult a thread-local
-//! [`zlib_rs_vendored::speculative::SpeculativeContext`] on the over-distance
+//! [`rapidgzip_inflate::speculative::SpeculativeContext`] on the over-distance
 //! back-ref path (emits a marker + placeholder) and on every in-buffer
 //! back-ref copy (propagates markers from source to destination).
 //!
@@ -22,8 +22,8 @@
 use crate::speculative::SpeculativeChunk;
 use crate::DeflateError;
 
-use zlib_rs_vendored::speculative::{ContextGuard, SpeculativeContext};
-use zlib_rs_vendored::{Inflate, InflateError, InflateFlush, Status};
+use rapidgzip_inflate::speculative::{ContextGuard, SpeculativeContext};
+use rapidgzip_inflate::{Inflate, InflateError, InflateFlush, Status};
 
 /// One reusable engine instance. Re-used across chunks on a single worker
 /// thread to amortise the inflate state's window allocation (32 KiB).
@@ -144,7 +144,7 @@ impl SpeculativeZlibDecoder {
             // Marker positions must be member-absolute; the engine's
             // per-call `writer.len()` resets between calls when the window
             // flushes. Update the offset before each call.
-            zlib_rs_vendored::speculative::set_out_pos_offset(written as u32);
+            rapidgzip_inflate::speculative::set_out_pos_offset(written as u32);
             let total_out_before = self.engine.total_out();
             let total_in_before = self.engine.total_in();
             // `InflateFlush::Block` returns `Ok` at every block boundary,

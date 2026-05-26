@@ -143,7 +143,7 @@ pub fn decode_one_indexed_zlib(
     input: &[u8],
     out: &mut Vec<u8>,
     member: u32,
-    dec: &mut zlib_rs_vendored::Inflate,
+    dec: &mut rapidgzip_inflate::Inflate,
     scratch: &mut [u8; 65_536],
 ) -> Result<usize, GzipError> {
     let header_len = parse_header(input)?;
@@ -152,9 +152,9 @@ pub fn decode_one_indexed_zlib(
     dec.reset(false);
     let body = &input[header_len..];
     let status = dec
-        .decompress(body, scratch, zlib_rs_vendored::InflateFlush::Finish)
+        .decompress(body, scratch, rapidgzip_inflate::InflateFlush::Finish)
         .map_err(|_| GzipError::Deflate(DeflateError::Invalid("zlib-rs inflate failed")))?;
-    if !matches!(status, zlib_rs_vendored::Status::StreamEnd) {
+    if !matches!(status, rapidgzip_inflate::Status::StreamEnd) {
         return Err(GzipError::Deflate(DeflateError::Invalid(
             "zlib-rs did not reach stream end",
         )));

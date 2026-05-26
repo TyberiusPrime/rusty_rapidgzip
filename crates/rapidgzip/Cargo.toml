@@ -13,7 +13,7 @@ crc32fast.workspace = true
 crossbeam-channel.workspace = true
 thiserror.workspace = true
 memmap2.workspace = true
-zlib-rs-vendored = { path = "../../third_party/zlib-rs" }
+rapidgzip-inflate.workspace = true
 
 [dev-dependencies]
 sha2.workspace = true

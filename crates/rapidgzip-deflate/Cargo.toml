@@ -9,4 +9,4 @@ description = "DEFLATE decoder primitives (bit reader, Huffman, inflate, specula
 
 [dependencies]
 thiserror.workspace = true
-zlib-rs-vendored = { path = "../../third_party/zlib-rs" }
+rapidgzip-inflate.workspace = true

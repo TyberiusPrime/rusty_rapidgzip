@@ -1,0 +1,26 @@
+[package]
+name = "rapidgzip-inflate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Modified zlib-rs inflate engine with speculative (mid-stream) decode support."
+
+[features]
+# Always enabled — our crate is std-only.
+default = ["std", "c-allocator", "rust-allocator"]
+std = []
+# Mirror zlib-rs feature names so cfg-guards in copied code compile without warnings.
+c-allocator = []
+rust-allocator = []
+ZLIB_DEBUG = []
+# Stubs for feature names present in the copied zlib-rs code but unused here.
+__internal-test = []
+__internal-fuzz-disable-checksum = []
+
+[dependencies]
+zlib-rs = { version = "0.6.3", features = ["__internal-api", "std", "c-allocator"] }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
