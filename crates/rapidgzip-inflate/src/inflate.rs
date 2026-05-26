@@ -1,13 +1,11 @@
 #![allow(non_snake_case)] // TODO ultimately remove this
 #![allow(clippy::missing_safety_doc)] // obviously needs to be fixed long-term
 
-use core::ffi::{c_char, c_int, c_long, c_ulong};
+use core::ffi::{c_char, c_int};
 use core::marker::PhantomData;
-use core::mem::MaybeUninit;
 use core::ops::ControlFlow;
 
 mod bitreader;
-mod infback;
 mod inffixed_tbl;
 mod inftrees;
 mod window;
@@ -25,8 +23,6 @@ use crate::{
 
 use crate::crc32::{crc32, Crc32Fold};
 
-#[allow(unused_imports)]
-pub use self::infback::{back, back_end, back_init};
 pub use self::window::Window;
 use self::{
     bitreader::BitReader,
@@ -86,33 +82,6 @@ impl<'a> InflateStream<'a> {
     ///
     /// Behavior is undefined if any of the following conditions are violated:
     ///
-    /// - `strm` satisfies the conditions of [`pointer::as_ref`]
-    /// - if not `NULL`, `strm` as initialized using [`init`] or similar
-    ///
-    /// [`pointer::as_ref`]: https://doc.rust-lang.org/core/primitive.pointer.html#method.as_ref
-    #[inline(always)]
-    pub unsafe fn from_stream_ref(strm: *const z_stream) -> Option<&'a Self> {
-        {
-            // Safety: ptr points to a valid value of type z_stream (if non-null)
-            let stream = unsafe { strm.as_ref() }?;
-
-            if stream.zalloc.is_none() || stream.zfree.is_none() {
-                return None;
-            }
-
-            if stream.state.is_null() {
-                return None;
-            }
-        }
-
-        // Safety: InflateStream has an equivalent layout as z_stream
-        unsafe { strm.cast::<InflateStream>().as_ref() }
-    }
-
-    /// # Safety
-    ///
-    /// Behavior is undefined if any of the following conditions are violated:
-    ///
     /// - `strm` satisfies the conditions of [`pointer::as_mut`]
     /// - if not `NULL`, `strm` as initialized using [`init`] or similar
     ///
@@ -154,136 +123,6 @@ impl<'a> InflateStream<'a> {
 const MAX_BITS: u8 = 15; // maximum number of bits in a code
 const MAX_DIST_EXTRA_BITS: u8 = 13; // maximum number of extra distance bits
 
-/// Decompresses `input` into the provided `output` buffer.
-///
-/// Returns a subslice of `output` containing the decompressed bytes and a
-/// [`ReturnCode`] indicating the result of the operation. Returns [`ReturnCode::BufError`] if
-/// there is insufficient output space.
-///
-/// # Example
-///
-/// ```
-/// # use zlib_rs::*;
-/// # fn foo(compressed: &[u8]) {
-/// let mut buffer = [0u8; 1024];
-/// let (decompressed, rc) = decompress_slice(&mut buffer, compressed, InflateConfig::default());
-/// assert_eq!(rc, ReturnCode::Ok);
-/// # }
-/// ```
-pub fn decompress_slice<'a>(
-    output: &'a mut [u8],
-    input: &[u8],
-    config: InflateConfig,
-) -> (&'a mut [u8], ReturnCode) {
-    // SAFETY: [u8] is also a valid [MaybeUninit<u8>]
-    let output_uninit = unsafe {
-        core::slice::from_raw_parts_mut(output.as_mut_ptr() as *mut MaybeUninit<u8>, output.len())
-    };
-
-    uncompress(output_uninit, input, config)
-}
-
-/// Inflates `source` into `dest`, and writes the final inflated size into `dest_len`.
-pub fn uncompress<'a>(
-    output: &'a mut [MaybeUninit<u8>],
-    input: &[u8],
-    config: InflateConfig,
-) -> (&'a mut [u8], ReturnCode) {
-    let (_consumed, output, ret) = uncompress2(output, input, config);
-    (output, ret)
-}
-
-pub fn uncompress2<'a>(
-    output: &'a mut [MaybeUninit<u8>],
-    input: &[u8],
-    config: InflateConfig,
-) -> (u64, &'a mut [u8], ReturnCode) {
-    let mut dest_len_ptr = output.len() as z_checksum;
-
-    // for detection of incomplete stream when *destLen == 0
-    let mut buf = [0u8];
-
-    let mut left;
-    let mut len = input.len() as u64;
-
-    let dest = if output.is_empty() {
-        left = 1;
-
-        buf.as_mut_ptr()
-    } else {
-        left = output.len() as u64;
-        dest_len_ptr = 0;
-
-        output.as_mut_ptr() as *mut u8
-    };
-
-    let mut stream = z_stream {
-        next_in: input.as_ptr() as *mut u8,
-        avail_in: 0,
-
-        zalloc: None,
-        zfree: None,
-        opaque: core::ptr::null_mut(),
-
-        ..z_stream::default()
-    };
-
-    let err = init(&mut stream, config);
-    if err != ReturnCode::Ok {
-        return (0, &mut [], err);
-    }
-
-    stream.next_out = dest;
-    stream.avail_out = 0;
-
-    let Some(stream) = (unsafe { InflateStream::from_stream_mut(&mut stream) }) else {
-        return (0, &mut [], ReturnCode::StreamError);
-    };
-
-    let err = loop {
-        if stream.avail_out == 0 {
-            stream.avail_out = Ord::min(left, u32::MAX as u64) as u32;
-            left -= stream.avail_out as u64;
-        }
-
-        if stream.avail_in == 0 {
-            stream.avail_in = Ord::min(len, u32::MAX as u64) as u32;
-            len -= stream.avail_in as u64;
-        }
-
-        let err = unsafe { inflate(stream, InflateFlush::NoFlush) };
-
-        if err != ReturnCode::Ok {
-            break err;
-        }
-    };
-
-    let consumed = len + u64::from(stream.avail_in);
-    if !output.is_empty() {
-        dest_len_ptr = stream.total_out;
-    } else if stream.total_out != 0 && err == ReturnCode::BufError {
-        left = 1;
-    }
-
-    let avail_out = stream.avail_out;
-
-    end(stream);
-
-    let ret = match err {
-        ReturnCode::StreamEnd => ReturnCode::Ok,
-        ReturnCode::NeedDict => ReturnCode::DataError,
-        ReturnCode::BufError if (left + avail_out as u64) != 0 => ReturnCode::DataError,
-        _ => err,
-    };
-
-    // SAFETY: we have now initialized these bytes
-    let output_slice = unsafe {
-        core::slice::from_raw_parts_mut(output.as_mut_ptr() as *mut u8, dest_len_ptr as usize)
-    };
-
-    (consumed, output_slice, ret)
-}
-
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
 pub enum Mode {
@@ -296,7 +135,9 @@ pub enum Mode {
     Name,
     Comment,
     HCrc,
+    #[allow(dead_code)]
     Sync,
+    #[allow(dead_code)]
     Mem,
     Length,
     Type,
@@ -871,10 +712,8 @@ impl State<'_> {
                                     let written_now = writer.len();
                                     let needed_from_prefix =
                                         self.offset - written_now - self.window.have();
-                                    let n = Ord::min(
-                                        Ord::min(needed_from_prefix, self.length),
-                                        left,
-                                    );
+                                    let n =
+                                        Ord::min(Ord::min(needed_from_prefix, self.length), left);
                                     crate::speculative::record_match_prefix(
                                         written_now,
                                         self.offset,
@@ -2248,10 +2087,7 @@ unsafe fn inflate_fast_help_impl<const FEATURES: usize>(state: &mut State, _star
                                 // here we need some bytes from the output itself
                                 let dst_start = writer.len();
                                 let tail = len as usize - op;
-                                writer.copy_match_with_features::<FEATURES>(
-                                    dist as usize,
-                                    tail,
-                                );
+                                writer.copy_match_with_features::<FEATURES>(dist as usize, tail);
                                 #[cfg(feature = "std")]
                                 crate::speculative::propagate_match_cached(
                                     spec_ctx,
@@ -2264,7 +2100,8 @@ unsafe fn inflate_fast_help_impl<const FEATURES: usize>(state: &mut State, _star
                             todo!()
                         } else {
                             let dst_start = writer.len();
-                            writer.copy_match_with_features::<FEATURES>(dist as usize, len as usize);
+                            writer
+                                .copy_match_with_features::<FEATURES>(dist as usize, len as usize);
                             #[cfg(feature = "std")]
                             crate::speculative::propagate_match_cached(
                                 spec_ctx,
@@ -2321,20 +2158,6 @@ unsafe fn inflate_fast_help_impl<const FEATURES: usize>(state: &mut State, _star
         debug_assert!(matches!(state.mode, Mode::Bad));
         state.bad(error_message);
     }
-}
-
-pub fn prime(stream: &mut InflateStream, bits: i32, value: i32) -> ReturnCode {
-    if bits == 0 {
-        /* fall through */
-    } else if bits < 0 {
-        stream.state.bit_reader.init_bits();
-    } else if bits > 16 || stream.state.bit_reader.bits_in_buffer() + bits as u8 > 32 {
-        return ReturnCode::StreamError;
-    } else {
-        stream.state.bit_reader.prime(bits as u8, value as u64);
-    }
-
-    ReturnCode::Ok
 }
 
 struct InflateAllocOffsets {
@@ -2536,10 +2359,6 @@ pub fn reset_keep(stream: &mut InflateStream) -> ReturnCode {
     ReturnCode::Ok
 }
 
-pub fn codes_used(stream: &InflateStream) -> usize {
-    stream.state.next
-}
-
 pub unsafe fn inflate(stream: &mut InflateStream, flush: InflateFlush) -> ReturnCode {
     if stream.next_out.is_null() || (stream.next_in.is_null() && stream.avail_in != 0) {
         return ReturnCode::StreamError;
@@ -2623,168 +2442,6 @@ pub unsafe fn inflate(stream: &mut InflateStream, flush: InflateFlush) -> Return
     }
 }
 
-fn syncsearch(mut got: usize, buf: &[u8]) -> (usize, usize) {
-    let len = buf.len();
-    let mut next = 0;
-
-    while next < len && got < 4 {
-        if buf[next] == if got < 2 { 0 } else { 0xff } {
-            got += 1;
-        } else if buf[next] != 0 {
-            got = 0;
-        } else {
-            got = 4 - got;
-        }
-        next += 1;
-    }
-
-    (got, next)
-}
-
-pub fn sync(stream: &mut InflateStream) -> ReturnCode {
-    let state = &mut stream.state;
-
-    if stream.avail_in == 0 && state.bit_reader.bits_in_buffer() < 8 {
-        return ReturnCode::BufError;
-    }
-    /* if first time, start search in bit buffer */
-    if !matches!(state.mode, Mode::Sync) {
-        state.mode = Mode::Sync;
-
-        let (buf, len) = state.bit_reader.start_sync_search();
-
-        (state.have, _) = syncsearch(0, &buf[..len]);
-    }
-
-    // search available input
-    // SAFETY: user guarantees that pointer and length are valid.
-    let slice = unsafe { core::slice::from_raw_parts(stream.next_in, stream.avail_in as usize) };
-
-    let len;
-    (state.have, len) = syncsearch(state.have, slice);
-    // SAFETY: syncsearch() returns an index that is in-bounds of the slice.
-    stream.next_in = unsafe { stream.next_in.add(len) };
-    stream.avail_in -= len as u32;
-    stream.total_in += len as z_size;
-
-    /* return no joy or set up to restart inflate() on a new block */
-    if state.have != 4 {
-        return ReturnCode::DataError;
-    }
-
-    if state.gzip_flags == -1 {
-        state.wrap = 0; /* if no header yet, treat as raw */
-    } else {
-        state.wrap &= !4; /* no point in computing a check value now */
-    }
-
-    let flags = state.gzip_flags;
-    let total_in = stream.total_in;
-    let total_out = stream.total_out;
-
-    reset(stream);
-
-    stream.total_in = total_in;
-    stream.total_out = total_out;
-
-    stream.state.gzip_flags = flags;
-    stream.state.mode = Mode::Type;
-
-    ReturnCode::Ok
-}
-
-/*
-  Returns true if inflate is currently at the end of a block generated by
-  Z_SYNC_FLUSH or Z_FULL_FLUSH. This function is used by one PPP
-  implementation to provide an additional safety check. PPP uses
-  Z_SYNC_FLUSH but removes the length bytes of the resulting empty stored
-  block. When decompressing, PPP checks that at the end of input packet,
-  inflate is waiting for these length bytes.
-*/
-pub fn sync_point(stream: &mut InflateStream) -> bool {
-    matches!(stream.state.mode, Mode::Stored) && stream.state.bit_reader.bits_in_buffer() == 0
-}
-
-pub unsafe fn copy<'a>(
-    dest: &mut MaybeUninit<InflateStream<'a>>,
-    source: &InflateStream<'a>,
-) -> ReturnCode {
-    if source.next_out.is_null() || (source.next_in.is_null() && source.avail_in != 0) {
-        return ReturnCode::StreamError;
-    }
-
-    // Safety: source and dest are both mutable references, so guaranteed not to overlap.
-    // dest being a reference to maybe uninitialized memory makes a copy of 1 DeflateStream valid.
-    unsafe { core::ptr::copy_nonoverlapping(source, dest.as_mut_ptr(), 1) };
-
-    // Allocate space.
-    let allocs = InflateAllocOffsets::new();
-    debug_assert_eq!(allocs.total_size, source.state.total_allocation_size);
-
-    let Some(allocation_start) = source.alloc.allocate_slice_raw::<u8>(allocs.total_size) else {
-        return ReturnCode::MemError;
-    };
-
-    let address = allocation_start.as_ptr() as usize;
-    let align_offset = address.next_multiple_of(64) - address;
-    let buf = unsafe { allocation_start.as_ptr().add(align_offset) };
-
-    let window_allocation = unsafe { buf.add(allocs.window_pos) };
-    let window = unsafe {
-        source
-            .state
-            .window
-            .clone_to(window_allocation, (1 << MAX_WBITS) + 64)
-    };
-
-    let copy = unsafe { buf.add(allocs.state_pos).cast::<State>() };
-    unsafe { core::ptr::copy_nonoverlapping(source.state, copy, 1) };
-
-    let field_ptr = unsafe { core::ptr::addr_of_mut!((*copy).window) };
-    unsafe { core::ptr::write(field_ptr, window) };
-
-    let field_ptr = unsafe { core::ptr::addr_of_mut!((*copy).allocation_start) };
-    unsafe { core::ptr::write(field_ptr, allocation_start.as_ptr()) };
-
-    let field_ptr = unsafe { core::ptr::addr_of_mut!((*dest.as_mut_ptr()).state) };
-    unsafe { core::ptr::write(field_ptr as *mut *mut State, copy) };
-
-    ReturnCode::Ok
-}
-
-pub fn undermine(stream: &mut InflateStream, subvert: i32) -> ReturnCode {
-    stream.state.flags.update(Flags::SANE, (!subvert) != 0);
-
-    ReturnCode::Ok
-}
-
-/// Configures whether the checksum is calculated and checked.
-pub fn validate(stream: &mut InflateStream, check: bool) -> ReturnCode {
-    if check && stream.state.wrap != 0 {
-        stream.state.wrap |= 0b100;
-    } else {
-        stream.state.wrap &= !0b100;
-    }
-
-    ReturnCode::Ok
-}
-
-pub fn mark(stream: &InflateStream) -> c_long {
-    if stream.next_out.is_null() || (stream.next_in.is_null() && stream.avail_in != 0) {
-        return c_long::MIN;
-    }
-
-    let state = &stream.state;
-
-    let length = match state.mode {
-        Mode::CopyBlock => state.length,
-        Mode::Match => state.was - state.length,
-        _ => 0,
-    };
-
-    (((state.back as c_long) as c_ulong) << 16) as c_long + length as c_long
-}
-
 pub fn set_dictionary(stream: &mut InflateStream, dictionary: &[u8]) -> ReturnCode {
     if stream.state.wrap != 0 && !matches!(stream.state.mode, Mode::Dict) {
         return ReturnCode::StreamError;
@@ -2826,76 +2483,4 @@ pub fn end<'a>(stream: &'a mut InflateStream<'_>) -> &'a mut z_stream {
     unsafe { alloc.deallocate(allocation_start, total_allocation_size) };
 
     stream
-}
-
-/// # Safety
-///
-/// The caller must guarantee:
-///
-/// * If `head` is `Some`:
-///     - If `head.extra` is not NULL, it must be writable for at least `head.extra_max` bytes
-///     - if `head.name` is not NULL, it must be writable for at least `head.name_max` bytes
-///     - if `head.comment` is not NULL, it must be writable for at least `head.comm_max` bytes
-pub unsafe fn get_header<'a>(
-    stream: &mut InflateStream<'a>,
-    head: Option<&'a mut gz_header>,
-) -> ReturnCode {
-    if (stream.state.wrap & 2) == 0 {
-        return ReturnCode::StreamError;
-    }
-
-    stream.state.head = head.map(|head| {
-        head.done = 0;
-        head
-    });
-    ReturnCode::Ok
-}
-
-/// # Safety
-///
-/// The `dictionary` must have enough space for the dictionary.
-pub unsafe fn get_dictionary(stream: &InflateStream<'_>, dictionary: *mut u8) -> usize {
-    let whave = stream.state.window.have();
-    let wnext = stream.state.window.next();
-
-    if !dictionary.is_null() {
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                stream.state.window.as_ptr().add(wnext),
-                dictionary,
-                whave - wnext,
-            );
-
-            core::ptr::copy_nonoverlapping(
-                stream.state.window.as_ptr(),
-                dictionary.add(whave).sub(wnext).cast(),
-                wnext,
-            );
-        }
-    }
-
-    stream.state.window.have()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn uncompress_buffer_overflow() {
-        let mut output = [0; 1 << 13];
-        let input = [
-            72, 137, 58, 0, 3, 39, 255, 255, 255, 255, 255, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14,
-            14, 14, 184, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 184, 14, 14,
-            14, 14, 14, 14, 14, 63, 14, 14, 14, 14, 14, 14, 14, 14, 184, 14, 14, 255, 14, 103, 14,
-            14, 14, 14, 14, 14, 61, 14, 255, 255, 63, 14, 14, 14, 14, 14, 14, 14, 14, 184, 14, 14,
-            255, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 6, 14, 14, 14, 14, 14, 14, 14, 14, 71,
-            4, 137, 106,
-        ];
-
-        let config = InflateConfig { window_bits: 15 };
-
-        let (_decompressed, err) = decompress_slice(&mut output, &input, config);
-        assert_eq!(err, ReturnCode::DataError);
-    }
 }

@@ -48,21 +48,6 @@ impl ReturnCode {
         }
     }
 
-    pub(crate) const fn error_message(self) -> *const core::ffi::c_char {
-        let msg = match self {
-            ReturnCode::Ok => "\0",
-            ReturnCode::StreamEnd => "stream end\0",
-            ReturnCode::NeedDict => "need dictionary\0",
-            ReturnCode::ErrNo => "file error\0",
-            ReturnCode::StreamError => "stream error\0",
-            ReturnCode::DataError => "data error\0",
-            ReturnCode::MemError => "insufficient memory\0",
-            ReturnCode::BufError => "buffer error\0",
-            ReturnCode::VersionError => "incompatible version\0",
-        };
-        msg.as_ptr().cast::<core::ffi::c_char>()
-    }
-
     pub(crate) const fn try_from_c_int(err: core::ffi::c_int) -> Option<Self> {
         match err {
             0 => Some(Self::Ok),

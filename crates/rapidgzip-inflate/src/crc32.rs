@@ -16,10 +16,6 @@ impl Crc32Fold {
         Self { value: CRC32_INITIAL_VALUE }
     }
 
-    pub const fn new_with_initial(initial: u32) -> Self {
-        Self { value: initial }
-    }
-
     pub fn fold(&mut self, src: &[u8], _start: u32) {
         self.value = crc32(self.value, src);
     }

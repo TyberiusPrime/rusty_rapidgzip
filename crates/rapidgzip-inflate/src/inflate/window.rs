@@ -19,9 +19,6 @@ pub struct Window<'a> {
 }
 
 impl<'a> Window<'a> {
-    pub fn into_raw_parts(self) -> (*mut u8, usize) {
-        self.buf.into_raw_parts()
-    }
 
     pub unsafe fn from_raw_parts(ptr: *mut u8, len: usize) -> Self {
         Self {
@@ -29,17 +26,6 @@ impl<'a> Window<'a> {
             have: 0,
             next: 0,
         }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.size() == 0
-    }
-
-    /// The size of the underlying buffer. For inflate, use `size` instead. This function is used
-    /// in `inflateBack` which does not consider the padding.
-    pub fn buffer_size(&self) -> usize {
-        assert!(self.buf.len().is_power_of_two());
-        self.buf.len()
     }
 
     pub fn size(&self) -> usize {
@@ -51,10 +37,6 @@ impl<'a> Window<'a> {
     /// number of bytes in the window. Saturates at `Self::capacity`.
     pub fn have(&self) -> usize {
         self.have
-    }
-
-    pub unsafe fn set_have(&mut self, have: usize) {
-        self.have = have;
     }
 
     /// Position where the next byte will be written
@@ -175,18 +157,6 @@ impl<'a> Window<'a> {
         })
     }
 
-    pub unsafe fn clone_to(&self, ptr: *mut u8, len: usize) -> Self {
-        debug_assert_eq!(self.buf.len(), len);
-
-        unsafe { core::ptr::copy_nonoverlapping(self.buf.as_ptr(), ptr, len) };
-
-        Self {
-            buf: unsafe { WeakSliceMut::from_raw_parts_mut(ptr, len) },
-            have: self.have,
-            next: self.next,
-        }
-    }
-
     // padding required so that SIMD operations going out-of-bounds are not a problem
     pub fn padding() -> usize {
         64 // very conservative
@@ -202,19 +172,6 @@ mod test {
         window.have = 0;
         window.next = 0;
         window
-    }
-
-    #[test]
-    fn window_init() {
-        let window = init_window(2);
-        assert_eq!(window.size(), 4);
-        assert_eq!(window.have(), 0);
-        assert!(!window.is_empty());
-        let start = window.as_ptr();
-        let size = window.size();
-        let (ptr, len) = window.into_raw_parts();
-        assert_eq!(ptr.cast_const(), start);
-        assert!(len >= size); // >= because the impl is allowed to add padding to the internal buffer
     }
 
     #[test]
