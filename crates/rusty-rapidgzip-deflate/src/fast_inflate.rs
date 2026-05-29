@@ -449,14 +449,20 @@ fn decode_compressed<const IS_SPECULATIVE: bool>(
 
                 let in_buffer_count = length - prefix_count;
                 if in_buffer_count > 0 {
-                    let in_dist = distance - prefix_count;
+                    // The in-buffer portion copies from absolute position
+                    // `chunk_base + 0` (member-local position 0): this is
+                    // where the original match source reaches after the
+                    // prefix_count unknown-prefix bytes are exhausted.
+                    // `cur` is now `chunk_base + emitted + prefix_count =
+                    // chunk_base + distance`, so the copy distance is
+                    // exactly `distance` (not `distance - prefix_count`).
                     if cap - cur < in_buffer_count + COPY_HEADROOM {
                         unsafe { out.set_len(cur) };
                         out.reserve(in_buffer_count + HEADROOM);
                         cap = out.capacity();
                         out_ptr = out.as_mut_ptr();
                     }
-                    unsafe { copy_back_raw(out_ptr, cur, in_dist, in_buffer_count) };
+                    unsafe { copy_back_raw(out_ptr, cur, distance, in_buffer_count) };
                     propagate_match_cached(ctx_ptr, emitted + prefix_count, distance, in_buffer_count);
                     cur += in_buffer_count;
                     if cap - cur < HEADROOM {
@@ -709,4 +715,67 @@ mod tests {
             "stitched output does not match original"
         );
     }
+
+    /// Simulate pipeline chunked speculative decode: split at every N-th block
+    /// boundary, decode each chunk speculatively, resolve markers, stitch, compare.
+    #[test]
+    fn multichunk_speculative_roundtrip() {
+        use crate::find_next_dynamic_block;
+        let payload = ascii_payload(4 * 1024 * 1024);
+        let body = deflate_via_gzip(&payload, 6);
+        let mut padded = body.clone();
+        padded.extend_from_slice(&[0u8; 32]);
+
+        let total_bits = body.len() as u64 * 8;
+
+        // Find block boundaries at ~64KB compressed intervals (simulating pipeline).
+        let chunk_bits = 64u64 * 1024 * 8;
+        let mut boundaries: Vec<u64> = vec![0];
+        let mut c = chunk_bits;
+        while c < total_bits {
+            if let Some(b) = find_next_dynamic_block(&padded, c, total_bits) {
+                if b > *boundaries.last().unwrap() {
+                    boundaries.push(b);
+                }
+            }
+            c += chunk_bits;
+        }
+
+        // Decode each chunk speculatively, resolve, stitch.
+        let mut resolved: Vec<u8> = Vec::new();
+        let mut prev_tail: Vec<u8> = Vec::new();
+
+        for i in 0..boundaries.len() {
+            let start_bit = boundaries[i];
+            let end_bit_hint = boundaries.get(i + 1).copied().unwrap_or(u64::MAX);
+
+            let mut chunk = SpeculativeChunk::default();
+            let (_, hit_bfinal) = decode_until(&padded, start_bit, end_bit_hint, &mut chunk).unwrap();
+
+            crate::speculative::resolve_markers(&mut chunk, &prev_tail).unwrap_or_else(|e| {
+                panic!("resolve_markers failed on chunk {i}: {e}");
+            });
+
+            // Update prev_tail (last 32KB).
+            const WINDOW: usize = 32 * 1024;
+            prev_tail.extend_from_slice(&chunk.bytes);
+            if prev_tail.len() > WINDOW {
+                let drop = prev_tail.len() - WINDOW;
+                prev_tail.drain(..drop);
+            }
+
+            resolved.extend_from_slice(&chunk.bytes);
+
+            if hit_bfinal { break; }
+        }
+
+        assert_eq!(resolved.len(), payload.len(), "length mismatch");
+        // Find first divergence for a useful error message.
+        for (i, (a, b)) in resolved.iter().zip(payload.iter()).enumerate() {
+            if a != b {
+                panic!("first mismatch at byte {i}: got {a:#04x}, expected {b:#04x}");
+            }
+        }
+    }
+
 }

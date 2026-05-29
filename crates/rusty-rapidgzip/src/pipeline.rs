@@ -361,8 +361,11 @@ pub fn parallel_decode_member(
     let mut chunks_sent: u64 = 0;
     let mut final_byte_after_last_trailer: Option<usize> = None;
     let mut last_err: Option<Error> = None;
+    let mut t_wait = std::time::Duration::ZERO;
+    let mut t_proc = std::time::Duration::ZERO;
 
     'outer: while next_id < num_chunks as u64 {
+        let tp0 = std::time::Instant::now();
         while let Some(mut res) = reorder.remove(&next_id) {
             // Resolve markers against last 32 KiB of previously emitted bytes.
             // Marker resolution targets back-refs that escaped the worker's
@@ -397,12 +400,15 @@ pub fn parallel_decode_member(
             chunks_sent += 1;
             next_id += 1;
             if saw_final {
+                t_proc += tp0.elapsed();
                 break 'outer;
             }
         }
+        t_proc += tp0.elapsed();
         if next_id >= num_chunks as u64 {
             break;
         }
+        let tw0 = std::time::Instant::now();
         let res = match result_rx.recv() {
             Ok(r) => r,
             Err(_) => {
@@ -412,6 +418,7 @@ pub fn parallel_decode_member(
                 break 'outer;
             }
         };
+        t_wait += tw0.elapsed();
         match res {
             Ok(r) => {
                 reorder.insert(r.id, r);
@@ -421,6 +428,14 @@ pub fn parallel_decode_member(
                 break 'outer;
             }
         }
+    }
+    if verbose {
+        eprintln!(
+            "[rapidgzip +{:.2}s] serializer: {:.3}s processing + {:.3}s waiting for workers",
+            crate::elapsed_since_start(),
+            t_proc.as_secs_f64(),
+            t_wait.as_secs_f64(),
+        );
     }
 
     // Drain remaining results so workers exit cleanly. Errors from chunks
@@ -754,7 +769,7 @@ pub fn parallel_decode_bgzf(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{read_gz, Config};
+    use crate::{read_gz, Config, InflateKernel};
     use crossbeam_channel::bounded;
     use sha2::{Digest, Sha256};
     use std::io::Write;
@@ -875,6 +890,72 @@ mod tests {
                 );
                 assert_eq!(sha(&out), sha(&expected), "t={threads} cs={chunk_sz}");
             }
+        }
+    }
+
+    /// FastInflate kernel: correctness across various payloads and chunk sizes.
+    #[test]
+    fn fast_inflate_kernel_correctness() {
+        // Highly repetitive payload (RLE-heavy) to stress the prefix-overhang
+        // propagation path (distance > emitted, with in-buffer extension).
+        let mut rle = Vec::new();
+        for _ in 0..1000 { rle.extend_from_slice(b"ACGTACGTACGTACGT"); }
+
+        // Random ASCII to exercise literals and varied back-refs.
+        let ascii = ascii_payload(4 * 1024 * 1024);
+
+        for (name, payload, level) in [
+            ("rle", rle.as_slice(), 6u32),
+            ("ascii", ascii.as_slice(), 6),
+            ("ascii9", ascii.as_slice(), 9),
+        ] {
+            let gz = gz_encode(payload, level);
+            let path = write_tmp(&format!("fast_{name}.gz"), &gz);
+            for threads in [1usize, 4] {
+                for chunk_sz in [64 * 1024usize, 1 << 20] {
+                    let out = decode_via_read_gz(
+                        &path,
+                        Config {
+                            num_threads: threads,
+                            chunk_size_bytes: chunk_sz,
+                            kernel: InflateKernel::FastInflate,
+                            ..Config::default()
+                        },
+                    );
+                    assert_eq!(
+                        sha(&out), sha(payload),
+                        "fast_inflate mismatch: payload={name} threads={threads} chunk={chunk_sz}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// FastInflate kernel: multi-stream (concatenated members) correctness.
+    #[test]
+    fn fast_inflate_kernel_multistream() {
+        let mut gz = Vec::new();
+        let mut expected = Vec::new();
+        for i in 0..10u32 {
+            let mut p = ascii_payload(512 * 1024);
+            let suffix = format!("==M{i}==");
+            let cut = p.len() - suffix.len();
+            p[cut..].copy_from_slice(suffix.as_bytes());
+            expected.extend_from_slice(&p);
+            gz.extend_from_slice(&gz_encode(&p, 6));
+        }
+        let path = write_tmp("fast_multistream.gz", &gz);
+        for threads in [1usize, 4] {
+            let out = decode_via_read_gz(
+                &path,
+                Config {
+                    num_threads: threads,
+                    chunk_size_bytes: 4 * 1024 * 1024,
+                    kernel: InflateKernel::FastInflate,
+                    ..Config::default()
+                },
+            );
+            assert_eq!(sha(&out), sha(&expected), "fast_inflate multistream threads={threads}");
         }
     }
 
