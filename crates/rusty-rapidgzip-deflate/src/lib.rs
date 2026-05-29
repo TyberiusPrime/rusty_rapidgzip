@@ -6,6 +6,7 @@ use thiserror::Error;
 
 pub mod bitreader;
 pub mod block_finder;
+pub mod fast_inflate;
 pub mod huffman;
 pub mod inflate;
 pub mod safe_inflate;

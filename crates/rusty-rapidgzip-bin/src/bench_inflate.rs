@@ -10,13 +10,23 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use rusty_rapidgzip::gzip;
-use rusty_rapidgzip_deflate::{inflate as intree_inflate, safe_inflate, BitReader};
+use rusty_rapidgzip_deflate::{fast_inflate, inflate as intree_inflate, safe_inflate, BitReader};
 use rusty_rapidgzip_inflate::{Inflate, InflateFlush, Status};
 
 fn run_safe(body: &[u8], expected_out: usize) {
     let mut out = Vec::with_capacity(expected_out);
     safe_inflate::inflate_into(body, &mut out).expect("safe inflate");
     assert_eq!(out.len(), expected_out, "safe: output size mismatch");
+}
+
+fn run_fast(body: &[u8], expected_out: usize) {
+    let mut padded = Vec::with_capacity(body.len() + 16);
+    padded.extend_from_slice(body);
+    padded.extend_from_slice(&[0u8; 16]);
+    let mut br = BitReader::new(&padded);
+    let mut out = Vec::with_capacity(expected_out);
+    fast_inflate::inflate_fast(&mut br, &mut out).expect("fast inflate");
+    assert_eq!(out.len(), expected_out, "fast: output size mismatch");
 }
 
 fn run_intree(body: &[u8], expected_out: usize) {
@@ -91,6 +101,9 @@ fn main() {
 
     if want("safe") {
         time("safe", iters, body.len(), out_len, || run_safe(body, out_len));
+    }
+    if want("fast") {
+        time("fast", iters, body.len(), out_len, || run_fast(body, out_len));
     }
     if want("intree") {
         time("intree", iters, body.len(), out_len, || run_intree(body, out_len));

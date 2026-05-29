@@ -64,10 +64,41 @@ impl std::ops::Deref for InputBytes {
 
 use rusty_rapidgzip_deflate::{
     find_next_dynamic_block, resolve_markers,
-    BitReader, SpeculativeChunk, SpeculativeZlibDecoder,
+    fast_inflate, BitReader, SpeculativeChunk, SpeculativeZlibDecoder,
 };
 
-use crate::{Config, Error};
+use crate::{Config, Error, InflateKernel};
+
+/// Per-worker kernel state. `ZlibRs` owns a reusable `SpeculativeZlibDecoder`;
+/// `FastInflate` is stateless so no state is needed.
+enum WorkerKernel {
+    ZlibRs(SpeculativeZlibDecoder),
+    FastInflate,
+}
+
+impl WorkerKernel {
+    fn new(kernel: InflateKernel) -> Self {
+        match kernel {
+            InflateKernel::ZlibRs => WorkerKernel::ZlibRs(SpeculativeZlibDecoder::new()),
+            InflateKernel::FastInflate => WorkerKernel::FastInflate,
+        }
+    }
+
+    fn decode_until(
+        &mut self,
+        input: &[u8],
+        start_bit: u64,
+        end_bit_hint: u64,
+        chunk: &mut SpeculativeChunk,
+    ) -> Result<(u64, bool), rusty_rapidgzip_deflate::DeflateError> {
+        match self {
+            WorkerKernel::ZlibRs(zdec) => zdec.decode_until(input, start_bit, end_bit_hint, chunk),
+            WorkerKernel::FastInflate => {
+                fast_inflate::decode_until(input, start_bit, end_bit_hint, chunk)
+            }
+        }
+    }
+}
 
 /// One unit of speculative decode work.
 struct WorkItem {
@@ -224,18 +255,17 @@ pub fn parallel_decode_member(
         let work_rx = work_rx.clone();
         let result_tx = result_tx.clone();
         let recycle_rx = recycle_rx.clone();
+        let kernel = config.kernel;
         let handle = thread::spawn(move || {
             let body = &input.as_slice()[body_offset..];
-            // Per-worker reusable zlib-rs decoder (amortises engine state
-            // across many chunks).
-            let mut zdec = SpeculativeZlibDecoder::new();
+            let mut wk = WorkerKernel::new(kernel);
             while let Ok(item) = work_rx.recv() {
                 // Try to pull a recycled output buffer; pages on it are
                 // warm so subsequent writes don't take page faults.
                 let recycled = recycle_rx
                     .as_ref()
                     .and_then(|r| r.try_recv().ok());
-                let res = decode_one_chunk(body, &item, &mut zdec, recycled);
+                let res = decode_one_chunk(body, &item, &mut wk, recycled);
                 if result_tx.send(res).is_err() {
                     return;
                 }
@@ -424,7 +454,7 @@ pub fn parallel_decode_member(
 fn decode_one_chunk(
     body: &[u8],
     item: &WorkItem,
-    zdec: &mut SpeculativeZlibDecoder,
+    wk: &mut WorkerKernel,
     recycled_bytes: Option<Vec<u8>>,
 ) -> Result<WorkResult, Error> {
     let mut br = BitReader::new(body);
@@ -451,7 +481,7 @@ fn decode_one_chunk(
             break;
         }
 
-        let (new_end, hit_bfinal) = zdec
+        let (new_end, hit_bfinal) = wk
             .decode_until(body, pos, item.end_bit_hint, &mut chunk)
             .map_err(Error::Deflate)?;
         br.seek_to_bit(new_end).map_err(Error::Deflate)?;

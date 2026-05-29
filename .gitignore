@@ -1,6 +1,7 @@
 /target
 **/target_claude
 librapidarchive/
+rapidgzip_cpp/
 Cargo.lock.bak
 tests/corpus/*.gz
 tests/corpus/*.sha256
