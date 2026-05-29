@@ -285,10 +285,10 @@ pub fn parallel_decode_member(
         }
     });
 
-    // Dedicated CRC validator thread. Receives resolved chunks in chunk_id
-    // order from the serializer; runs the running CRC32 + per-member
-    // validation off the serializer's critical path. The bytes are shared
-    // via Arc — main writes them to stdout in parallel with this validation.
+    // ── CRC validator thread ─────────────────────────────────────────────────
+    //
+    // Receives fully-resolved chunks in order from the serializer, validates
+    // CRC32 + ISIZE off the hot path, and recycles the output buffer.
     let (crc_tx, crc_rx) = bounded::<(Arc<Vec<u8>>, Vec<MemberBoundary>)>(num_threads * 2);
     let crc_handle: thread::JoinHandle<Result<(), Error>> = thread::spawn(move || {
         let mut cur_crc = crc32fast::Hasher::new();
@@ -301,12 +301,7 @@ pub fn parallel_decode_member(
                 let piece = &bytes[cursor..mb.byte_offset_in_chunk];
                 cur_crc.update(piece);
                 cur_uncompressed += piece.len() as u64;
-
-                let crc_got = std::mem::replace(
-                    &mut cur_crc,
-                    crc32fast::Hasher::new(),
-                )
-                .finalize();
+                let crc_got = std::mem::replace(&mut cur_crc, crc32fast::Hasher::new()).finalize();
                 if crc_got != mb.crc_expected {
                     return Err(Error::Gzip(crate::GzipError::CrcMismatch {
                         expected: mb.crc_expected,
@@ -331,13 +326,6 @@ pub fn parallel_decode_member(
             let tail = &bytes[cursor..];
             cur_crc.update(tail);
             cur_uncompressed += tail.len() as u64;
-
-            // Recycle the inner Vec back to the worker pool if main has
-            // already finished writing this chunk. CRC is typically the
-            // slower of the two consumers, so try_unwrap usually succeeds
-            // here. If main is still holding the Arc we drop our ref and
-            // skip recycle for this one — main will drop without recycling
-            // (it doesn't have the recycle_tx) and the Vec is freed.
             drop(member_boundaries);
             if let (Some(tx), Ok(mut v)) = (
                 recycle_tx_for_crc.as_ref(),
@@ -350,120 +338,119 @@ pub fn parallel_decode_member(
         Ok(())
     });
 
-    // Serializer (run on the calling thread): receive results, reorder,
-    // resolve markers, stream bytes out. CRC validation happens on the
-    // CRC thread above; we just forward the resolved bytes.
+    // ── Serializer ───────────────────────────────────────────────────────────
+    let body_len = body.len();
     let mut reorder: std::collections::BTreeMap<u64, WorkResult> =
         std::collections::BTreeMap::new();
     let mut next_id: u64 = 0;
     let mut prev_tail: Vec<u8> = Vec::new();
-    let mut total_uncompressed: u64 = 0;
-    let mut chunks_sent: u64 = 0;
-    let mut final_byte_after_last_trailer: Option<usize> = None;
+    let mut total_uc: u64 = 0;
+    let mut sent: u64 = 0;
+    let mut final_byte: Option<usize> = None;
     let mut last_err: Option<Error> = None;
-    let mut t_wait = std::time::Duration::ZERO;
-    let mut t_proc = std::time::Duration::ZERO;
+
+    let mut t_resolve = std::time::Duration::ZERO;
+    let mut t_wait    = std::time::Duration::ZERO;
+    let mut n_markers: u64 = 0;
 
     'outer: while next_id < num_chunks as u64 {
-        let tp0 = std::time::Instant::now();
         while let Some(mut res) = reorder.remove(&next_id) {
-            // Resolve markers against last 32 KiB of previously emitted bytes.
-            // Marker resolution targets back-refs that escaped the worker's
-            // own chunk; across a member boundary the LZ77 window resets, so
-            // no marker should fire that would mis-read prior-member bytes.
+            n_markers += res.chunk.markers.len() as u64;
+            // Build the tail for the NEXT chunk (fast: only tail-window markers).
+            let t0 = std::time::Instant::now();
+            let new_tail = build_prev_tail_fast(&res.chunk, &prev_tail);
+            // Resolve this chunk's markers against the OLD prev_tail.
             if let Err(e) = resolve_markers(&mut res.chunk, &prev_tail) {
                 last_err = Some(Error::Deflate(e));
                 break 'outer;
             }
-            update_tail(&mut prev_tail, &res.chunk.bytes);
+            t_resolve += t0.elapsed();
+            prev_tail = new_tail;
 
-            total_uncompressed += res.chunk.bytes.len() as u64;
-
+            total_uc += res.chunk.bytes.len() as u64;
             let saw_final = res.final_block;
             if let Some(mb) = res.member_boundaries.last() {
                 if saw_final {
-                    final_byte_after_last_trailer =
-                        Some(mb.trailer_input_byte as usize + 8);
+                    final_byte = Some(mb.trailer_input_byte as usize + 8);
                 }
             }
-
             let bytes_arc = Arc::new(res.chunk.bytes);
-            // Send to CRC thread first, then to sink. If CRC thread has
-            // exited (error), its channel send fails — we'll surface that
-            // when joining.
             let _ = crc_tx.send((Arc::clone(&bytes_arc), res.member_boundaries));
             if sink.send(bytes_arc).is_err() {
                 drop(crc_tx);
                 let _ = crc_handle.join();
-                return Ok((total_uncompressed, body.len(), chunks_sent));
+                drop(result_rx);
+                let _ = dispatch.join();
+                for h in worker_handles { let _ = h.join(); }
+                return Ok((total_uc, body_len, sent));
             }
-            chunks_sent += 1;
+            sent += 1;
             next_id += 1;
             if saw_final {
-                t_proc += tp0.elapsed();
                 break 'outer;
             }
         }
-        t_proc += tp0.elapsed();
-        if next_id >= num_chunks as u64 {
-            break;
-        }
-        let tw0 = std::time::Instant::now();
+        if next_id >= num_chunks as u64 { break; }
+        let tw = std::time::Instant::now();
         let res = match result_rx.recv() {
             Ok(r) => r,
             Err(_) => {
-                last_err = Some(Error::Io(std::io::Error::other(
-                    "worker channel closed",
-                )));
+                last_err = Some(Error::Io(std::io::Error::other("worker channel closed")));
                 break 'outer;
             }
         };
-        t_wait += tw0.elapsed();
+        t_wait += tw.elapsed();
         match res {
-            Ok(r) => {
-                reorder.insert(r.id, r);
-            }
-            Err(e) => {
-                last_err = Some(e);
-                break 'outer;
-            }
+            Ok(r)  => { reorder.insert(r.id, r); }
+            Err(e) => { last_err = Some(e); break 'outer; }
         }
     }
     if verbose {
         eprintln!(
-            "[rapidgzip +{:.2}s] serializer: {:.3}s processing + {:.3}s waiting for workers",
+            "[rapidgzip +{:.2}s] serializer {next_id} chunks | {n_markers} markers | resolve={:.3}s wait={:.3}s",
             crate::elapsed_since_start(),
-            t_proc.as_secs_f64(),
+            t_resolve.as_secs_f64(),
             t_wait.as_secs_f64(),
         );
     }
 
-    // Drain remaining results so workers exit cleanly. Errors from chunks
-    // past the final boundary may have been produced; we discard them.
+    drop(crc_tx);
     drop(result_rx);
     let _ = dispatch.join();
-    for h in worker_handles {
-        let _ = h.join();
-    }
-
-    // Close CRC channel and join. Surface CRC errors over any serializer
-    // error (serializer-side errors are non-CRC paths like marker resolution).
-    drop(crc_tx);
-    let crc_result = crc_handle.join().unwrap_or_else(|_| {
-        Err(Error::Io(std::io::Error::other("crc thread panicked")))
-    });
+    for h in worker_handles { let _ = h.join(); }
 
     if let Some(e) = last_err {
         return Err(e);
     }
-    crc_result?;
 
-    let body_consumed = final_byte_after_last_trailer.ok_or_else(|| {
-        Error::Io(std::io::Error::other(
-            "parallel decode produced no final block",
-        ))
+    crc_handle.join().unwrap_or_else(|_| {
+        Err(Error::Io(std::io::Error::other("crc thread panicked")))
     })?;
-    Ok((total_uncompressed, body_consumed, chunks_sent))
+
+    let bc = final_byte.ok_or_else(|| {
+        Error::Io(std::io::Error::other("parallel decode produced no final block"))
+    })?;
+    Ok((total_uc, bc, sent))
+}
+
+/// Build the next chunk's prev_tail by applying only the markers that land in
+/// the last 32 KiB of this chunk's output.
+fn build_prev_tail_fast(chunk: &SpeculativeChunk, prev_tail: &[u8]) -> Vec<u8> {
+    const WINDOW: usize = 32 * 1024;
+    let len = chunk.bytes.len();
+    let tail_start = len.saturating_sub(WINDOW);
+    let first = chunk.markers.partition_point(|m| (m.out_pos as usize) < tail_start);
+    let mut new_tail = chunk.bytes[tail_start..].to_vec();
+    for m in &chunk.markers[first..] {
+        let pos = m.out_pos as usize;
+        if pos >= tail_start + new_tail.len() { break; }
+        let dst = pos - tail_start;
+        let off = m.prefix_offset as usize;
+        if off < prev_tail.len() {
+            new_tail[dst] = prev_tail[prev_tail.len() - 1 - off];
+        }
+    }
+    new_tail
 }
 
 fn decode_one_chunk(
@@ -564,20 +551,6 @@ fn effective_threads(config: &Config) -> usize {
     n.max(1)
 }
 
-/// Keep the last 32 KiB of (prev_tail ++ new_bytes) as the next prev_tail.
-fn update_tail(prev_tail: &mut Vec<u8>, new_bytes: &[u8]) {
-    const WINDOW: usize = 32 * 1024;
-    if new_bytes.len() >= WINDOW {
-        prev_tail.clear();
-        prev_tail.extend_from_slice(&new_bytes[new_bytes.len() - WINDOW..]);
-        return;
-    }
-    prev_tail.extend_from_slice(new_bytes);
-    if prev_tail.len() > WINDOW {
-        let drop = prev_tail.len() - WINDOW;
-        prev_tail.drain(..drop);
-    }
-}
 
 /// BGZF fast-path pipeline.
 ///
@@ -1111,18 +1084,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn update_tail_keeps_last_32k() {
-        let mut prev = Vec::new();
-        update_tail(&mut prev, &[1u8; 1000]);
-        assert_eq!(prev.len(), 1000);
-        update_tail(&mut prev, &[2u8; 50_000]);
-        assert_eq!(prev.len(), 32 * 1024);
-        assert!(prev.iter().all(|&b| b == 2));
-        let mut prev = vec![9u8; 30_000];
-        update_tail(&mut prev, &[7u8; 5_000]);
-        assert_eq!(prev.len(), 32 * 1024);
-        // Last 5000 bytes should be 7s.
-        assert!(prev[32 * 1024 - 5_000..].iter().all(|&b| b == 7));
-    }
 }
