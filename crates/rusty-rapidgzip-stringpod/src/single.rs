@@ -9,7 +9,10 @@ use crate::storage::Storage;
 /// is immutable; only the metadata can be mutated (cuts, drains).
 #[derive(Clone)]
 pub struct StringPod {
-    pub(crate) data: Arc<[u8]>,
+    // `Arc<Vec<u8>>` (not `Arc<[u8]>`) so `finish` can wrap the builder's Vec
+    // as-is — converting to a boxed slice would realloc+copy the whole buffer
+    // whenever the builder over-reserved.
+    pub(crate) data: Arc<Vec<u8>>,
     pub(crate) storage: Storage,
 }
 
@@ -238,11 +241,12 @@ impl StringPodBuilder {
         self.data.len()
     }
 
-    /// Finalise the builder. Wraps the byte buffer in `Arc<[u8]>`.
+    /// Finalise the builder. Wraps the byte buffer in `Arc<Vec<u8>>` without
+    /// reallocating (any over-reserved capacity is retained, not copied away).
     #[must_use]
     pub fn finish(self) -> StringPod {
         StringPod {
-            data: Arc::from(self.data.into_boxed_slice()),
+            data: Arc::new(self.data),
             storage: self.storage,
         }
     }
@@ -255,7 +259,7 @@ impl StringPodBuilder {
 /// subsequent mutations of the source pod do not affect the alias pod
 /// (snapshot semantics).
 pub struct StringPodAliasBuilder {
-    data: Arc<[u8]>,
+    data: Arc<Vec<u8>>,
     positions: Vec<(u32, u32)>,
 }
 

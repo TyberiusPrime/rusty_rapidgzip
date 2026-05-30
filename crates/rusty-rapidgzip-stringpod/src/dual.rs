@@ -11,8 +11,10 @@ use crate::storage::Storage;
 /// can be aliased into a tag column without pinning qual, and vice versa.
 #[derive(Clone)]
 pub struct DualStringPod {
-    pub(crate) seq: Arc<[u8]>,
-    pub(crate) qual: Arc<[u8]>,
+    // `Arc<Vec<u8>>` (not `Arc<[u8]>`) so `finish` wraps the builder Vecs as-is
+    // rather than reallocating away any over-reserved capacity.
+    pub(crate) seq: Arc<Vec<u8>>,
+    pub(crate) qual: Arc<Vec<u8>>,
     pub(crate) storage: Storage,
 }
 
@@ -319,8 +321,8 @@ impl DualStringPodBuilder {
     #[must_use]
     pub fn finish(self) -> DualStringPod {
         DualStringPod {
-            seq: Arc::from(self.seq.into_boxed_slice()),
-            qual: Arc::from(self.qual.into_boxed_slice()),
+            seq: Arc::new(self.seq),
+            qual: Arc::new(self.qual),
             storage: self.storage,
         }
     }
@@ -332,8 +334,8 @@ impl DualStringPodBuilder {
 /// pod's `seq` and `qual` `Arc<[u8]>` buffers without copying. Both buffers
 /// are pinned for the alias pod's lifetime (snapshot semantics).
 pub struct DualStringPodAliasBuilder {
-    seq: Arc<[u8]>,
-    qual: Arc<[u8]>,
+    seq: Arc<Vec<u8>>,
+    qual: Arc<Vec<u8>>,
     positions: Vec<(u32, u32)>,
 }
 
