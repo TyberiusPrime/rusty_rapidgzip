@@ -536,26 +536,38 @@ fn decode_compressed<const IS_SPECULATIVE: bool>(
 // marker-ness forward. On FASTQ, marker-ness saturates the output, so that
 // turned into a binary search per back-reference and dominated runtime.
 //
-// This path instead mirrors rapidgzip's `m_window16`: decode into a `u16`
-// scratch buffer where a set high bit (`SpeculativeChunk::MARKER16`) flags an
-// unresolved prefix-referencing cell and the low 15 bits hold its
-// `prefix_offset`. Back-reference copies move whole `u16` cells, so marker-ness
-// propagates for *free* as part of the copy — no per-back-ref bookkeeping. A
-// single linear `extract_from_u16` pass afterwards lowers the scratch to the
-// existing `(bytes, markers)` contract, so the pipeline and `resolve_markers`
-// are unchanged.
+// This path mirrors rapidgzip's `m_window16`: cells carry their resolution
+// state inline. A cell with the high bit (`SpeculativeChunk::MARKER16`) set is
+// an unresolved prefix-referencing byte whose low 15 bits hold its
+// `prefix_offset`; otherwise it is a resolved literal in the low 8 bits.
+// Back-reference copies move whole `u16` cells, so marker-ness propagates for
+// *free* as part of the copy — no per-back-ref bookkeeping.
+//
+// Crucially the window is **bounded**: a fixed `U16_BUFCAP`-cell buffer that
+// retains the last `U16_WINDOW` (= max DEFLATE distance) cells of history and
+// flushes everything older into the `(bytes, markers)` contract as it fills.
+// That keeps the per-worker footprint ~512 KiB (L2-resident) instead of a
+// full-chunk buffer that, at 32 SMT threads, faulted ~900 MiB concurrently and
+// blew up sys time. The flush is amortized: emit `U16_FLUSH_AT - U16_WINDOW`
+// cells, then slide the retained window down with one `copy_within`.
 
 /// High bit marks a prefix-referencing cell; low 15 bits are the prefix offset.
 const MARKER16: u16 = SpeculativeChunk::MARKER16;
 /// Cells of slop `copy_back_u16` may overwrite past `dst + length`.
 const COPY_HEADROOM_U16: usize = 16;
-/// Spare cells kept past the write head so literal/copy stores never bounds-check.
-const HEADROOM_U16: usize = 4096;
+/// History retained for back-references (max DEFLATE distance, in cells).
+const U16_WINDOW: usize = 32 * 1024;
+/// Flush once the write cursor reaches here; emits `_AT - _WINDOW` cells.
+const U16_FLUSH_AT: usize = 256 * 1024;
+/// Fixed buffer capacity. Headroom past `_FLUSH_AT` covers one max-length
+/// (258-cell) copy plus `copy_back_u16`'s chunked overshoot.
+const U16_BUFCAP: usize = U16_FLUSH_AT + 258 + COPY_HEADROOM_U16 + 8;
 
-/// Speculative decode into a reusable `u16` scratch, then lower into `chunk`.
+/// Speculative decode through a bounded `u16` sliding window, lowering emitted
+/// cells into `chunk` incrementally.
 ///
-/// Drop-in for [`decode_until`] on the parallel fast path. `scratch` is owned by
-/// the worker and reused across chunks so its pages stay faulted.
+/// Drop-in for [`decode_until`] on the parallel fast path. `scratch` is the
+/// worker-owned window buffer (fixed `U16_BUFCAP` cells, reused across chunks).
 pub fn decode_until_u16(
     input: &[u8],
     start_bit: u64,
@@ -565,13 +577,23 @@ pub fn decode_until_u16(
 ) -> Result<(u64, bool), DeflateError> {
     let mut br = BitReader::new(input);
     br.seek_to_bit(start_bit)?;
-    scratch.clear();
+    if scratch.len() != U16_BUFCAP {
+        scratch.clear();
+        scratch.resize(U16_BUFCAP, 0);
+    }
+
+    // `cur` is the window-local write cursor; `window_base` is the global
+    // member-relative position of `scratch[0]` (only ever 0 before the first
+    // flush — overshoot markers can only appear in that regime). Both persist
+    // across blocks of the member, since back-references cross block boundaries.
+    let mut cur: usize = 0;
+    let mut window_base: u64 = 0;
 
     let mut final_block = false;
     loop {
         let bfinal = br.read(1)? != 0;
         let btype = br.read(2)?;
-        decode_block_u16(&mut br, scratch, btype)?;
+        decode_block_u16(&mut br, scratch, chunk, btype, &mut cur, &mut window_base)?;
         if bfinal {
             final_block = true;
             break;
@@ -581,40 +603,74 @@ pub fn decode_until_u16(
         }
     }
     let end_bit = br.tell_bit();
-    chunk.extract_from_u16(scratch);
+    // Final flush: nothing more references this member, so emit all of it.
+    chunk.extract_from_u16(&scratch[0..cur]);
     Ok((end_bit, final_block))
+}
+
+/// Emit everything older than the retained window, then slide the window down.
+/// Caller guarantees `*cur > U16_WINDOW`.
+#[inline]
+fn flush_u16(
+    scratch: &mut Vec<u16>,
+    chunk: &mut SpeculativeChunk,
+    cur: &mut usize,
+    window_base: &mut u64,
+) {
+    let flush_count = *cur - U16_WINDOW;
+    chunk.extract_from_u16(&scratch[0..flush_count]);
+    scratch.copy_within((*cur - U16_WINDOW)..*cur, 0);
+    *window_base += flush_count as u64;
+    *cur = U16_WINDOW;
 }
 
 fn decode_block_u16(
     br: &mut BitReader<'_>,
-    out: &mut Vec<u16>,
+    scratch: &mut Vec<u16>,
+    chunk: &mut SpeculativeChunk,
     btype: u32,
+    cur: &mut usize,
+    window_base: &mut u64,
 ) -> Result<(), DeflateError> {
     match btype {
-        0 => decode_stored_u16(br, out),
+        0 => decode_stored_u16(br, scratch, chunk, cur, window_base),
         1 => {
             let lit = HuffmanDecoder::from_lengths_litlen(&fixed_literal_lengths())?;
             let dist = HuffmanDecoder::from_lengths(&fixed_distance_lengths())?;
-            decode_compressed_u16(br, out, &lit, &dist)
+            decode_compressed_u16(br, scratch, chunk, &lit, &dist, cur, window_base)
         }
         2 => {
             let (lit, dist) = read_dynamic_header(br)?;
-            decode_compressed_u16(br, out, &lit, &dist)
+            decode_compressed_u16(br, scratch, chunk, &lit, &dist, cur, window_base)
         }
         _ => Err(DeflateError::Invalid("reserved block type")),
     }
 }
 
-fn decode_stored_u16(br: &mut BitReader<'_>, out: &mut Vec<u16>) -> Result<(), DeflateError> {
+fn decode_stored_u16(
+    br: &mut BitReader<'_>,
+    scratch: &mut Vec<u16>,
+    chunk: &mut SpeculativeChunk,
+    cur: &mut usize,
+    window_base: &mut u64,
+) -> Result<(), DeflateError> {
     br.byte_align();
     let len = br.read(16)? as u16;
     let nlen = br.read(16)? as u16;
     if !len ^ nlen != 0 {
         return Err(DeflateError::Invalid("stored block: LEN/NLEN mismatch"));
     }
-    out.reserve(len as usize);
-    for _ in 0..len {
-        out.push(br.read(8)? as u16);
+    let mut remaining = len as usize;
+    while remaining > 0 {
+        if *cur >= U16_FLUSH_AT {
+            flush_u16(scratch, chunk, cur, window_base);
+        }
+        let take = remaining.min(U16_FLUSH_AT - *cur);
+        for _ in 0..take {
+            scratch[*cur] = br.read(8)? as u16;
+            *cur += 1;
+        }
+        remaining -= take;
     }
     Ok(())
 }
@@ -660,23 +716,23 @@ unsafe fn copy_back_u16(out_ptr: *mut u16, cur: usize, distance: usize, length: 
     }
 }
 
-/// Decode one compressed block (fixed or dynamic) into the `u16` scratch.
+/// Decode one compressed block (fixed or dynamic) through the sliding window.
 #[allow(unsafe_code)]
 fn decode_compressed_u16(
     br: &mut BitReader<'_>,
-    out: &mut Vec<u16>,
+    scratch: &mut Vec<u16>,
+    chunk: &mut SpeculativeChunk,
     lit: &HuffmanDecoder,
     dist: &HuffmanDecoder,
+    cur_ref: &mut usize,
+    window_base_ref: &mut u64,
 ) -> Result<(), DeflateError> {
     const NEEDED: u32 = 48;
     const LUT_MASK: u64 = (1u64 << LUT_BITS) - 1;
 
-    if out.capacity() - out.len() < HEADROOM_U16 {
-        out.reserve(HEADROOM_U16);
-    }
-    let mut cap = out.capacity();
-    let mut out_ptr = out.as_mut_ptr();
-    let mut cur = out.len();
+    let mut out_ptr = scratch.as_mut_ptr();
+    let mut cur = *cur_ref;
+    let mut window_base = *window_base_ref;
 
     let mut buf = br.buf;
     let mut bits = br.bits;
@@ -700,30 +756,18 @@ fn decode_compressed_u16(
             byte_pos = br.byte_pos;
         };
     }
-    // Ensure `cap - cur >= need + COPY_HEADROOM_U16`, refreshing ptr/cap.
-    macro_rules! ensure_cap {
-        ($need:expr) => {
-            if cap - cur < $need + COPY_HEADROOM_U16 {
-                unsafe { out.set_len(cur) };
-                out.reserve($need + HEADROOM_U16);
-                cap = out.capacity();
-                out_ptr = out.as_mut_ptr();
-            }
-        };
-    }
 
     let result: Result<(), DeflateError> = 'outer: loop {
         if byte_pos + 8 <= input_len {
-            let chunk =
+            let chunk_in =
                 unsafe { std::ptr::read_unaligned(input_ptr.add(byte_pos) as *const u64) };
-            buf |= u64::from_le(chunk) << bits;
+            buf |= u64::from_le(chunk_in) << bits;
             let advance = (63u32 ^ bits) >> 3;
             byte_pos += advance as usize;
             bits |= 56;
         } else if bits < NEEDED {
             while bits < NEEDED {
                 if byte_pos >= input_len {
-                    unsafe { out.set_len(cur) };
                     sync_br!();
                     br.exhausted = true;
                     break 'outer Err(DeflateError::UnexpectedEof);
@@ -734,13 +778,22 @@ fn decode_compressed_u16(
             }
         }
 
+        // ── Flush the window if it has filled (cold: ~every 224 Ki cells) ─────
+        if cur >= U16_FLUSH_AT {
+            let flush_count = cur - U16_WINDOW;
+            chunk.extract_from_u16(&scratch[0..flush_count]);
+            scratch.copy_within((cur - U16_WINDOW)..cur, 0);
+            window_base += flush_count as u64;
+            cur = U16_WINDOW;
+            out_ptr = scratch.as_mut_ptr();
+        }
+
         // ── Literal/length symbol ────────────────────────────────────────────
         let entry = {
             let idx = (buf & LUT_MASK) as usize;
             let e = unsafe { *lit_lut.add(idx) };
             let len = e & 0xff;
             if len == 0 {
-                unsafe { out.set_len(cur) };
                 sync_br!();
                 match lit.lookup_long(br) {
                     Ok(e) => {
@@ -758,12 +811,6 @@ fn decode_compressed_u16(
 
         // ── Literal ──────────────────────────────────────────────────────────
         if entry & HUFFDEC_LITERAL != 0 {
-            if cur == cap {
-                unsafe { out.set_len(cur) };
-                out.reserve(HEADROOM_U16);
-                cap = out.capacity();
-                out_ptr = out.as_mut_ptr();
-            }
             // Mask to the literal byte: `entry >> 16` would otherwise carry
             // HUFFDEC_LITERAL (bit 31) into bit 15, colliding with MARKER16.
             unsafe { *out_ptr.add(cur) = ((entry >> 16) & 0xff) as u16 };
@@ -773,7 +820,6 @@ fn decode_compressed_u16(
 
         // ── EOB / reserved ───────────────────────────────────────────────────
         if entry & HUFFDEC_EXCEPTIONAL != 0 {
-            unsafe { out.set_len(cur) };
             sync_br!();
             if entry >> 16 == 0 {
                 break 'outer Ok(());
@@ -797,7 +843,6 @@ fn decode_compressed_u16(
             let e = unsafe { *dist_lut.add(idx) };
             let len = e & 0xff;
             if len == 0 {
-                unsafe { out.set_len(cur) };
                 sync_br!();
                 match dist.lookup_long(br) {
                     Ok(e) => {
@@ -813,7 +858,6 @@ fn decode_compressed_u16(
             }
         };
         if dsym >= 30 {
-            unsafe { out.set_len(cur) };
             sync_br!();
             break 'outer Err(DeflateError::Invalid("distance symbol out of range"));
         }
@@ -826,12 +870,12 @@ fn decode_compressed_u16(
             bits -= dextra;
         }
 
-        // ── Back-reference into the dense window ──────────────────────────────
-        ensure_cap!(length);
-        if distance > cur {
-            // Overshoot into the unknown prefix: write marker cells whose
-            // low 15 bits encode prefix_offset (= dist - emitted - k - 1),
-            // then copy the in-buffer tail (which may itself be markers).
+        // ── Back-reference ────────────────────────────────────────────────────
+        // Overshoot into the unknown prefix can only happen before the first
+        // flush (`window_base == 0`): afterwards `cur >= U16_WINDOW >= distance`,
+        // so the source is always in-window. That lets the hot test stay
+        // `distance > cur` and the prefix_offset formula stay window-base-free.
+        if window_base == 0 && distance > cur {
             let prefix_count = (distance - cur).min(length);
             for k in 0..prefix_count {
                 let prefix_offset = (distance - cur - k - 1) as u16;
@@ -846,7 +890,6 @@ fn decode_compressed_u16(
             continue 'outer;
         }
         if distance == 0 {
-            unsafe { out.set_len(cur) };
             sync_br!();
             break 'outer Err(DeflateError::Invalid("zero back-reference distance"));
         }
@@ -854,6 +897,8 @@ fn decode_compressed_u16(
         cur += length;
     };
 
+    *cur_ref = cur;
+    *window_base_ref = window_base;
     result
 }
 
