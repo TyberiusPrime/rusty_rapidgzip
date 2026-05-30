@@ -197,6 +197,34 @@ const COPY_N: usize = 16;
 /// store may land past `dst + length`).
 const COPY_HEADROOM: usize = COPY_N;
 
+/// Copy one `N`-byte chunk `src → dst`, reading the whole chunk into a SIMD
+/// register before writing (so it tolerates the over-read when `distance < N`).
+///
+/// We go through explicit `__m256i` / `__m128i` intrinsics rather than
+/// `read_unaligned::<[u8; N]>()` because LLVM materialises the `[u8; N]` array
+/// on the stack — the round-trip showed up as a 32-byte `vmovdqu %ymm,(%rsp)`
+/// burning ~16% of decode cycles. The intrinsic keeps the chunk register-resident.
+#[inline(always)]
+#[allow(unsafe_code)]
+unsafe fn copy_one_chunk<const N: usize>(src: *const u8, dst: *mut u8) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    if N == 32 {
+        use core::arch::x86_64::{__m256i, _mm256_loadu_si256, _mm256_storeu_si256};
+        let v = unsafe { _mm256_loadu_si256(src as *const __m256i) };
+        unsafe { _mm256_storeu_si256(dst as *mut __m256i, v) };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if N == 16 {
+        use core::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_storeu_si128};
+        let v = unsafe { _mm_loadu_si128(src as *const __m128i) };
+        unsafe { _mm_storeu_si128(dst as *mut __m128i, v) };
+        return;
+    }
+    let chunk: [u8; N] = unsafe { std::ptr::read_unaligned(src.cast::<[u8; N]>()) };
+    unsafe { std::ptr::write_unaligned(dst.cast::<[u8; N]>(), chunk) };
+}
+
 /// Copy `length` bytes in `N`-byte chunks.  May over-write up to `N-1` bytes
 /// beyond `dst + length`; caller ensures `dst + length + N` is valid.
 ///
@@ -210,13 +238,11 @@ const COPY_HEADROOM: usize = COPY_N;
 #[allow(unsafe_code)]
 unsafe fn copy_chunked_unchecked<const N: usize>(src: *const u8, dst: *mut u8, length: usize) {
     let end = src.add(length);
-    let chunk: [u8; N] = std::ptr::read_unaligned(src.cast::<[u8; N]>());
-    std::ptr::write_unaligned(dst.cast::<[u8; N]>(), chunk);
+    copy_one_chunk::<N>(src, dst);
     let mut s = src.add(N);
     let mut d = dst.add(N);
     while s < end {
-        let chunk: [u8; N] = std::ptr::read_unaligned(s.cast::<[u8; N]>());
-        std::ptr::write_unaligned(d.cast::<[u8; N]>(), chunk);
+        copy_one_chunk::<N>(s, d);
         s = s.add(N);
         d = d.add(N);
     }
