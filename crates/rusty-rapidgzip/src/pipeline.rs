@@ -163,6 +163,116 @@ impl PoolGate {
     }
 }
 
+/// Dispatch-side back-pressure on the number of *decoded chunks in flight*.
+///
+/// A decoded chunk carries its full `bytes` (≈3–4× the compressed chunk) plus a
+/// `markers` vector; with a slow consumer the pipeline otherwise runs as far
+/// ahead as the summed channel capacities allow (~`8 × num_threads` chunks
+/// spread across the result / resolve / done / crc stages), and that headroom —
+/// not the active worker count — is what fixes peak RSS. This counting
+/// semaphore caps outstanding chunks: dispatch [`acquire`]s a slot before
+/// sending each work item, and the output stage [`release`]s it once the chunk
+/// has been streamed to the sink. The ceiling is mutable so the autotune
+/// controller can shrink it in lock-step with the active worker count.
+///
+/// On by default at [`INFLIGHT_DEFAULT_FACTOR`] chunks per worker (floored by
+/// [`INFLIGHT_FLOOR`]); `RAPIDGZIP_INFLIGHT=<factor>` overrides the factor and
+/// `RAPIDGZIP_INFLIGHT=0` disables the cap entirely (the `Option` becomes
+/// `None`, so there is zero added lock traffic).
+///
+/// [`acquire`]: InflightCap::acquire
+/// [`release`]: InflightCap::release
+struct InflightCap {
+    inner: Mutex<InflightState>,
+    cv: Condvar,
+}
+
+struct InflightState {
+    in_flight: usize,
+    max: usize,
+    shutdown: bool,
+}
+
+impl InflightCap {
+    fn new(max: usize) -> Self {
+        Self {
+            inner: Mutex::new(InflightState { in_flight: 0, max: max.max(1), shutdown: false }),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// Block until a slot is free, then claim it. Returns `false` if the cap was
+    /// shut down while waiting (teardown) — the caller should stop dispatching.
+    fn acquire(&self) -> bool {
+        let mut g = self.inner.lock().unwrap();
+        loop {
+            if g.shutdown {
+                return false;
+            }
+            if g.in_flight < g.max {
+                g.in_flight += 1;
+                return true;
+            }
+            g = self.cv.wait(g).unwrap();
+        }
+    }
+
+    /// Return one slot and wake a waiting dispatcher.
+    fn release(&self) {
+        let mut g = self.inner.lock().unwrap();
+        g.in_flight = g.in_flight.saturating_sub(1);
+        drop(g);
+        self.cv.notify_one();
+    }
+
+    /// Raise or lower the ceiling (autotune). Wakes dispatch if it rose.
+    fn set_max(&self, max: usize) {
+        let mut g = self.inner.lock().unwrap();
+        g.max = max.max(1);
+        drop(g);
+        self.cv.notify_all();
+    }
+
+    /// Release a dispatcher blocked in [`acquire`] during teardown.
+    fn shutdown(&self) {
+        let mut g = self.inner.lock().unwrap();
+        g.shutdown = true;
+        drop(g);
+        self.cv.notify_all();
+    }
+}
+
+/// Absolute floor on the in-flight cap. The serial stage-A tail-chain + resolve
+/// pool need a minimum lookahead to stay fed; below ~this the pipeline starves
+/// at low thread counts (measured: `2×P` throttled P=2 ~6%). The floor only ever
+/// *raises* the cap, so it costs nothing at high N — where `N×factor` dominates
+/// and the runaway (~8N buffered chunks) actually lives.
+const INFLIGHT_FLOOR: usize = 16;
+
+/// Default in-flight chunks per worker. 2 is the measured sweet spot: ~−50% peak
+/// RSS under a slow consumer with the throughput path unaffected at every P.
+const INFLIGHT_DEFAULT_FACTOR: usize = 2;
+
+/// Configured in-flight factor: `Some(f)` ⇒ cap outstanding chunks at
+/// `max(N·f, INFLIGHT_FLOOR)`; `None` ⇒ cap disabled. On by default; override
+/// with `RAPIDGZIP_INFLIGHT` (`0` disables, any other value sets the factor,
+/// garbage falls back to the default).
+fn inflight_factor() -> Option<usize> {
+    match std::env::var("RAPIDGZIP_INFLIGHT") {
+        Ok(s) => match s.parse::<usize>() {
+            Ok(0) => None,
+            Ok(f) => Some(f),
+            Err(_) => Some(INFLIGHT_DEFAULT_FACTOR),
+        },
+        Err(_) => Some(INFLIGHT_DEFAULT_FACTOR),
+    }
+}
+
+/// Build the cap for `num_threads` workers from a configured `factor`.
+fn make_inflight_cap(num_threads: usize, factor: Option<usize>) -> Option<Arc<InflightCap>> {
+    factor.map(|f| Arc::new(InflightCap::new((num_threads * f).max(INFLIGHT_FLOOR))))
+}
+
 /// One unit of speculative decode work.
 struct WorkItem {
     id: u64,
@@ -380,6 +490,15 @@ pub fn parallel_decode_member(
     drop(work_rx);
     drop(result_tx);
 
+    // ── In-flight chunk cap (default-on) ─────────────────────────────────────
+    //
+    // Bounds the number of decoded chunks outstanding between dispatch and the
+    // sink (see [`InflightCap`]). On by default; `RAPIDGZIP_INFLIGHT=0` disables
+    // it. The factor is "chunks per active worker"; when autotune is on the
+    // controller rescales the ceiling as it sheds, so RSS tracks `active`.
+    let inflight_factor = inflight_factor();
+    let inflight = make_inflight_cap(num_threads, inflight_factor);
+
     // ── Autotune controller (opt-in) ─────────────────────────────────────────
     //
     // Polls how full the worker→stage-A `result` channel is and sheds/restores
@@ -394,6 +513,7 @@ pub fn parallel_decode_member(
         let stop = Arc::clone(&tune_stop);
         let cap = (num_threads * 2).max(1);
         let policy = Policy::from_env();
+        let inflight = inflight.clone();
         Some(thread::spawn(move || {
             let mut tune = AutoTune::new(num_threads, policy);
             while !stop.load(Ordering::Relaxed) {
@@ -401,6 +521,11 @@ pub fn parallel_decode_member(
                 let occ = rx.len() as f64 / cap as f64;
                 if let Some(n) = tune.observe(occ) {
                     gate.set_active(n);
+                    // Shrink/grow the in-flight ceiling in lock-step so RSS
+                    // tracks the active worker count, not just the static -P.
+                    if let (Some(cap), Some(f)) = (&inflight, inflight_factor) {
+                        cap.set_max((n * f).max(INFLIGHT_FLOOR));
+                    }
                     if verbose {
                         eprintln!(
                             "[rapidgzip +{:.2}s] autotune: active={n} (result occ={occ:.2})",
@@ -414,14 +539,24 @@ pub fn parallel_decode_member(
         None
     };
 
-    // Dispatch work — send all items. The bounded channel applies backpressure.
-    let dispatch = thread::spawn(move || {
-        for item in work_items {
-            if work_tx.send(item).is_err() {
-                return;
+    // Dispatch work — send all items. The bounded channel applies backpressure;
+    // the optional in-flight cap additionally throttles how many decoded chunks
+    // may be outstanding at once (acquire here, released at the sink).
+    let dispatch = {
+        let inflight = inflight.clone();
+        thread::spawn(move || {
+            for item in work_items {
+                if let Some(cap) = &inflight {
+                    if !cap.acquire() {
+                        return; // cap shut down during teardown
+                    }
+                }
+                if work_tx.send(item).is_err() {
+                    return;
+                }
             }
-        }
-    });
+        })
+    };
 
     // ── CRC validator thread ─────────────────────────────────────────────────
     //
@@ -609,7 +744,14 @@ pub fn parallel_decode_member(
             }
             let bytes_arc = Arc::new(done.chunk.bytes);
             let _ = crc_tx.send((Arc::clone(&bytes_arc), done.member_boundaries));
-            if sink.send(bytes_arc).is_err() {
+            let send_ok = sink.send(bytes_arc).is_ok();
+            // Chunk has left the decode pipeline — free its in-flight slot so
+            // dispatch may admit the next one. (Release whether or not the sink
+            // accepted it; on close we tear down and abort dispatch anyway.)
+            if let Some(cap) = &inflight {
+                cap.release();
+            }
+            if !send_ok {
                 sink_closed = true;
                 break 'outer;
             }
@@ -656,6 +798,11 @@ pub fn parallel_decode_member(
     drop(done_rx);
     tune_stop.store(true, Ordering::Relaxed);
     gate.shutdown();
+    // Wake `dispatch` if it's parked in `InflightCap::acquire` (e.g. we broke at
+    // the final block before processing every dispatched item) so it can exit.
+    if let Some(cap) = &inflight {
+        cap.shutdown();
+    }
     if let Some(h) = tune_handle {
         let _ = h.join();
     }
@@ -1068,15 +1215,30 @@ pub fn parallel_decode_bgzf(
     }
     drop(result_tx);
 
-    // Dispatch all work items, then close the work channel.
-    let dispatch = thread::spawn(move || {
-        for (id, &(s, e)) in batches.iter().enumerate() {
-            if work_tx.send((id as u64, s, e)).is_err() {
-                return;
+    // In-flight cap: bound decoded batches outstanding between dispatch and the
+    // sink (same default-on policy as the speculative path; see [`InflightCap`]).
+    // BGZF has no autotune controller, so the ceiling is static.
+    let inflight = make_inflight_cap(num_threads, inflight_factor());
+
+    // Dispatch all work items, then close the work channel. The in-flight cap
+    // throttles how many decoded batches may be outstanding (acquire here,
+    // released at the sink).
+    let dispatch = {
+        let inflight = inflight.clone();
+        thread::spawn(move || {
+            for (id, &(s, e)) in batches.iter().enumerate() {
+                if let Some(cap) = &inflight {
+                    if !cap.acquire() {
+                        return; // cap shut down during teardown
+                    }
+                }
+                if work_tx.send((id as u64, s, e)).is_err() {
+                    return;
+                }
             }
-        }
-        drop(work_tx);
-    });
+            drop(work_tx);
+        })
+    };
 
     // Serializer: reorder, stream in order.
     let mut pending: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
@@ -1094,7 +1256,12 @@ pub fn parallel_decode_bgzf(
                 pending.insert(id, bytes);
                 while let Some(bytes) = pending.remove(&next_id) {
                     total_uncompressed += bytes.len() as u64;
-                    if sink.send(Arc::new(bytes)).is_err() {
+                    let send_ok = sink.send(Arc::new(bytes)).is_ok();
+                    // Batch has left the pipeline — free its in-flight slot.
+                    if let Some(cap) = &inflight {
+                        cap.release();
+                    }
+                    if !send_ok {
                         last_err = Some(Error::Io(std::io::Error::new(
                             std::io::ErrorKind::BrokenPipe,
                             "sink closed",
@@ -1111,6 +1278,11 @@ pub fn parallel_decode_bgzf(
         }
     }
 
+    // Wake `dispatch` if it's parked in `acquire` (we broke out of the
+    // serializer early, e.g. on error, before releasing every batch).
+    if let Some(cap) = &inflight {
+        cap.shutdown();
+    }
     let _ = dispatch.join();
     for w in workers {
         let _ = w.join();
@@ -1483,6 +1655,47 @@ mod tests {
         // Release the now re-parked worker via shutdown.
         gate.shutdown();
         h.join().unwrap();
+    }
+
+    /// InflightCap: acquire blocks at the ceiling, release admits the next,
+    /// `set_max` can raise/lower it live, and `shutdown` frees a blocked waiter.
+    #[test]
+    fn inflight_cap_blocks_releases_resizes_shuts_down() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        // Ceiling 2: first two acquires pass immediately.
+        let cap = Arc::new(InflightCap::new(2));
+        assert!(cap.acquire());
+        assert!(cap.acquire());
+
+        // A third acquire must block until a slot frees.
+        let admitted = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&cap);
+        let a = Arc::clone(&admitted);
+        let h = std::thread::spawn(move || {
+            assert!(c.acquire());
+            a.fetch_add(1, Ordering::SeqCst);
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(admitted.load(Ordering::SeqCst), 0, "acquired over the ceiling");
+        cap.release(); // now 1 in flight → waiter proceeds
+        h.join().unwrap();
+        assert_eq!(admitted.load(Ordering::SeqCst), 1);
+
+        // We're at 2 in flight again (waiter took the freed slot + one held).
+        // Raising the ceiling admits another without a release.
+        cap.set_max(3);
+        assert!(cap.acquire());
+
+        // Lowering below the current count just makes the next acquire wait;
+        // shutdown releases a blocked waiter with `false`.
+        cap.set_max(1);
+        let c = Arc::clone(&cap);
+        let shut = std::thread::spawn(move || c.acquire());
+        std::thread::sleep(Duration::from_millis(50));
+        cap.shutdown();
+        assert!(!shut.join().unwrap(), "shutdown should abort a blocked acquire");
     }
 
     /// Gzip levels 1..9 should all decode correctly. Different levels
