@@ -421,6 +421,11 @@ fn codes(
             break Err(DeflateError::Invalid("length symbol out of range"));
         }
         let len_extra = LEXT[idx] as u32;
+        // A truncated stream can leave fewer buffered bits than the symbol's
+        // extra-bit width; refill is best-effort, so guard before consuming.
+        if bits < len_extra {
+            break Err(DeflateError::UnexpectedEof);
+        }
         let length = LENS[idx] as usize
             + (buf as usize & ((1usize << len_extra) - 1));
         buf >>= len_extra;
@@ -466,6 +471,9 @@ fn codes(
             break Err(DeflateError::Invalid("distance symbol out of range"));
         }
         let dist_extra = DEXT[dsym] as u32;
+        if bits < dist_extra {
+            break Err(DeflateError::UnexpectedEof);
+        }
         let dist = DISTS[dsym] as usize
             + (buf as usize & ((1usize << dist_extra) - 1));
         buf >>= dist_extra;
@@ -617,10 +625,13 @@ pub fn inflate_into(input: &[u8], out: &mut Vec<u8>) -> Result<usize, DeflateErr
             break;
         }
     }
-    // Bits left in the bit buffer have already been "consumed" from `input`
-    // bytes — round `pos` accordingly: there's nothing left to push back since
-    // the bit buffer is local, and `pos` already counts every byte we pulled.
-    Ok(s.pos)
+    // `pos` is the read cursor: refill pulls whole bytes into the 64-bit buffer
+    // eagerly, so at end-of-stream up to 7 bytes may still sit buffered and
+    // unconsumed. The deflate stream actually ends mid-`bit_buffer`; the number
+    // of *consumed* input bytes (rounded up to the next byte after the final
+    // block) is `pos` minus the whole bytes still buffered. `bit_count <= 8*pos`
+    // always holds, so this never underflows.
+    Ok(s.pos - (s.bit_count / 8) as usize)
 }
 
 /// Convenience wrapper: returns the decompressed bytes as a fresh `Vec<u8>`.
