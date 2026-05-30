@@ -37,11 +37,8 @@ fn main() -> Result<()> {
     let (recycle_tx, recycle_rx) = bounded::<Vec<u8>>(recycle_cap);
 
     let kernel = match std::env::var("RAPIDGZIP_KERNEL").as_deref() {
-        Ok("fast") => {
-            eprintln!("rapidgzip-rs: using fast inflate kernel)");
-            InflateKernel::FastInflate
-        },
-        Ok("zlib") | Err(_) => InflateKernel::ZlibRs,
+        Ok("zlib") => InflateKernel::ZlibRs,
+        Ok("fast") | Err(_) => InflateKernel::FastInflate,
         Ok(other) => {
             eprintln!("rapidgzip-rs: unknown RAPIDGZIP_KERNEL={other:?}, expected 'zlib' or 'fast'");
             std::process::exit(1);

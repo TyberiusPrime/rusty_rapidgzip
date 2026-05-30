@@ -47,18 +47,18 @@ pub struct Config {
     /// the CRC validator, and only the pipeline knows when both refs drop.
     pub recycle_tx: Option<Sender<Vec<u8>>>,
     /// Which speculative inflate kernel to use for the parallel pipeline.
-    /// Defaults to [`InflateKernel::ZlibRs`].
+    /// Defaults to [`InflateKernel::FastInflate`].
     pub kernel: InflateKernel,
 }
 
 /// Which speculative inflate kernel the parallel pipeline uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum InflateKernel {
-    /// zlib-rs-based speculative decoder (`SpeculativeZlibDecoder`). Default.
+    /// Pure-Rust fast inflate kernel (`fast_inflate::decode_until_u16`). Default.
     #[default]
-    ZlibRs,
-    /// Pure-Rust fast inflate kernel (`fast_inflate::decode_until`).
     FastInflate,
+    /// zlib-rs-based speculative decoder (`SpeculativeZlibDecoder`).
+    ZlibRs,
 }
 
 /// How chatty `read_gz` is on stderr.
@@ -87,7 +87,7 @@ impl Default for Config {
             verbose: Verbosity::Off,
             recycle_rx: None,
             recycle_tx: None,
-            kernel: InflateKernel::ZlibRs,
+            kernel: InflateKernel::FastInflate,
         }
     }
 }
