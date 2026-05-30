@@ -529,6 +529,334 @@ fn decode_compressed<const IS_SPECULATIVE: bool>(
     result
 }
 
+// ── Dense u16 marker-window speculative path ─────────────────────────────────
+//
+// The side-table speculative path above (`decode_compressed::<true>`) calls
+// into `propagate_match_cached` on every in-buffer back-reference to copy
+// marker-ness forward. On FASTQ, marker-ness saturates the output, so that
+// turned into a binary search per back-reference and dominated runtime.
+//
+// This path instead mirrors rapidgzip's `m_window16`: decode into a `u16`
+// scratch buffer where a set high bit (`SpeculativeChunk::MARKER16`) flags an
+// unresolved prefix-referencing cell and the low 15 bits hold its
+// `prefix_offset`. Back-reference copies move whole `u16` cells, so marker-ness
+// propagates for *free* as part of the copy — no per-back-ref bookkeeping. A
+// single linear `extract_from_u16` pass afterwards lowers the scratch to the
+// existing `(bytes, markers)` contract, so the pipeline and `resolve_markers`
+// are unchanged.
+
+/// High bit marks a prefix-referencing cell; low 15 bits are the prefix offset.
+const MARKER16: u16 = SpeculativeChunk::MARKER16;
+/// Cells of slop `copy_back_u16` may overwrite past `dst + length`.
+const COPY_HEADROOM_U16: usize = 16;
+/// Spare cells kept past the write head so literal/copy stores never bounds-check.
+const HEADROOM_U16: usize = 4096;
+
+/// Speculative decode into a reusable `u16` scratch, then lower into `chunk`.
+///
+/// Drop-in for [`decode_until`] on the parallel fast path. `scratch` is owned by
+/// the worker and reused across chunks so its pages stay faulted.
+pub fn decode_until_u16(
+    input: &[u8],
+    start_bit: u64,
+    end_bit_hint: u64,
+    chunk: &mut SpeculativeChunk,
+    scratch: &mut Vec<u16>,
+) -> Result<(u64, bool), DeflateError> {
+    let mut br = BitReader::new(input);
+    br.seek_to_bit(start_bit)?;
+    scratch.clear();
+
+    let mut final_block = false;
+    loop {
+        let bfinal = br.read(1)? != 0;
+        let btype = br.read(2)?;
+        decode_block_u16(&mut br, scratch, btype)?;
+        if bfinal {
+            final_block = true;
+            break;
+        }
+        if br.tell_bit() >= end_bit_hint {
+            break;
+        }
+    }
+    let end_bit = br.tell_bit();
+    chunk.extract_from_u16(scratch);
+    Ok((end_bit, final_block))
+}
+
+fn decode_block_u16(
+    br: &mut BitReader<'_>,
+    out: &mut Vec<u16>,
+    btype: u32,
+) -> Result<(), DeflateError> {
+    match btype {
+        0 => decode_stored_u16(br, out),
+        1 => {
+            let lit = HuffmanDecoder::from_lengths_litlen(&fixed_literal_lengths())?;
+            let dist = HuffmanDecoder::from_lengths(&fixed_distance_lengths())?;
+            decode_compressed_u16(br, out, &lit, &dist)
+        }
+        2 => {
+            let (lit, dist) = read_dynamic_header(br)?;
+            decode_compressed_u16(br, out, &lit, &dist)
+        }
+        _ => Err(DeflateError::Invalid("reserved block type")),
+    }
+}
+
+fn decode_stored_u16(br: &mut BitReader<'_>, out: &mut Vec<u16>) -> Result<(), DeflateError> {
+    br.byte_align();
+    let len = br.read(16)? as u16;
+    let nlen = br.read(16)? as u16;
+    if !len ^ nlen != 0 {
+        return Err(DeflateError::Invalid("stored block: LEN/NLEN mismatch"));
+    }
+    out.reserve(len as usize);
+    for _ in 0..len {
+        out.push(br.read(8)? as u16);
+    }
+    Ok(())
+}
+
+/// Copy `length` `u16` cells from `cur - distance` to `cur`. May overwrite up to
+/// `COPY_HEADROOM_U16 - 1` cells past `cur + length`; caller guarantees capacity.
+///
+/// # Safety
+/// - `out_ptr[cur - distance .. cur + length + COPY_HEADROOM_U16]` is valid.
+/// - `distance > 0` and `length > 0`.
+#[inline(always)]
+#[allow(unsafe_code)]
+unsafe fn copy_back_u16(out_ptr: *mut u16, cur: usize, distance: usize, length: usize) {
+    let src = out_ptr.add(cur - distance);
+    let dst = out_ptr.add(cur);
+    if distance >= length {
+        // Non-overlapping: 8-cell (16-byte) chunked copy, may overshoot.
+        let end = src.add(length);
+        let mut s = src as *const u16;
+        let mut d = dst;
+        loop {
+            let chunk: [u16; 8] = std::ptr::read_unaligned(s.cast::<[u16; 8]>());
+            std::ptr::write_unaligned(d.cast::<[u16; 8]>(), chunk);
+            s = s.add(8);
+            d = d.add(8);
+            if s >= end {
+                break;
+            }
+        }
+    } else if distance == 1 {
+        // RLE: broadcast one cell (marker-ness included) the whole run.
+        let v = *src;
+        let mut d = dst;
+        for _ in 0..length {
+            *d = v;
+            d = d.add(1);
+        }
+    } else {
+        // Overlapping period > 1: cell-by-cell.
+        for i in 0..length {
+            *dst.add(i) = *src.add(i);
+        }
+    }
+}
+
+/// Decode one compressed block (fixed or dynamic) into the `u16` scratch.
+#[allow(unsafe_code)]
+fn decode_compressed_u16(
+    br: &mut BitReader<'_>,
+    out: &mut Vec<u16>,
+    lit: &HuffmanDecoder,
+    dist: &HuffmanDecoder,
+) -> Result<(), DeflateError> {
+    const NEEDED: u32 = 48;
+    const LUT_MASK: u64 = (1u64 << LUT_BITS) - 1;
+
+    if out.capacity() - out.len() < HEADROOM_U16 {
+        out.reserve(HEADROOM_U16);
+    }
+    let mut cap = out.capacity();
+    let mut out_ptr = out.as_mut_ptr();
+    let mut cur = out.len();
+
+    let mut buf = br.buf;
+    let mut bits = br.bits;
+    let mut byte_pos = br.byte_pos;
+    let input_ptr = br.input.as_ptr();
+    let input_len = br.input.len();
+    let lit_lut = lit.lut_ptr();
+    let dist_lut = dist.lut_ptr();
+
+    macro_rules! sync_br {
+        () => {
+            br.buf = buf;
+            br.bits = bits;
+            br.byte_pos = byte_pos;
+        };
+    }
+    macro_rules! reload_from_br {
+        () => {
+            buf = br.buf;
+            bits = br.bits;
+            byte_pos = br.byte_pos;
+        };
+    }
+    // Ensure `cap - cur >= need + COPY_HEADROOM_U16`, refreshing ptr/cap.
+    macro_rules! ensure_cap {
+        ($need:expr) => {
+            if cap - cur < $need + COPY_HEADROOM_U16 {
+                unsafe { out.set_len(cur) };
+                out.reserve($need + HEADROOM_U16);
+                cap = out.capacity();
+                out_ptr = out.as_mut_ptr();
+            }
+        };
+    }
+
+    let result: Result<(), DeflateError> = 'outer: loop {
+        if byte_pos + 8 <= input_len {
+            let chunk =
+                unsafe { std::ptr::read_unaligned(input_ptr.add(byte_pos) as *const u64) };
+            buf |= u64::from_le(chunk) << bits;
+            let advance = (63u32 ^ bits) >> 3;
+            byte_pos += advance as usize;
+            bits |= 56;
+        } else if bits < NEEDED {
+            while bits < NEEDED {
+                if byte_pos >= input_len {
+                    unsafe { out.set_len(cur) };
+                    sync_br!();
+                    br.exhausted = true;
+                    break 'outer Err(DeflateError::UnexpectedEof);
+                }
+                buf |= unsafe { (*input_ptr.add(byte_pos)) as u64 } << bits;
+                byte_pos += 1;
+                bits += 8;
+            }
+        }
+
+        // ── Literal/length symbol ────────────────────────────────────────────
+        let entry = {
+            let idx = (buf & LUT_MASK) as usize;
+            let e = unsafe { *lit_lut.add(idx) };
+            let len = e & 0xff;
+            if len == 0 {
+                unsafe { out.set_len(cur) };
+                sync_br!();
+                match lit.lookup_long(br) {
+                    Ok(e) => {
+                        reload_from_br!();
+                        e
+                    }
+                    Err(e) => break 'outer Err(e),
+                }
+            } else {
+                buf >>= len;
+                bits -= len;
+                e
+            }
+        };
+
+        // ── Literal ──────────────────────────────────────────────────────────
+        if entry & HUFFDEC_LITERAL != 0 {
+            if cur == cap {
+                unsafe { out.set_len(cur) };
+                out.reserve(HEADROOM_U16);
+                cap = out.capacity();
+                out_ptr = out.as_mut_ptr();
+            }
+            // Mask to the literal byte: `entry >> 16` would otherwise carry
+            // HUFFDEC_LITERAL (bit 31) into bit 15, colliding with MARKER16.
+            unsafe { *out_ptr.add(cur) = ((entry >> 16) & 0xff) as u16 };
+            cur += 1;
+            continue 'outer;
+        }
+
+        // ── EOB / reserved ───────────────────────────────────────────────────
+        if entry & HUFFDEC_EXCEPTIONAL != 0 {
+            unsafe { out.set_len(cur) };
+            sync_br!();
+            if entry >> 16 == 0 {
+                break 'outer Ok(());
+            }
+            break 'outer Err(DeflateError::Invalid("literal/length symbol out of range"));
+        }
+
+        // ── Length code ──────────────────────────────────────────────────────
+        let length_base = ((entry >> 16) & 0x1ff) as usize;
+        let len_extra = ((entry >> 8) & 0x1f) as u32;
+        let mut length = length_base;
+        if len_extra > 0 {
+            length += (buf & ((1u64 << len_extra) - 1)) as usize;
+            buf >>= len_extra;
+            bits -= len_extra;
+        }
+
+        // ── Distance symbol ──────────────────────────────────────────────────
+        let dsym = {
+            let idx = (buf & LUT_MASK) as usize;
+            let e = unsafe { *dist_lut.add(idx) };
+            let len = e & 0xff;
+            if len == 0 {
+                unsafe { out.set_len(cur) };
+                sync_br!();
+                match dist.lookup_long(br) {
+                    Ok(e) => {
+                        reload_from_br!();
+                        (e >> 16) as u16
+                    }
+                    Err(e) => break 'outer Err(e),
+                }
+            } else {
+                buf >>= len;
+                bits -= len;
+                (e >> 16) as u16
+            }
+        };
+        if dsym >= 30 {
+            unsafe { out.set_len(cur) };
+            sync_br!();
+            break 'outer Err(DeflateError::Invalid("distance symbol out of range"));
+        }
+        let di = dsym as usize;
+        let mut distance = DISTANCE_BASE[di] as usize;
+        let dextra = DISTANCE_EXTRA[di] as u32;
+        if dextra > 0 {
+            distance += (buf & ((1u64 << dextra) - 1)) as usize;
+            buf >>= dextra;
+            bits -= dextra;
+        }
+
+        // ── Back-reference into the dense window ──────────────────────────────
+        ensure_cap!(length);
+        if distance > cur {
+            // Overshoot into the unknown prefix: write marker cells whose
+            // low 15 bits encode prefix_offset (= dist - emitted - k - 1),
+            // then copy the in-buffer tail (which may itself be markers).
+            let prefix_count = (distance - cur).min(length);
+            for k in 0..prefix_count {
+                let prefix_offset = (distance - cur - k - 1) as u16;
+                unsafe { *out_ptr.add(cur + k) = MARKER16 | prefix_offset };
+            }
+            cur += prefix_count;
+            let in_buffer = length - prefix_count;
+            if in_buffer > 0 {
+                unsafe { copy_back_u16(out_ptr, cur, distance, in_buffer) };
+                cur += in_buffer;
+            }
+            continue 'outer;
+        }
+        if distance == 0 {
+            unsafe { out.set_len(cur) };
+            sync_br!();
+            break 'outer Err(DeflateError::Invalid("zero back-reference distance"));
+        }
+        unsafe { copy_back_u16(out_ptr, cur, distance, length) };
+        cur += length;
+    };
+
+    result
+}
+
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -714,6 +1042,49 @@ mod tests {
             stitched == payload,
             "stitched output does not match original"
         );
+    }
+
+    /// The u16 dense-window path must produce byte-and-marker-identical results
+    /// to the side-table `decode_member` for the same midstream chunk.
+    #[test]
+    fn u16_matches_sidetable_midstream() {
+        let payload = ascii_payload(4 * 1024 * 1024);
+        let body = deflate_via_gzip(&payload, 6);
+        let mut padded = body.clone();
+        padded.extend_from_slice(&[0u8; 16]);
+
+        let mut block_starts: Vec<u64> = Vec::new();
+        {
+            let mut br = crate::BitReader::new(&padded);
+            let mut dummy = Vec::new();
+            loop {
+                block_starts.push(br.tell_bit());
+                let bfinal = crate::inflate::inflate_block(&mut br, &mut dummy).unwrap();
+                if bfinal { break; }
+            }
+        }
+        assert!(block_starts.len() >= 3);
+        let split_bit = block_starts[1];
+
+        let mut a = SpeculativeChunk::default();
+        decode_member(&padded, split_bit, &mut a).unwrap();
+
+        let mut b = SpeculativeChunk::default();
+        let mut scratch = Vec::new();
+        decode_until_u16(&padded, split_bit, u64::MAX, &mut b, &mut scratch).unwrap();
+
+        assert_eq!(a.bytes.len(), b.bytes.len(), "byte length differs");
+        assert_eq!(a.markers.len(), b.markers.len(), "marker count differs");
+        // Compare marker (out_pos, prefix_offset) sets.
+        for (i, (ma, mb)) in a.markers.iter().zip(b.markers.iter()).enumerate() {
+            assert_eq!(
+                (ma.out_pos, ma.prefix_offset),
+                (mb.out_pos, mb.prefix_offset),
+                "marker {i} differs: sidetable={ma:?} u16={mb:?}"
+            );
+        }
+        // Compare non-marker bytes (marker placeholders may differ: 0 vs 0).
+        assert!(a.bytes == b.bytes, "decoded bytes differ");
     }
 
     /// Simulate pipeline chunked speculative decode: split at every N-th block

@@ -29,6 +29,39 @@ impl SpeculativeChunk {
     pub fn is_resolved(&self) -> bool { self.markers.is_empty() }
     pub fn reserve_bytes(&mut self, n: usize) { self.bytes.reserve(n); }
 
+    /// High bit of a dense-window cell marks an unresolved (prefix-referencing)
+    /// byte; the low 15 bits hold its `prefix_offset`. See `fast_inflate`'s
+    /// u16 speculative path.
+    pub const MARKER16: u16 = 0x8000;
+
+    /// Append a dense u16 marker-window into this chunk's `(bytes, markers)`.
+    ///
+    /// Each cell is either a resolved literal (high bit clear, value in the low
+    /// 8 bits) or a marker (high bit set, `prefix_offset` in the low 15 bits).
+    /// Markers are emitted in increasing `out_pos` order (scratch scanned
+    /// left-to-right), preserving the sorted invariant the serializer relies on.
+    pub fn extract_from_u16(&mut self, scratch: &[u16]) {
+        self.bytes.reserve(scratch.len());
+        self.markers.reserve(scratch.len() / 8);
+        let base = self.bytes.len() as u32;
+        let mut last = self.max_marker_pos.unwrap_or(0);
+        let mut any = false;
+        for (i, &cell) in scratch.iter().enumerate() {
+            if cell & Self::MARKER16 != 0 {
+                let out_pos = base + i as u32;
+                self.markers.push(Marker { out_pos, prefix_offset: cell & 0x7fff });
+                self.bytes.push(0);
+                last = out_pos;
+                any = true;
+            } else {
+                self.bytes.push(cell as u8);
+            }
+        }
+        if any {
+            self.max_marker_pos = Some(last);
+        }
+    }
+
     pub fn bytes_offset_markers(
         &mut self,
         src: &[rusty_rapidgzip_inflate::speculative::MarkerRec],

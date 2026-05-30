@@ -70,17 +70,18 @@ use rusty_rapidgzip_deflate::{
 use crate::{Config, Error, InflateKernel};
 
 /// Per-worker kernel state. `ZlibRs` owns a reusable `SpeculativeZlibDecoder`;
-/// `FastInflate` is stateless so no state is needed.
+/// `FastInflate` owns a reusable `u16` dense-window scratch buffer (reused
+/// across chunks so its pages stay faulted).
 enum WorkerKernel {
     ZlibRs(SpeculativeZlibDecoder),
-    FastInflate,
+    FastInflate(Vec<u16>),
 }
 
 impl WorkerKernel {
     fn new(kernel: InflateKernel) -> Self {
         match kernel {
             InflateKernel::ZlibRs => WorkerKernel::ZlibRs(SpeculativeZlibDecoder::new()),
-            InflateKernel::FastInflate => WorkerKernel::FastInflate,
+            InflateKernel::FastInflate => WorkerKernel::FastInflate(Vec::new()),
         }
     }
 
@@ -93,8 +94,8 @@ impl WorkerKernel {
     ) -> Result<(u64, bool), rusty_rapidgzip_deflate::DeflateError> {
         match self {
             WorkerKernel::ZlibRs(zdec) => zdec.decode_until(input, start_bit, end_bit_hint, chunk),
-            WorkerKernel::FastInflate => {
-                fast_inflate::decode_until(input, start_bit, end_bit_hint, chunk)
+            WorkerKernel::FastInflate(scratch) => {
+                fast_inflate::decode_until_u16(input, start_bit, end_bit_hint, chunk, scratch)
             }
         }
     }
