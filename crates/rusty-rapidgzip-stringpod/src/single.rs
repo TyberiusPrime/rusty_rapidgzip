@@ -205,12 +205,12 @@ impl StringPodBuilder {
     /// # Panics
     /// If the byte buffer would exceed `u32::MAX` total bytes.
     pub fn push(&mut self, bytes: &[u8]) {
-        if let Some(stride) = self.storage.current_stride()
-            && bytes.len() as u64 == u64::from(stride)
-        {
-            self.data.extend_from_slice(bytes);
-            self.storage.builder_push_strided();
-            return;
+        if let Some(stride) = self.storage.current_stride() {
+            if bytes.len() as u64 == u64::from(stride) {
+                self.data.extend_from_slice(bytes);
+                self.storage.builder_push_strided();
+                return;
+            }
         }
         // Variable (or promoted) path
         let start_usize = self.data.len();

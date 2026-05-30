@@ -19,6 +19,10 @@ path = "src/bench_inflate.rs"
 name = "bench-autotune"
 path = "src/bench_autotune.rs"
 
+[[bin]]
+name = "bench-fastq"
+path = "src/bench_fastq.rs"
+
 [dependencies]
 rusty-rapidgzip.workspace = true
 rusty-rapidgzip-deflate.workspace = true

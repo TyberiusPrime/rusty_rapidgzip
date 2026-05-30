@@ -1,20 +1,11 @@
 [package]
 name = "fastqrab-stringpod"
-edition.workspace = true
 version.workspace = true
+edition.workspace = true
 rust-version.workspace = true
-authors.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
-readme.workspace = true
-description.workspace = true
-keywords.workspace = true
-categories.workspace = true
-exclude.workspace = true
+description = "Cache-friendly columnar storage for many small byte strings (FASTQ reads, qualities, names)."
 
 [dependencies]
-    bstr = {workspace = true}
-
-[lints]
-workspace = true
+bstr.workspace = true

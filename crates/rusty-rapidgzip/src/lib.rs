@@ -26,6 +26,8 @@ use thiserror::Error;
 
 use pipeline::InputBytes;
 
+use fastqrab_stringpod::{StringPod, StringPodBuilder};
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Number of worker threads. `0` → use available parallelism.
@@ -95,6 +97,8 @@ pub enum Error {
     Gzip(#[from] GzipError),
     #[error("deflate: {0}")]
     Deflate(#[from] rusty_rapidgzip_deflate::DeflateError),
+    #[error("fastq: {0}")]
+    Fastq(String),
 }
 
 /// Decode `path` and stream decompressed bytes to `sink` in stream order.
@@ -164,3 +168,290 @@ pub fn read_gz(
     })
 }
 
+/// One decode chunk's worth of FASTQ, split into per-role columns.
+///
+/// Each column is an independent [`StringPod`]: `names` (header lines with the
+/// leading `@` stripped via an O(1) `cut_start`), `seqs`, and `quals`. The
+/// separator (`+`) line is validated and dropped. A column is
+/// `Storage::FixedLength` when every entry in *this* emission shares a length
+/// (the common fixed-read-length case) and `Variable` otherwise — the pod
+/// builders start fixed on the first line's length and auto-promote on the
+/// first mismatch.
+///
+/// Per-emission the three column lengths may differ by one (the record line
+/// straddling a chunk boundary lands in a single column), but across the whole
+/// stream each column receives exactly one entry per record, in order.
+#[derive(Debug)]
+pub struct FastqChunk {
+    pub names: StringPod,
+    pub seqs: StringPod,
+    pub quals: StringPod,
+}
+
+/// A decode chunk handed to a demux worker, with the trailing partial line of
+/// the previous chunk to stitch onto this chunk's leading partial line.
+struct DemuxJob {
+    idx: u64,
+    chunk: Arc<Vec<u8>>,
+    prev_tail: Vec<u8>,
+}
+
+/// A worker's phase-agnostic split of one chunk: four buckets holding the
+/// chunk's lines indexed by `line_index_within_stream mod 4` (the worker does
+/// not know which absolute role that is — the collector rotates), plus the
+/// number of lines completed in the chunk (`= newline count`) so the collector
+/// can accumulate the global phase.
+struct DemuxResult {
+    idx: u64,
+    buckets: [StringPod; 4],
+    lines: u64,
+}
+
+/// Like [`read_gz`], but decode + split into columnar FASTQ and stream a
+/// [`FastqChunk`] per decode chunk instead of raw bytes.
+///
+/// The decode itself runs through the same parallel pipeline as `read_gz`. The
+/// expensive newline scan and the copy into per-role columns run in a parallel
+/// demux pool: each worker buckets its chunk's lines by `index mod 4` without
+/// knowing the absolute phase (decode-chunk boundaries never align to records,
+/// and `@`/`+` are ambiguous mid-stream since both are legal quality bytes).
+/// A cheap serial stage threads the one-line carry across boundaries and feeds
+/// each worker its predecessor's trailing partial line; a cheap serial
+/// collector accumulates the global line count, "ring-rotates" each chunk's
+/// four buckets onto (name, seq, +, qual), strips the `@`, and validates.
+pub fn read_gz_into_fastq(
+    path: impl AsRef<Path>,
+    sink: Sender<FastqChunk>,
+    config: Config,
+) -> Result<DecodeStats, Error> {
+    let path = path.as_ref().to_path_buf();
+    let num_threads = if config.num_threads == 0 {
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+    } else {
+        config.num_threads
+    };
+    // The decode pipeline already saturates the cores; the demux pool must stay
+    // small or it oversubscribes and the allocator contends. A handful of
+    // workers is enough to keep the split off the critical path.
+    let demux_threads = std::env::var("RAPIDGZIP_FASTQ_DEMUX_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or_else(|| num_threads.min(4))
+        .max(1);
+
+    // Recycle drained byte buffers back to the decode workers so pages stay
+    // faulted-in. We forward this into the decode config (its CRC thread
+    // recycles) and the demux workers also return buffers once they've copied
+    // the payload into columns.
+    let (recycle_tx, recycle_rx) = crossbeam_channel::bounded::<Vec<u8>>(num_threads * 2);
+    let mut cfg = config;
+    cfg.recycle_rx = Some(recycle_rx);
+    cfg.recycle_tx = Some(recycle_tx.clone());
+
+    let (bytes_tx, bytes_rx) = crossbeam_channel::bounded::<Arc<Vec<u8>>>(16);
+    let producer = std::thread::spawn(move || read_gz(&path, bytes_tx, cfg));
+
+    // Demux pool — phase-agnostic per-chunk bucketing (the heavy scan + copy).
+    let (job_tx, job_rx) = crossbeam_channel::bounded::<DemuxJob>(num_threads * 2);
+    let (done_tx, done_rx) = crossbeam_channel::bounded::<DemuxResult>(num_threads * 2);
+    let mut workers = Vec::with_capacity(demux_threads);
+    for _ in 0..demux_threads {
+        let job_rx = job_rx.clone();
+        let done_tx = done_tx.clone();
+        let recycle_tx = recycle_tx.clone();
+        workers.push(std::thread::spawn(move || {
+            for job in job_rx {
+                let result = demux_chunk(job.idx, &job.chunk, &job.prev_tail);
+                // Payload is copied into the columns now; hand the buffer back.
+                if let Ok(mut v) = Arc::try_unwrap(job.chunk) {
+                    v.clear();
+                    let _ = recycle_tx.try_send(v);
+                }
+                if done_tx.send(result).is_err() {
+                    return;
+                }
+            }
+        }));
+    }
+    drop(job_rx);
+    drop(done_tx);
+
+    // Collector — serial, in stream order: rotate buckets onto roles + emit.
+    let (tail_tx, tail_rx) = crossbeam_channel::bounded::<Vec<u8>>(1);
+    let collector = std::thread::spawn(move || collect(done_rx, tail_rx, &sink));
+
+    // Stage A — serial, cheap: thread the trailing-partial-line carry across
+    // boundaries (one backward scan per chunk) and dispatch demux jobs.
+    let mut carry: Vec<u8> = Vec::new();
+    let mut idx: u64 = 0;
+    for chunk in bytes_rx {
+        match rposition_nl(&chunk) {
+            Some(last_nl) => {
+                let next_carry = chunk[last_nl + 1..].to_vec();
+                let prev_tail = std::mem::take(&mut carry);
+                if job_tx.send(DemuxJob { idx, chunk, prev_tail }).is_err() {
+                    break;
+                }
+                idx += 1;
+                carry = next_carry;
+            }
+            None => {
+                // No newline at all (pathological for FASTQ): the whole chunk is
+                // the middle of one line. Fold it into the carry; emit nothing.
+                carry.extend_from_slice(&chunk);
+            }
+        }
+    }
+    drop(job_tx);
+    // Final unterminated line (file without a trailing newline), if any.
+    let _ = tail_tx.send(carry);
+    drop(tail_tx);
+
+    for w in workers {
+        let _ = w.join();
+    }
+    let split_result = collector.join().expect("fastq collector thread panicked");
+
+    drop(recycle_tx);
+    let stats = producer.join().expect("decode producer thread panicked")?;
+    split_result?;
+    Ok(stats)
+}
+
+#[inline]
+fn strip_cr(line: &[u8]) -> &[u8] {
+    match line.last() {
+        Some(b'\r') => &line[..line.len() - 1],
+        _ => line,
+    }
+}
+
+#[inline]
+fn rposition_nl(data: &[u8]) -> Option<usize> {
+    data.iter().rposition(|&c| c == b'\n')
+}
+
+#[inline]
+fn push_line(bucket: &mut Option<StringPodBuilder>, est: usize, line: &[u8]) {
+    bucket
+        .get_or_insert_with(|| StringPodBuilder::with_capacity(line.len(), est))
+        .push(line);
+}
+
+/// Split one chunk into four buckets keyed by `line_index mod 4`, phase
+/// unknown. The line that straddles the *previous* boundary is reassembled
+/// from `prev_tail ++ this chunk's leading partial line` and pushed first into
+/// bucket 3 — that is the line one position *before* the first fully-contained
+/// line (local index 0 → bucket 0), so it shares bucket 0's predecessor slot.
+/// After the collector's rotation this lands in the correct role column, in
+/// order, with no further copy. `data` is guaranteed to contain ≥1 newline.
+fn demux_chunk(idx: u64, data: &[u8], prev_tail: &[u8]) -> DemuxResult {
+    let est = (data.len() / 300).max(16);
+    let mut builders: [Option<StringPodBuilder>; 4] = [None, None, None, None];
+
+    let first_nl = data.iter().position(|&c| c == b'\n').expect("≥1 newline");
+
+    // Reassemble the boundary-straddling line and push it into bucket 3.
+    let head = strip_cr(&data[..first_nl]);
+    let mut split = Vec::with_capacity(prev_tail.len() + head.len());
+    split.extend_from_slice(prev_tail);
+    split.extend_from_slice(head);
+    push_line(&mut builders[3], est, strip_cr(&split));
+
+    // Fully-contained lines: between consecutive newlines, local index from 0.
+    let mut lines: u64 = 1; // the boundary line, completed by `first_nl`
+    let mut local: usize = 0;
+    let mut start = first_nl + 1;
+    while let Some(rel) = data[start..].iter().position(|&c| c == b'\n') {
+        let nl = start + rel;
+        push_line(&mut builders[local & 3], est, strip_cr(&data[start..nl]));
+        lines += 1;
+        local += 1;
+        start = nl + 1;
+    }
+    // data[start..] is this chunk's trailing partial line — carried by Stage A.
+
+    let buckets = builders.map(|b| b.map(StringPodBuilder::finish).unwrap_or_else(StringPod::empty));
+    DemuxResult { idx, buckets, lines }
+}
+
+/// Reorder demux results by chunk index, rotate each chunk's four buckets onto
+/// roles using the running global line count, strip the `@`, validate `@`/`+`,
+/// and emit a [`FastqChunk`] per chunk. Finally emit any unterminated trailing
+/// line. Runs serially in stream order.
+fn collect(
+    done_rx: Receiver<DemuxResult>,
+    tail_rx: Receiver<Vec<u8>>,
+    sink: &Sender<FastqChunk>,
+) -> Result<(), Error> {
+    use std::collections::BTreeMap;
+    let mut reorder: BTreeMap<u64, DemuxResult> = BTreeMap::new();
+    let mut next: u64 = 0;
+    // Global count of lines completed so far; `g = global_lines % 4` is the
+    // role of each chunk's boundary line, and bucket `b` holds role `(g+1+b)%4`.
+    let mut global_lines: u64 = 0;
+
+    let handle = |res: DemuxResult, global_lines: &mut u64| -> Result<(), Error> {
+        let g = (*global_lines % 4) as i64;
+        // role r is held by bucket `b` where (g + 1 + b) % 4 == r.
+        let src = |r: i64| ((r - g - 1).rem_euclid(4)) as usize;
+        let mut b: [Option<StringPod>; 4] = res.buckets.map(Some);
+        let mut names = b[src(0)].take().expect("rotation is a permutation");
+        let seqs = b[src(1)].take().expect("rotation is a permutation");
+        let plus = b[src(2)].take().expect("rotation is a permutation");
+        let quals = b[src(3)].take().expect("rotation is a permutation");
+
+        if !names.is_empty() && names.get(0).first() != Some(&b'@') {
+            return Err(Error::Fastq("header line does not start with '@'".to_string()));
+        }
+        if !plus.is_empty() && plus.get(0).first() != Some(&b'+') {
+            return Err(Error::Fastq("separator line does not start with '+'".to_string()));
+        }
+        names.cut_start(1); // drop the leading '@' from every header, O(1)
+
+        *global_lines += res.lines;
+        let _ = sink.send(FastqChunk { names, seqs, quals });
+        Ok(())
+    };
+
+    for res in done_rx {
+        reorder.insert(res.idx, res);
+        while let Some(res) = reorder.remove(&next) {
+            handle(res, &mut global_lines)?;
+            next += 1;
+        }
+    }
+    // Any stragglers (shouldn't happen once done_rx is closed, but be safe).
+    while let Some(res) = reorder.remove(&next) {
+        handle(res, &mut global_lines)?;
+        next += 1;
+    }
+
+    // Trailing unterminated line, if the file lacked a final newline.
+    if let Ok(carry) = tail_rx.recv() {
+        if !carry.is_empty() {
+            let line = strip_cr(&carry);
+            let mut pb = StringPodBuilder::with_capacity(line.len(), 1);
+            pb.push(line);
+            let pod = pb.finish();
+            let empty = StringPod::empty;
+            let chunk = match (global_lines % 4) as usize {
+                0 => {
+                    if pod.get(0).first() != Some(&b'@') {
+                        return Err(Error::Fastq("trailing header does not start with '@'".to_string()));
+                    }
+                    let mut names = pod;
+                    names.cut_start(1);
+                    Some(FastqChunk { names, seqs: empty(), quals: empty() })
+                }
+                1 => Some(FastqChunk { names: empty(), seqs: pod, quals: empty() }),
+                3 => Some(FastqChunk { names: empty(), seqs: empty(), quals: pod }),
+                _ => None, // a stray '+' separator — drop
+            };
+            if let Some(chunk) = chunk {
+                let _ = sink.send(chunk);
+            }
+        }
+    }
+    Ok(())
+}

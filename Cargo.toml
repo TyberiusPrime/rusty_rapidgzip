@@ -5,6 +5,7 @@ members = [
     "crates/rusty-rapidgzip",
     "crates/rusty-rapidgzip-bin",
     "crates/rusty-rapidgzip-inflate",
+    "crates/rusty-rapidgzip-stringpod",
     "xtask",
 ]
 
@@ -14,13 +15,15 @@ edition = "2021"
 rust-version = "1.80"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/TyberiusPrime/rusty-rapidgzip"
+authors = ["Florian Finkernagel <finkernagel@imt.uni-marburg.de>"]
 
 [workspace.dependencies]
 rusty-rapidgzip-deflate = { path = "crates/rusty-rapidgzip-deflate" }
 rusty-rapidgzip = { path = "crates/rusty-rapidgzip" }
 rusty-rapidgzip-inflate = { path = "crates/rusty-rapidgzip-inflate" }
-rusty-rapidgzip-srtingpod = { path = "crates/rusty-rapidgzip-stringpod" }
+fastqrab-stringpod = { path = "crates/rusty-rapidgzip-stringpod" }
 
+bstr = "1"
 crc32fast = "1.4"
 crossbeam-channel = "0.5"
 thiserror = "2"

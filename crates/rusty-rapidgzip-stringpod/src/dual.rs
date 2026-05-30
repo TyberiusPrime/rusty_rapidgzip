@@ -285,13 +285,13 @@ impl DualStringPodBuilder {
             seq.len(),
             qual.len()
         );
-        if let Some(stride) = self.storage.current_stride()
-            && seq.len() as u64 == u64::from(stride)
-        {
-            self.seq.extend_from_slice(seq);
-            self.qual.extend_from_slice(qual);
-            self.storage.builder_push_strided();
-            return;
+        if let Some(stride) = self.storage.current_stride() {
+            if seq.len() as u64 == u64::from(stride) {
+                self.seq.extend_from_slice(seq);
+                self.qual.extend_from_slice(qual);
+                self.storage.builder_push_strided();
+                return;
+            }
         }
         let start_usize = self.seq.len();
         let start = u32::try_from(start_usize).expect("byte buffer exceeds u32::MAX");
