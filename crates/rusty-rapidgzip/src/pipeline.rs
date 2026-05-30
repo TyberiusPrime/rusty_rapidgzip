@@ -133,6 +133,24 @@ struct MemberBoundary {
     trailer_input_byte: u64,
 }
 
+/// A chunk handed to the resolve pool: its still-unresolved markers plus the
+/// (already fully-resolved) previous-chunk tail they reference.
+struct ResolveJob {
+    id: u64,
+    chunk: SpeculativeChunk,
+    prev_tail: Arc<Vec<u8>>,
+    final_block: bool,
+    member_boundaries: Vec<MemberBoundary>,
+}
+
+/// A chunk whose markers have been resolved in place, ready to stream in order.
+struct ResolveDone {
+    id: u64,
+    chunk: SpeculativeChunk,
+    final_block: bool,
+    member_boundaries: Vec<MemberBoundary>,
+}
+
 /// Decode the deflate body of one or more concatenated gzip members in
 /// parallel.
 ///
@@ -339,51 +357,142 @@ pub fn parallel_decode_member(
         Ok(())
     });
 
-    // ── Serializer ───────────────────────────────────────────────────────────
+    // ── Resolve fan-out ──────────────────────────────────────────────────────
+    //
+    // Marker resolution used to run inline in the (serial) serializer and, on
+    // FASTQ at high thread counts, became the Amdahl bottleneck (~0.5s of serial
+    // work patching ~800M markers). Only the 32 KiB tail of each chunk is a true
+    // serial dependency: `build_prev_tail_fast` must resolve chunk N-1's tail
+    // before chunk N's markers (which reference it) can resolve. So we split:
+    //
+    //   • Stage A (spawned, serial, cheap): reorder decode results by id, run
+    //     the `build_prev_tail_fast` chain, hand each chunk + the prev_tail it
+    //     needs to the resolve pool.
+    //   • Resolve pool (parallel): `resolve_markers` patches the chunk's bulk
+    //     markers in place — fully independent across chunks.
+    //   • Output (this thread): reorder resolved chunks by id, stream to CRC +
+    //     sink in order.
     let body_len = body.len();
-    let mut reorder: std::collections::BTreeMap<u64, WorkResult> =
+    // Marker resolution is memory-bound (scattered writes), so a small pool
+    // saturates bandwidth; more just oversubscribes the decode workers. 4 is
+    // the measured sweet spot on a 16-core/32-thread box (P32 matches/beats
+    // C++). Override with RAPIDGZIP_RESOLVE_THREADS for other machines.
+    let resolve_threads = std::env::var("RAPIDGZIP_RESOLVE_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or_else(|| num_threads.min(4))
+        .max(1);
+    let (resolve_tx, resolve_rx) = bounded::<ResolveJob>(num_threads * 2);
+    let (done_tx, done_rx) = bounded::<Result<ResolveDone, Error>>(num_threads * 2);
+
+    let n_markers = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let resolve_ns = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    // Resolve pool — each chunk's markers resolve against its own prev_tail, so
+    // jobs are independent and need no ordering here.
+    let mut resolve_handles = Vec::with_capacity(resolve_threads);
+    for _ in 0..resolve_threads {
+        let resolve_rx = resolve_rx.clone();
+        let done_tx = done_tx.clone();
+        let n_markers = Arc::clone(&n_markers);
+        let resolve_ns = Arc::clone(&resolve_ns);
+        resolve_handles.push(thread::spawn(move || {
+            use std::sync::atomic::Ordering::Relaxed;
+            while let Ok(mut job) = resolve_rx.recv() {
+                n_markers.fetch_add(job.chunk.markers.len() as u64, Relaxed);
+                let t0 = std::time::Instant::now();
+                let r = resolve_markers(&mut job.chunk, &job.prev_tail);
+                resolve_ns.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+                let msg = r.map(|()| ResolveDone {
+                    id: job.id,
+                    chunk: job.chunk,
+                    final_block: job.final_block,
+                    member_boundaries: job.member_boundaries,
+                });
+                if done_tx.send(msg.map_err(Error::Deflate)).is_err() {
+                    return;
+                }
+            }
+        }));
+    }
+    drop(resolve_rx);
+
+    // Stage A — serial tail-chain + dispatch. Owns `result_rx`. `done_tx_err`
+    // forwards decode/channel errors straight to the output stage.
+    let done_tx_err = done_tx.clone();
+    drop(done_tx);
+    let stage_a = {
+        let num_chunks = num_chunks as u64;
+        thread::spawn(move || {
+            let mut reorder: std::collections::BTreeMap<u64, WorkResult> =
+                std::collections::BTreeMap::new();
+            let mut next_id: u64 = 0;
+            let mut prev_tail: Vec<u8> = Vec::new();
+            while next_id < num_chunks {
+                while let Some(res) = reorder.remove(&next_id) {
+                    // Resolve only this chunk's tail to feed the next chunk; the
+                    // bulk resolve happens in the pool against `prev_arc`.
+                    let new_tail = build_prev_tail_fast(&res.chunk, &prev_tail);
+                    let prev_arc = Arc::new(std::mem::replace(&mut prev_tail, new_tail));
+                    let saw_final = res.final_block;
+                    let job = ResolveJob {
+                        id: res.id,
+                        chunk: res.chunk,
+                        prev_tail: prev_arc,
+                        final_block: res.final_block,
+                        member_boundaries: res.member_boundaries,
+                    };
+                    if resolve_tx.send(job).is_err() {
+                        return;
+                    }
+                    next_id += 1;
+                    if saw_final {
+                        return;
+                    }
+                }
+                match result_rx.recv() {
+                    Ok(Ok(r)) => {
+                        reorder.insert(r.id, r);
+                    }
+                    Ok(Err(e)) => {
+                        let _ = done_tx_err.send(Err(e));
+                        return;
+                    }
+                    Err(_) => {
+                        let _ = done_tx_err.send(Err(Error::Io(std::io::Error::other(
+                            "worker channel closed",
+                        ))));
+                        return;
+                    }
+                }
+            }
+        })
+    };
+
+    // ── Output stage (in order) ──────────────────────────────────────────────
+    let mut reorder: std::collections::BTreeMap<u64, ResolveDone> =
         std::collections::BTreeMap::new();
     let mut next_id: u64 = 0;
-    let mut prev_tail: Vec<u8> = Vec::new();
     let mut total_uc: u64 = 0;
     let mut sent: u64 = 0;
     let mut final_byte: Option<usize> = None;
     let mut last_err: Option<Error> = None;
-
-    let mut t_resolve = std::time::Duration::ZERO;
-    let mut t_wait    = std::time::Duration::ZERO;
-    let mut n_markers: u64 = 0;
+    let mut sink_closed = false;
 
     'outer: while next_id < num_chunks as u64 {
-        while let Some(mut res) = reorder.remove(&next_id) {
-            n_markers += res.chunk.markers.len() as u64;
-            // Build the tail for the NEXT chunk (fast: only tail-window markers).
-            let t0 = std::time::Instant::now();
-            let new_tail = build_prev_tail_fast(&res.chunk, &prev_tail);
-            // Resolve this chunk's markers against the OLD prev_tail.
-            if let Err(e) = resolve_markers(&mut res.chunk, &prev_tail) {
-                last_err = Some(Error::Deflate(e));
-                break 'outer;
-            }
-            t_resolve += t0.elapsed();
-            prev_tail = new_tail;
-
-            total_uc += res.chunk.bytes.len() as u64;
-            let saw_final = res.final_block;
-            if let Some(mb) = res.member_boundaries.last() {
-                if saw_final {
+        while let Some(done) = reorder.remove(&next_id) {
+            total_uc += done.chunk.bytes.len() as u64;
+            let saw_final = done.final_block;
+            if saw_final {
+                if let Some(mb) = done.member_boundaries.last() {
                     final_byte = Some(mb.trailer_input_byte as usize + 8);
                 }
             }
-            let bytes_arc = Arc::new(res.chunk.bytes);
-            let _ = crc_tx.send((Arc::clone(&bytes_arc), res.member_boundaries));
+            let bytes_arc = Arc::new(done.chunk.bytes);
+            let _ = crc_tx.send((Arc::clone(&bytes_arc), done.member_boundaries));
             if sink.send(bytes_arc).is_err() {
-                drop(crc_tx);
-                let _ = crc_handle.join();
-                drop(result_rx);
-                let _ = dispatch.join();
-                for h in worker_handles { let _ = h.join(); }
-                return Ok((total_uc, body_len, sent));
+                sink_closed = true;
+                break 'outer;
             }
             sent += 1;
             next_id += 1;
@@ -391,35 +500,50 @@ pub fn parallel_decode_member(
                 break 'outer;
             }
         }
-        if next_id >= num_chunks as u64 { break; }
-        let tw = std::time::Instant::now();
-        let res = match result_rx.recv() {
-            Ok(r) => r,
-            Err(_) => {
-                last_err = Some(Error::Io(std::io::Error::other("worker channel closed")));
+        if next_id >= num_chunks as u64 {
+            break;
+        }
+        match done_rx.recv() {
+            Ok(Ok(d)) => {
+                reorder.insert(d.id, d);
+            }
+            Ok(Err(e)) => {
+                last_err = Some(e);
                 break 'outer;
             }
-        };
-        t_wait += tw.elapsed();
-        match res {
-            Ok(r)  => { reorder.insert(r.id, r); }
-            Err(e) => { last_err = Some(e); break 'outer; }
+            Err(_) => {
+                last_err = Some(Error::Io(std::io::Error::other("resolve channel closed")));
+                break 'outer;
+            }
         }
     }
     if verbose {
+        use std::sync::atomic::Ordering::Relaxed;
         eprintln!(
-            "[rapidgzip +{:.2}s] serializer {next_id} chunks | {n_markers} markers | resolve={:.3}s wait={:.3}s",
+            "[rapidgzip +{:.2}s] resolve fan-out: {sent} chunks | {} markers | resolve_cpu={:.3}s across {resolve_threads} threads",
             crate::elapsed_since_start(),
-            t_resolve.as_secs_f64(),
-            t_wait.as_secs_f64(),
+            n_markers.load(Relaxed),
+            resolve_ns.load(Relaxed) as f64 / 1e9,
         );
     }
 
+    // Tear down. Dropping `done_rx` unblocks the pool if we exited early; the
+    // channel disconnects then cascade upstream (pool → stage A → workers →
+    // dispatch), so the joins below complete.
     drop(crc_tx);
-    drop(result_rx);
+    drop(done_rx);
+    let _ = stage_a.join();
+    for h in resolve_handles {
+        let _ = h.join();
+    }
     let _ = dispatch.join();
-    for h in worker_handles { let _ = h.join(); }
+    for h in worker_handles {
+        let _ = h.join();
+    }
 
+    if sink_closed {
+        return Ok((total_uc, body_len, sent));
+    }
     if let Some(e) = last_err {
         return Err(e);
     }
