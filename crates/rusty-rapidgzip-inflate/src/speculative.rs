@@ -25,7 +25,20 @@ pub struct SpeculativeContext {
     pub markers: Vec<MarkerRec>,
     pub max_marker_pos: Option<u32>,
     pub out_pos_offset: u32,
+    /// Index into `markers` of the first marker still reachable as a copy
+    /// *source*. Markers below this have `out_pos < write_head - MAX_DISTANCE`
+    /// and can never be matched again, so the per-back-ref `partition_point`
+    /// only ever scans `markers[live_start..]` — a window-bounded, cache-hot
+    /// tail rather than the whole (potentially multi-million-entry) Vec.
+    /// Markers are pushed in strictly increasing `out_pos` order, so the Vec
+    /// stays sorted and this cursor only advances. Retired markers remain in
+    /// the Vec for final resolution; this is purely a search optimization.
+    pub live_start: usize,
 }
+
+/// Maximum DEFLATE back-reference distance. A marker at output position `p`
+/// can only be a copy source while the write head is in `(p, p + MAX_DISTANCE]`.
+const MAX_DISTANCE: usize = 32768;
 
 thread_local! {
     static ACTIVE: Cell<*mut SpeculativeContext> = const { Cell::new(core::ptr::null_mut()) };
@@ -108,7 +121,25 @@ pub fn propagate_match_cached(
     let src_lo = dst_start - dist;
     if src_lo > max { return; }
 
-    let mut cursor = ctx.markers.partition_point(|m| (m.out_pos as usize) < src_lo);
+    // Retire markers that can no longer be a copy source: any marker with
+    // `out_pos < dst_start - MAX_DISTANCE` is unreachable (no future back-ref
+    // can reach that far back). The source range starts at `src_lo >= dst_start
+    // - MAX_DISTANCE`, so retired markers are always below the search window.
+    // This keeps the searched slice bounded to one window (≤ 32768 entries),
+    // which stays cache-resident instead of binary-searching the full Vec.
+    let live_floor = dst_start.saturating_sub(MAX_DISTANCE);
+    {
+        let markers = &ctx.markers;
+        let mut ls = ctx.live_start;
+        while ls < markers.len() && (markers[ls].out_pos as usize) < live_floor {
+            ls += 1;
+        }
+        ctx.live_start = ls;
+    }
+    let live_start = ctx.live_start;
+
+    let mut cursor = live_start
+        + ctx.markers[live_start..].partition_point(|m| (m.out_pos as usize) < src_lo);
     let mut new_max = max;
 
     for k in 0..len {

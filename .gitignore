@@ -1,5 +1,8 @@
 /target
 **/target_claude
+profile.json.gz
+*.perf
+flamechart.png
 librapidarchive/
 rapidgzip_cpp/
 Cargo.lock.bak
