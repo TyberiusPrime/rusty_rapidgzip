@@ -914,7 +914,7 @@ pub fn parallel_decode_bgzf(
                             )
                         }
                         crate::gzip::InflateEngine::Intree => {
-                            crate::gzip::decode_one_indexed(
+                            crate::gzip::decode_one_indexed_fast(
                                 &file[s..e], &mut out, mi as u32,
                             )
                         }

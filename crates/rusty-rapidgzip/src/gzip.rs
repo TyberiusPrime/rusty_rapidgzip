@@ -11,7 +11,7 @@
 
 use thiserror::Error;
 
-use rusty_rapidgzip_deflate::{inflate, safe_inflate, BitReader, DeflateError};
+use rusty_rapidgzip_deflate::{fast_inflate, inflate, safe_inflate, BitReader, DeflateError};
 
 /// Which DEFLATE engine to use for the framed-gzip and BGZF paths.
 ///
@@ -183,6 +183,61 @@ pub fn decode_one_indexed_safe(
     let body_bytes = safe_inflate::inflate_into(&input[header_len..], out)?;
 
     let trailer_start = header_len + body_bytes;
+    if trailer_start + 8 > input.len() {
+        return Err(GzipError::Truncated);
+    }
+    let crc_expected = u32::from_le_bytes(
+        input[trailer_start..trailer_start + 4].try_into().unwrap(),
+    );
+    let isize_expected = u32::from_le_bytes(
+        input[trailer_start + 4..trailer_start + 8].try_into().unwrap(),
+    );
+    let decoded = &out[initial_out_len..];
+    let crc_got = crc32fast::hash(decoded);
+    if crc_got != crc_expected {
+        return Err(GzipError::CrcMismatch {
+            expected: crc_expected,
+            got: crc_got,
+            member,
+            uncompressed: decoded.len() as u64,
+            trailer_byte: trailer_start as u64,
+        });
+    }
+    let isize_got = decoded.len() as u64;
+    if (isize_got & 0xFFFF_FFFF) as u32 != isize_expected {
+        return Err(GzipError::IsizeMismatch {
+            expected: isize_expected,
+            got: isize_got,
+            member,
+            trailer_byte: trailer_start as u64,
+        });
+    }
+    Ok(trailer_start + 8)
+}
+
+/// Same as [`decode_one_indexed`] but uses the perf-tuned `fast_inflate`
+/// kernel. Used by the BGZF fast-path, where every member is an independent
+/// window-known deflate stream — no markers needed, so the fastest serial
+/// kernel applies directly. Returns input bytes consumed (header + body +
+/// 8-byte trailer).
+pub fn decode_one_indexed_fast(
+    input: &[u8],
+    out: &mut Vec<u8>,
+    member: u32,
+) -> Result<usize, GzipError> {
+    let header_len = parse_header(input)?;
+    let body_start = header_len;
+
+    let initial_out_len = out.len();
+    let mut br = BitReader::new(&input[body_start..]);
+    fast_inflate::inflate_fast(&mut br, out)?;
+    br.byte_align();
+
+    let body_bits = br.tell_bit();
+    debug_assert_eq!(body_bits % 8, 0);
+    let body_bytes = (body_bits / 8) as usize;
+
+    let trailer_start = body_start + body_bytes;
     if trailer_start + 8 > input.len() {
         return Err(GzipError::Truncated);
     }
