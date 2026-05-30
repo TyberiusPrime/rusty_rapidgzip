@@ -11,7 +11,6 @@ use std::time::Instant;
 
 use rusty_rapidgzip::gzip;
 use rusty_rapidgzip_deflate::{fast_inflate, inflate as intree_inflate, safe_inflate, BitReader};
-use rusty_rapidgzip_inflate::{Inflate, InflateFlush, Status};
 
 fn run_safe(body: &[u8], expected_out: usize) {
     let mut out = Vec::with_capacity(expected_out);
@@ -38,19 +37,6 @@ fn run_intree(body: &[u8], expected_out: usize) {
     let mut out = Vec::with_capacity(expected_out);
     intree_inflate(&mut br, &mut out).expect("intree inflate");
     assert_eq!(out.len(), expected_out, "intree: output size mismatch");
-}
-
-fn run_zlib(body: &[u8], expected_out: usize) {
-    // zlib-rs decompress wants a fixed scratch slice; size it to the full
-    // decoded length so we exercise one Finish call (mirrors a hot-path
-    // single-shot decode of a known-size BGZF block).
-    let mut dec = Inflate::new(false, 15);
-    let mut scratch = vec![0u8; expected_out];
-    let status = dec
-        .decompress(body, &mut scratch, InflateFlush::Finish)
-        .expect("zlib inflate");
-    assert!(matches!(status, Status::StreamEnd), "zlib: expected StreamEnd, got {status:?}");
-    assert_eq!(dec.total_out() as usize, expected_out, "zlib: output size mismatch");
 }
 
 fn time<F: FnMut()>(label: &str, iters: u32, body_len: usize, out_len: usize, mut f: F) {
@@ -107,8 +93,5 @@ fn main() {
     }
     if want("intree") {
         time("intree", iters, body.len(), out_len, || run_intree(body, out_len));
-    }
-    if want("zlib") {
-        time("zlib", iters, body.len(), out_len, || run_zlib(body, out_len));
     }
 }

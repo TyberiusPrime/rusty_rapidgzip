@@ -64,25 +64,21 @@ impl std::ops::Deref for InputBytes {
 
 use rusty_rapidgzip_deflate::{
     find_next_dynamic_block, resolve_markers,
-    fast_inflate, BitReader, SpeculativeChunk, SpeculativeZlibDecoder,
+    fast_inflate, BitReader, SpeculativeChunk,
 };
 
-use crate::{Config, Error, InflateKernel};
+use crate::{Config, Error};
 
-/// Per-worker kernel state. `ZlibRs` owns a reusable `SpeculativeZlibDecoder`;
-/// `FastInflate` owns a reusable `u16` dense-window scratch buffer (reused
-/// across chunks so its pages stay faulted).
-enum WorkerKernel {
-    ZlibRs(SpeculativeZlibDecoder),
-    FastInflate(Vec<u16>),
+/// Per-worker kernel state: a reusable `u16` dense-window scratch buffer for
+/// `fast_inflate`, reused across chunks so its pages stay faulted.
+#[derive(Default)]
+struct WorkerKernel {
+    scratch: Vec<u16>,
 }
 
 impl WorkerKernel {
-    fn new(kernel: InflateKernel) -> Self {
-        match kernel {
-            InflateKernel::ZlibRs => WorkerKernel::ZlibRs(SpeculativeZlibDecoder::new()),
-            InflateKernel::FastInflate => WorkerKernel::FastInflate(Vec::new()),
-        }
+    fn new() -> Self {
+        Self::default()
     }
 
     fn decode_until(
@@ -92,12 +88,7 @@ impl WorkerKernel {
         end_bit_hint: u64,
         chunk: &mut SpeculativeChunk,
     ) -> Result<(u64, bool), rusty_rapidgzip_deflate::DeflateError> {
-        match self {
-            WorkerKernel::ZlibRs(zdec) => zdec.decode_until(input, start_bit, end_bit_hint, chunk),
-            WorkerKernel::FastInflate(scratch) => {
-                fast_inflate::decode_until_u16(input, start_bit, end_bit_hint, chunk, scratch)
-            }
-        }
+        fast_inflate::decode_until_u16(input, start_bit, end_bit_hint, chunk, &mut self.scratch)
     }
 }
 
@@ -274,10 +265,9 @@ pub fn parallel_decode_member(
         let work_rx = work_rx.clone();
         let result_tx = result_tx.clone();
         let recycle_rx = recycle_rx.clone();
-        let kernel = config.kernel;
         let handle = thread::spawn(move || {
             let body = &input.as_slice()[body_offset..];
-            let mut wk = WorkerKernel::new(kernel);
+            let mut wk = WorkerKernel::new();
             while let Ok(item) = work_rx.recv() {
                 // Try to pull a recycled output buffer; pages on it are
                 // warm so subsequent writes don't take page faults.
@@ -758,9 +748,6 @@ pub fn parallel_decode_bgzf(
         let file = Arc::clone(&file);
         let members_ref: Vec<(usize, usize)> = members.clone();
         workers.push(thread::spawn(move || {
-            // Per-worker zlib-rs state reused across all members. `reset()`
-            // between members keeps the 32 KiB window allocated.
-            let mut zdec = (rusty_rapidgzip_inflate::Inflate::new(false, 15), Box::new([0u8; 65_536]));
             while let Ok((id, m_start, m_end)) = work_rx.recv() {
                 // BGZF blocks are ≤64 KiB uncompressed; preallocate to avoid
                 // Vec growth reallocations inside the inflate hot loop.
@@ -769,20 +756,10 @@ pub fn parallel_decode_bgzf(
                 for mi in m_start..m_end {
                     let (s, e) = members_ref[mi];
                     let res = match engine {
-                        crate::gzip::InflateEngine::Zlib => {
-                            let (dec, scratch) = &mut zdec;
-                            crate::gzip::decode_one_indexed_zlib(
-                                &file[s..e],
-                                &mut out,
-                                mi as u32,
-                                dec,
-                                scratch.as_mut(),
-                            )
-                        }
                         crate::gzip::InflateEngine::Safe => {
                             crate::gzip::decode_one_indexed_safe(
                                 &file[s..e], &mut out, mi as u32,
-                            ).map(|n| { let _ = n; n })
+                            )
                         }
                         crate::gzip::InflateEngine::Intree => {
                             crate::gzip::decode_one_indexed(
@@ -867,7 +844,7 @@ pub fn parallel_decode_bgzf(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{read_gz, Config, InflateKernel};
+    use crate::{read_gz, Config};
     use crossbeam_channel::bounded;
     use sha2::{Digest, Sha256};
     use std::io::Write;
@@ -925,12 +902,12 @@ mod tests {
         hex::encode(h.finalize())
     }
 
-    /// zlib-rs backend with many concatenated members, with chunk size
-    /// tuned so member boundaries land in the *middle* of speculative chunks
-    /// (mirrors the bug observed in the wild: CRC mismatch on member ~22 of
-    /// a real `.fastq.gz` file with ~1MB-uncompressed members).
+    /// Many concatenated members, with chunk size tuned so member boundaries
+    /// land in the *middle* of speculative chunks (mirrors the bug observed in
+    /// the wild: CRC mismatch on member ~22 of a real `.fastq.gz` file with
+    /// ~1MB-uncompressed members).
     #[test]
-    fn zlib_rs_backend_multistream_member_crosses_chunk_boundary() {
+    fn multistream_member_crosses_chunk_boundary() {
         // Make enough members to span several chunks, with size chosen so
         // chunk boundaries don't align with member ends.
         // Mirrors the real-world failing case: ~1MB uncompressed per
@@ -1016,7 +993,6 @@ mod tests {
                         Config {
                             num_threads: threads,
                             chunk_size_bytes: chunk_sz,
-                            kernel: InflateKernel::FastInflate,
                             ..Config::default()
                         },
                     );
@@ -1049,7 +1025,6 @@ mod tests {
                 Config {
                     num_threads: threads,
                     chunk_size_bytes: 4 * 1024 * 1024,
-                    kernel: InflateKernel::FastInflate,
                     ..Config::default()
                 },
             );

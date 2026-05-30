@@ -7,7 +7,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use clap::Parser;
 use crossbeam_channel::bounded;
-use rusty_rapidgzip::{elapsed_since_start, read_gz, Config, InflateKernel, Verbosity};
+use rusty_rapidgzip::{elapsed_since_start, read_gz, Config, Verbosity};
 
 #[derive(Parser, Debug)]
 #[command(name = "rapidgzip-rs", version)]
@@ -36,22 +36,12 @@ fn main() -> Result<()> {
         * 2;
     let (recycle_tx, recycle_rx) = bounded::<Vec<u8>>(recycle_cap);
 
-    let kernel = match std::env::var("RAPIDGZIP_KERNEL").as_deref() {
-        Ok("zlib") => InflateKernel::ZlibRs,
-        Ok("fast") | Err(_) => InflateKernel::FastInflate,
-        Ok(other) => {
-            eprintln!("rapidgzip-rs: unknown RAPIDGZIP_KERNEL={other:?}, expected 'zlib' or 'fast'");
-            std::process::exit(1);
-        }
-    };
-
     let cfg = Config {
         num_threads: args.threads,
         chunk_size_bytes: args.chunk_size,
         verbose: if args.verbose { Verbosity::On } else { Verbosity::Off },
         recycle_rx: Some(recycle_rx),
         recycle_tx: Some(recycle_tx.clone()),
-        kernel,
         ..Config::default()
     };
 

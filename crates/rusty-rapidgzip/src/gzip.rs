@@ -23,8 +23,6 @@ pub enum InflateEngine {
     /// In-tree rapidgzip-deflate inflater (perf-tuned, contains `unsafe`).
     #[default]
     Intree,
-    /// Vendored zlib-rs engine (also contains `unsafe`).
-    Zlib,
     /// Pure-safe puff-style inflater. Currently slower; here for safety and
     /// as the target for iterative perf work.
     Safe,
@@ -36,7 +34,6 @@ impl InflateEngine {
     pub fn from_env() -> Self {
         match std::env::var("RAPIDGZIP_INFLATE").as_deref() {
             Ok("safe") => Self::Safe,
-            Ok("zlib") => Self::Zlib,
             Ok("intree") => Self::Intree,
             _ => Self::default(),
         }
@@ -119,10 +116,8 @@ pub fn decode_one_indexed(
     out: &mut Vec<u8>,
     member: u32,
 ) -> Result<usize, GzipError> {
-    // Engine dispatch for the serial path. `Zlib` falls through to in-tree
-    // here because the existing zlib helper expects a fixed-size scratch
-    // buffer suited only to BGZF blocks; the standalone bench binary uses
-    // the zlib engine directly for apples-to-apples comparison.
+    // Engine dispatch for the serial path: `Safe` uses the puff-style
+    // inflater, everything else uses the in-tree decoder below.
     if let InflateEngine::Safe = InflateEngine::from_env() {
         return decode_one_indexed_safe(input, out, member);
     }
@@ -186,64 +181,6 @@ pub fn decode_one_indexed_safe(
     let initial_out_len = out.len();
     let body_bytes = safe_inflate::inflate_into(&input[header_len..], out)?;
 
-    let trailer_start = header_len + body_bytes;
-    if trailer_start + 8 > input.len() {
-        return Err(GzipError::Truncated);
-    }
-    let crc_expected = u32::from_le_bytes(
-        input[trailer_start..trailer_start + 4].try_into().unwrap(),
-    );
-    let isize_expected = u32::from_le_bytes(
-        input[trailer_start + 4..trailer_start + 8].try_into().unwrap(),
-    );
-    let decoded = &out[initial_out_len..];
-    let crc_got = crc32fast::hash(decoded);
-    if crc_got != crc_expected {
-        return Err(GzipError::CrcMismatch {
-            expected: crc_expected,
-            got: crc_got,
-            member,
-            uncompressed: decoded.len() as u64,
-            trailer_byte: trailer_start as u64,
-        });
-    }
-    let isize_got = decoded.len() as u64;
-    if (isize_got & 0xFFFF_FFFF) as u32 != isize_expected {
-        return Err(GzipError::IsizeMismatch {
-            expected: isize_expected,
-            got: isize_got,
-            member,
-            trailer_byte: trailer_start as u64,
-        });
-    }
-    Ok(trailer_start + 8)
-}
-
-/// Same as [`decode_one_indexed`] but inflates with `zlib-rs` (via flate2)
-/// instead of the in-tree DEFLATE decoder. BGZF only — bounded input.
-pub fn decode_one_indexed_zlib(
-    input: &[u8],
-    out: &mut Vec<u8>,
-    member: u32,
-    dec: &mut rusty_rapidgzip_inflate::Inflate,
-    scratch: &mut [u8; 65_536],
-) -> Result<usize, GzipError> {
-    let header_len = parse_header(input)?;
-    let initial_out_len = out.len();
-
-    dec.reset(false);
-    let body = &input[header_len..];
-    let status = dec
-        .decompress(body, scratch, rusty_rapidgzip_inflate::InflateFlush::Finish)
-        .map_err(|_| GzipError::Deflate(DeflateError::Invalid("zlib-rs inflate failed")))?;
-    if !matches!(status, rusty_rapidgzip_inflate::Status::StreamEnd) {
-        return Err(GzipError::Deflate(DeflateError::Invalid(
-            "zlib-rs did not reach stream end",
-        )));
-    }
-    let produced = dec.total_out() as usize;
-    out.extend_from_slice(&scratch[..produced]);
-    let body_bytes = dec.total_in() as usize;
     let trailer_start = header_len + body_bytes;
     if trailer_start + 8 > input.len() {
         return Err(GzipError::Truncated);
