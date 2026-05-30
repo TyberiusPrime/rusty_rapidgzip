@@ -2,9 +2,17 @@
 
 A streaming, parallel gzip decoder for Rust, inspired by [rapidgzip][1] / [pugz][2].
 
-**Status:** very early — Phase 0 scaffolding. Not usable yet.
+Absolutely vibed up with Claude - but hey, gzip inflate is well understood 
+problem, right?
 
-## Goal
+## Status
+
+Performance is getting to be even with rapidgzip (cpp).
+
+Robustness needs a thorough test setup and fuzzying, even though
+gzip decoding is self-validating thanks to CRC32.
+
+## Basic API
 
 Decompress huge `.gz` files in parallel and stream the decompressed bytes
 back to the caller through a bounded channel:
@@ -18,21 +26,9 @@ std::thread::spawn(move || read_gz("huge.fastq.gz", tx, Config::default()));
 for chunk in rx { /* process bytes in stream order */ }
 ```
 
-No random access, no `Read`/`Seek`, no upstream-compatible `.gzi`.
+No random access, no `Read`/`Seek`, no upstream-compatible `.gzi` (for now).
 
 [1]: https://github.com/mxmlnkn/rapidgzip
 [2]: https://github.com/Piezoid/pugz
 
-## Layout
-
-- `crates/rapidgzip-deflate/` — bit reader, Huffman decoders, DEFLATE inflate (incl. speculative / no-window mode).
-- `crates/rapidgzip/` — gzip framing, parallel pipeline, public API.
-- `crates/rapidgzip-bin/` — `rapidgzip-rs` CLI.
-- `xtask/` — corpus management & golden-hash test harness.
-- `tests/corpus/` — test gz files (gitignored, fetched/built by xtask).
-
-## Status
-
-In beta. Claude vibed up a working architecture and optimized it to be 
-within spitting distance (25%ish) of rapidgzip's (c++) performance
 
