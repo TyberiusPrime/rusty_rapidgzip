@@ -1,0 +1,625 @@
+{
+    "version": 1,
+    "description": "Comprehensive gzip decompression test corpus for rapidgzip-rs. Covers synthetic edge cases, classic compression benchmarks (Canterbury, Silesia), large real-world data, and domain-specific formats to thoroughly exercise a parallel gzip decoder.",
+
+    "datasets": [
+        {
+            "id": "synth-empty",
+            "name": "Empty file",
+            "category": "synthetic",
+            "tags": ["zero_length", "edge_case"],
+            "importance": "critical",
+            "gz_file": "synth-empty.gz",
+            "raw_size_approx": 0,
+            "acquisition": {
+                "method": "generate",
+                "command": "printf '' | gzip -n > {gz_file}"
+            },
+            "notes": "Zero-length input produces the minimal valid gzip stream (20 bytes: 10-byte header + empty DEFLATE block + 4-byte CRC32 + 4-byte ISIZE). Critical for verifying the decoder handles empty streams without crash or spurious output."
+        },
+        {
+            "id": "synth-single-byte",
+            "name": "Single byte 'A'",
+            "category": "synthetic",
+            "tags": ["single_byte", "edge_case"],
+            "importance": "critical",
+            "gz_file": "synth-single-byte.gz",
+            "raw_size_approx": 1,
+            "acquisition": {
+                "method": "generate",
+                "command": "printf 'A' | gzip -n > {gz_file}"
+            },
+            "notes": "Smallest non-empty payload. Verifies single-byte output with no off-by-one errors in buffer management or CRC computation."
+        },
+        {
+            "id": "synth-zeros-1m",
+            "name": "1 MiB of null bytes",
+            "category": "synthetic",
+            "tags": ["highly_compressible", "repeated", "backref_heavy"],
+            "importance": "high",
+            "gz_file": "synth-zeros-1m.gz",
+            "raw_size_approx": 1048576,
+            "acquisition": {
+                "method": "generate",
+                "command": "dd if=/dev/zero bs=1048576 count=1 2>/dev/null | gzip -n > {gz_file}"
+            },
+            "notes": "Maximally compressible data. Produces very long back-references in DEFLATE, achieving ~1000:1 compression ratio. Stress-tests distance/length decoding and the sliding window at extreme lengths."
+        },
+        {
+            "id": "synth-random-1m",
+            "name": "1 MiB of random data",
+            "category": "synthetic",
+            "tags": ["incompressible", "random", "literal_heavy"],
+            "importance": "high",
+            "gz_file": "synth-random-1m.gz",
+            "raw_size_approx": 1048576,
+            "acquisition": {
+                "method": "generate",
+                "command": "dd if=/dev/urandom bs=1048576 count=1 2>/dev/null | gzip -n > {gz_file}"
+            },
+            "notes": "Incompressible random data. The compressed output will be larger than the input. Exercises literal encoding paths and verifies correct handling of data that cannot be compressed via back-references."
+        },
+        {
+            "id": "synth-repeated-pattern",
+            "name": "Repeating 8-byte pattern (1 MiB)",
+            "category": "synthetic",
+            "tags": ["backref_heavy", "repeated", "moderate_compressibility"],
+            "importance": "high",
+            "gz_file": "synth-repeated-pattern.gz",
+            "raw_size_approx": 1048576,
+            "acquisition": {
+                "method": "generate",
+                "command": "python3 -c \"import sys; sys.stdout.buffer.write(b'ABCDEFGH' * 131072)\" | gzip -n > {gz_file}"
+            },
+            "notes": "Short pattern repeated densely. Creates short-distance back-reference chains that stress the sliding window and length/distance decoding differently from long runs of zeros."
+        },
+        {
+            "id": "synth-concat-members",
+            "name": "Concatenated gzip members",
+            "category": "synthetic",
+            "tags": ["concatenated", "multi_member", "edge_case"],
+            "importance": "critical",
+            "gz_file": "synth-concat-members.gz",
+            "raw_size_approx": 10,
+            "acquisition": {
+                "method": "generate",
+                "command": "(printf 'Hello' | gzip -n; printf 'World' | gzip -n) > {gz_file}"
+            },
+            "notes": "Two gzip members concatenated (Hello + World = HelloWorld). Tests that the decoder correctly detects member boundaries, resets internal state between members, and concatenates decompressed output in order."
+        },
+        {
+            "id": "synth-spaces-1m",
+            "name": "1 MiB of ASCII spaces",
+            "category": "synthetic",
+            "tags": ["highly_compressible", "ascii"],
+            "importance": "medium",
+            "gz_file": "synth-spaces-1m.gz",
+            "raw_size_approx": 1048576,
+            "acquisition": {
+                "method": "generate",
+                "command": "python3 -c \"import sys; sys.stdout.buffer.write(b' ' * 1048576)\" | gzip -n > {gz_file}"
+            },
+            "notes": "All 0x20 bytes. Similar to zeros but exercises a different literal value. Ensures the decoder handles all byte values in the output, not just null."
+        },
+        {
+            "id": "synth-0xff-1m",
+            "name": "1 MiB of 0xFF bytes",
+            "category": "synthetic",
+            "tags": ["highly_compressible", "binary", "high_bytes"],
+            "importance": "medium",
+            "gz_file": "synth-0xff-1m.gz",
+            "raw_size_approx": 1048576,
+            "acquisition": {
+                "method": "generate",
+                "command": "python3 -c \"import sys; sys.stdout.buffer.write(b'\\xff' * 1048576)\" | gzip -n > {gz_file}"
+            },
+            "notes": "All 0xFF bytes. Tests the highest byte value to ensure no sign-extension bugs or issues with byte values >= 0x80 in the decompressed output."
+        },
+        {
+            "id": "synth-level1",
+            "name": "10 MiB cycling bytes, gzip -1",
+            "category": "synthetic",
+            "tags": ["low_compression", "fixed_huffman"],
+            "importance": "medium",
+            "gz_file": "synth-level1.gz",
+            "raw_size_approx": 10485760,
+            "acquisition": {
+                "method": "generate",
+                "command": "python3 -c \"import sys; sys.stdout.buffer.write(bytes(range(256)) * 40960)\" | gzip -1 -n > {gz_file}"
+            },
+            "notes": "10 MiB of cycling byte values 0-255 compressed with fastest level. Produces different DEFLATE structure (simpler Huffman trees, larger blocks) than max compression. Pairs with synth-level9 to verify bit-exact decompressed output regardless of compression level."
+        },
+        {
+            "id": "synth-level9",
+            "name": "10 MiB cycling bytes, gzip -9",
+            "category": "synthetic",
+            "tags": ["max_compression", "dynamic_huffman"],
+            "importance": "medium",
+            "gz_file": "synth-level9.gz",
+            "raw_size_approx": 10485760,
+            "acquisition": {
+                "method": "generate",
+                "command": "python3 -c \"import sys; sys.stdout.buffer.write(bytes(range(256)) * 40960)\" | gzip -9 -n > {gz_file}"
+            },
+            "notes": "Same source data as synth-level1 but compressed with maximum level. Exercises complex dynamic Huffman trees, long back-references, and smaller blocks. Decompressed output must be bit-exact identical to synth-level1."
+        },
+
+        {
+            "id": "canterbury-alice29",
+            "name": "Alice in Wonderland",
+            "category": "canterbury",
+            "tags": ["text", "english", "literary"],
+            "importance": "high",
+            "gz_file": "canterbury-alice29.txt.gz",
+            "raw_size_approx": 152089,
+            "acquisition": {
+                "method": "archive_member",
+                "archive_url": "https://corpus.canterbury.ac.nz/resources/cantrbry.zip",
+                "archive_format": "zip",
+                "member_path": "alice29.txt"
+            },
+            "notes": "Classic English literary text (~150KB) with natural language patterns. Good representative of text decompression workloads. Tests medium-length back-references typical of natural language."
+        },
+        {
+            "id": "canterbury-asyoulik",
+            "name": "As You Like It (Shakespeare)",
+            "category": "canterbury",
+            "tags": ["text", "english", "drama"],
+            "importance": "medium",
+            "gz_file": "canterbury-asyoulik.txt.gz",
+            "raw_size_approx": 125179,
+            "acquisition": {
+                "method": "archive_member",
+                "archive_url": "https://corpus.canterbury.ac.nz/resources/cantrbry.zip",
+                "archive_format": "zip",
+                "member_path": "asyoulik.txt"
+            },
+            "notes": "Shakespearean play. Different vocabulary and line structure from prose. Tests archaic English with dialogue formatting and stage directions."
+        },
+        {
+            "id": "canterbury-cp-html",
+            "name": "HTML source",
+            "category": "canterbury",
+            "tags": ["structured", "html", "markup"],
+            "importance": "medium",
+            "gz_file": "canterbury-cp.html.gz",
+            "raw_size_approx": 24603,
+            "acquisition": {
+                "method": "archive_member",
+                "archive_url": "https://corpus.canterbury.ac.nz/resources/cantrbry.zip",
+                "archive_format": "zip",
+                "member_path": "cp.html"
+            },
+            "notes": "HTML with mixed tags and text. Tests decompression of structured markup where tag names create repeating patterns compressible via back-references."
+        },
+        {
+            "id": "canterbury-fields-c",
+            "name": "C source code (fields.c)",
+            "category": "canterbury",
+            "tags": ["source_code", "c"],
+            "importance": "medium",
+            "gz_file": "canterbury-fields.c.gz",
+            "raw_size_approx": 11150,
+            "acquisition": {
+                "method": "archive_member",
+                "archive_url": "https://corpus.canterbury.ac.nz/resources/cantrbry.zip",
+                "archive_format": "zip",
+                "member_path": "fields.c"
+            },
+            "notes": "Small C source file (~11KB). Tests decompression of programming language text with keywords, operators, and short identifiers."
+        },
+        {
+            "id": "canterbury-grammar-lsp",
+            "name": "LISP source (grammar.lsp)",
+            "category": "canterbury",
+            "tags": ["source_code", "lisp", "small"],
+            "importance": "high",
+            "gz_file": "canterbury-grammar.lsp.gz",
+            "raw_size_approx": 3721,
+            "acquisition": {
+                "method": "archive_member",
+                "archive_url": "https://corpus.canterbury.ac.nz/resources/cantrbry.zip",
+                "archive_format": "zip",
+                "member_path": "grammar.lsp"
+            },
+            "notes": "Very small file (~3.7KB). Tests that the decoder handles tiny inputs correctly, including cases where the entire file is a single DEFLATE block."
+        },
+        {
+            "id": "canterbury-kennedy-xls",
+            "name": "Excel spreadsheet (kennedy.xls)",
+            "category": "canterbury",
+            "tags": ["binary", "spreadsheet", "structured"],
+            "importance": "high",
+            "gz_file": "canterbury-kennedy.xls.gz",
+            "raw_size_approx": 1029744,
+            "acquisition": {
+                "method": "archive_member",
+                "archive_url": "https://corpus.canterbury.ac.nz/resources/cantrbry.zip",
+                "archive_format": "zip",
+                "member_path": "kennedy.xls"
+            },
+            "notes": "Excel spreadsheet (~1MB). Binary format with structured data. Tests decompression of non-text binary content with record structures and varied entropy."
+        },
+        {
+            "id": "canterbury-lcet10",
+            "name": "Technical writing (lcet10.txt)",
+            "category": "canterbury",
+            "tags": ["text", "technical"],
+            "importance": "medium",
+            "gz_file": "canterbury-lcet10.txt.gz",
+            "raw_size_approx": 426754,
+            "acquisition": {
+                "method": "archive_member",
+                "archive_url": "https://corpus.canterbury.ac.nz/resources/cantrbry.zip",
+                "archive_format": "zip",
+                "member_path": "lcet10.txt"
+            },
+            "notes": "Technical writing (~427KB). Specialized vocabulary with repeated domain-specific terms. Tests back-references capturing repeated jargon."
+        },
+        {
+            "id": "canterbury-plrabn12",
+            "name": "Plato's Republic (poetry)",
+            "category": "canterbury",
+            "tags": ["text", "poetry", "english"],
+            "importance": "medium",
+            "gz_file": "canterbury-plrabn12.txt.gz",
+            "raw_size_approx": 481861,
+            "acquisition": {
+                "method": "archive_member",
+                "archive_url": "https://corpus.canterbury.ac.nz/resources/cantrbry.zip",
+                "archive_format": "zip",
+                "member_path": "plrabn12.txt"
+            },
+            "notes": "Poetry (~482KB). Line-oriented with shorter lines than prose. Tests decompression of text with frequent line breaks and rhythmic patterns."
+        },
+        {
+            "id": "canterbury-ptt5",
+            "name": "CCITT fax image (ptt5)",
+            "category": "canterbury",
+            "tags": ["binary", "image", "fax"],
+            "importance": "high",
+            "gz_file": "canterbury-ptt5.gz",
+            "raw_size_approx": 513216,
+            "acquisition": {
+                "method": "archive_member",
+                "archive_url": "https://corpus.canterbury.ac.nz/resources/cantrbry.zip",
+                "archive_format": "zip",
+                "member_path": "ptt5"
+            },
+            "notes": "CCITT fax test image (~513KB). Binary image data with runs of same-value pixels. Tests decompression of binary data that has its own run-length structure, creating interesting interactions with DEFLATE back-references."
+        },
+        {
+            "id": "canterbury-sum",
+            "name": "SPARC executable (sum)",
+            "category": "canterbury",
+            "tags": ["binary", "executable"],
+            "importance": "medium",
+            "gz_file": "canterbury-sum.gz",
+            "raw_size_approx": 38240,
+            "acquisition": {
+                "method": "archive_member",
+                "archive_url": "https://corpus.canterbury.ac.nz/resources/cantrbry.zip",
+                "archive_format": "zip",
+                "member_path": "sum"
+            },
+            "notes": "SPARC executable (~38KB). Binary file with ELF headers, code sections, and data. Tests mixed binary content with varying entropy (high in code, low in padding)."
+        },
+        {
+            "id": "canterbury-xargs",
+            "name": "GNU manual page (xargs.1)",
+            "category": "canterbury",
+            "tags": ["text", "man_page", "small"],
+            "importance": "high",
+            "gz_file": "canterbury-xargs.1.gz",
+            "raw_size_approx": 4227,
+            "acquisition": {
+                "method": "archive_member",
+                "archive_url": "https://corpus.canterbury.ac.nz/resources/cantrbry.zip",
+                "archive_format": "zip",
+                "member_path": "xargs.1"
+            },
+            "notes": "Very small man page (~4.2KB). Tests the decoder's handling of small inputs where gzip wrapper overhead is significant relative to payload."
+        },
+
+        {
+            "id": "canterbury-large-ecoli",
+            "name": "E. coli genome",
+            "category": "canterbury-large",
+            "tags": ["genomics", "dna", "repetitive", "small_alphabet"],
+            "importance": "high",
+            "gz_file": "canterbury-large-E.coli.gz",
+            "raw_size_approx": 4638690,
+            "acquisition": {
+                "method": "archive_member",
+                "archive_url": "https://corpus.canterbury.ac.nz/resources/large.zip",
+                "archive_format": "zip",
+                "member_path": "E.coli"
+            },
+            "notes": "Complete E. coli genome (~4.6MB). Only 4-character alphabet (A/C/G/T) with biological repetition patterns. Very different from English text - tests decompression of data with a tiny alphabet and bio repeat structures."
+        },
+        {
+            "id": "canterbury-large-bible",
+            "name": "King James Bible",
+            "category": "canterbury-large",
+            "tags": ["text", "english", "religious", "large"],
+            "importance": "medium",
+            "gz_file": "canterbury-large-bible.txt.gz",
+            "raw_size_approx": 4047392,
+            "acquisition": {
+                "method": "archive_member",
+                "archive_url": "https://corpus.canterbury.ac.nz/resources/large.zip",
+                "archive_format": "zip",
+                "member_path": "bible.txt"
+            },
+            "notes": "King James Bible (~4MB). Very large text with archaic English, verse numbers, and repetitive book/chapter/verse structure. Tests long-range text patterns."
+        },
+        {
+            "id": "canterbury-large-world192",
+            "name": "CIA World Factbook",
+            "category": "canterbury-large",
+            "tags": ["text", "structured", "encyclopedic"],
+            "importance": "medium",
+            "gz_file": "canterbury-large-world192.txt.gz",
+            "raw_size_approx": 2473400,
+            "acquisition": {
+                "method": "archive_member",
+                "archive_url": "https://corpus.canterbury.ac.nz/resources/large.zip",
+                "archive_format": "zip",
+                "member_path": "world192.txt"
+            },
+            "notes": "CIA World Factbook (~2.5MB). Structured text with country entries following templates. Highly repetitive structure tests medium-distance back-references."
+        },
+
+        {
+            "id": "silesia-dickens",
+            "name": "Dickens collected works",
+            "category": "silesia",
+            "tags": ["text", "english", "large"],
+            "importance": "high",
+            "gz_file": "silesia-dickens.gz",
+            "raw_size_approx": 10192446,
+            "acquisition": {
+                "method": "archive_member",
+                "archive_url": "https://sun.aei.polsl.pl/~sdeor/corpus/silesia.zip",
+                "archive_format": "zip",
+                "member_path": "dickens"
+            },
+            "notes": "14 Dickens works concatenated (~10MB). Large English text. Big enough to exercise parallel chunk splitting. Tests natural language text decompression at scale."
+        },
+        {
+            "id": "silesia-mozilla",
+            "name": "Mozilla 1.0 tarred executables",
+            "category": "silesia",
+            "tags": ["binary", "executable", "mixed", "very_large"],
+            "importance": "high",
+            "gz_file": "silesia-mozilla.gz",
+            "raw_size_approx": 51220480,
+            "acquisition": {
+                "method": "archive_member",
+                "archive_url": "https://sun.aei.polsl.pl/~sdeor/corpus/silesia.zip",
+                "archive_format": "zip",
+                "member_path": "mozilla"
+            },
+            "notes": "Mozilla 1.0 tarred directory (~51MB). Contains executables, JAR archives, HTML, XML, text - extremely diverse content in one file. Tests decoder's ability to handle rapid entropy changes across parallel chunks. Large enough to thoroughly exercise parallel decompression."
+        },
+        {
+            "id": "silesia-mr",
+            "name": "Medical MRI image",
+            "category": "silesia",
+            "tags": ["binary", "medical", "image", "dicom"],
+            "importance": "high",
+            "gz_file": "silesia-mr.gz",
+            "raw_size_approx": 9970564,
+            "acquisition": {
+                "method": "archive_member",
+                "archive_url": "https://sun.aei.polsl.pl/~sdeor/corpus/silesia.zip",
+                "archive_format": "zip",
+                "member_path": "mr"
+            },
+            "notes": "DICOM MRI scan of a head (~10MB). 19 planes of medical imaging data. Binary structured data with specific voxel patterns."
+        },
+        {
+            "id": "silesia-nci",
+            "name": "NCI chemical database",
+            "category": "silesia",
+            "tags": ["database", "chemical", "structured", "large"],
+            "importance": "high",
+            "gz_file": "silesia-nci.gz",
+            "raw_size_approx": 33553445,
+            "acquisition": {
+                "method": "archive_member",
+                "archive_url": "https://sun.aei.polsl.pl/~sdeor/corpus/silesia.zip",
+                "archive_format": "zip",
+                "member_path": "nci"
+            },
+            "notes": "Chemical structure database in SDF format (~34MB). Molecular structures, coordinates, and properties. Highly compressible structured text with repeated field labels. Tests database-style records with strong inter-record patterns."
+        },
+        {
+            "id": "silesia-ooffice",
+            "name": "OpenOffice DLL",
+            "category": "silesia",
+            "tags": ["binary", "executable", "dll"],
+            "importance": "medium",
+            "gz_file": "silesia-ooffice.gz",
+            "raw_size_approx": 6152192,
+            "acquisition": {
+                "method": "archive_member",
+                "archive_url": "https://sun.aei.polsl.pl/~sdeor/corpus/silesia.zip",
+                "archive_format": "zip",
+                "member_path": "ooffice"
+            },
+            "notes": "OpenOffice DLL (~6MB). Windows PE binary with code, imports, and data sections. Tests a single binary executable with varied entropy."
+        },
+        {
+            "id": "silesia-osdb",
+            "name": "Open Source Database Benchmark",
+            "category": "silesia",
+            "tags": ["database", "mysql", "structured"],
+            "importance": "medium",
+            "gz_file": "silesia-osdb.gz",
+            "raw_size_approx": 10085684,
+            "acquisition": {
+                "method": "archive_member",
+                "archive_url": "https://sun.aei.polsl.pl/~sdeor/corpus/silesia.zip",
+                "archive_format": "zip",
+                "member_path": "osdb"
+            },
+            "notes": "MySQL database file from OSDB benchmark (~10MB). Binary database format with mixed record types. Tests structured binary data typical of database workloads."
+        },
+        {
+            "id": "silesia-reymont",
+            "name": "Chlopi by Reymont (Polish text)",
+            "category": "silesia",
+            "tags": ["text", "non_ascii", "polish", "pdf"],
+            "importance": "high",
+            "gz_file": "silesia-reymont.gz",
+            "raw_size_approx": 6627202,
+            "acquisition": {
+                "method": "archive_member",
+                "archive_url": "https://sun.aei.polsl.pl/~sdeor/corpus/silesia.zip",
+                "archive_format": "zip",
+                "member_path": "reymont"
+            },
+            "notes": "Polish novel 'Chlopi' as uncompressed PDF (~6.6MB). Contains non-ASCII characters (Polish diacritics in PDF encoding). Essential for testing that the decoder handles multi-byte and extended Latin characters correctly."
+        },
+        {
+            "id": "silesia-samba",
+            "name": "Samba 2.2 source code",
+            "category": "silesia",
+            "tags": ["source_code", "tar", "mixed", "large"],
+            "importance": "high",
+            "gz_file": "silesia-samba.gz",
+            "raw_size_approx": 21606400,
+            "acquisition": {
+                "method": "archive_member",
+                "archive_url": "https://sun.aei.polsl.pl/~sdeor/corpus/silesia.zip",
+                "archive_format": "zip",
+                "member_path": "samba"
+            },
+            "notes": "Tarred Samba 2.2 source code (~22MB). C source, headers, docs, Makefiles, scripts. Large enough for parallel decompression. Tests mixed code/text typical of software distribution."
+        },
+        {
+            "id": "silesia-sao",
+            "name": "SAO star catalog",
+            "category": "silesia",
+            "tags": ["binary", "database", "astronomical"],
+            "importance": "medium",
+            "gz_file": "silesia-sao.gz",
+            "raw_size_approx": 7251944,
+            "acquisition": {
+                "method": "archive_member",
+                "archive_url": "https://sun.aei.polsl.pl/~sdeor/corpus/silesia.zip",
+                "archive_format": "zip",
+                "member_path": "sao"
+            },
+            "notes": "SAO star catalog with 258,996 stars (~7.3MB). Binary fixed-length records. Tests structured binary data with astronomical coordinates."
+        },
+        {
+            "id": "silesia-webster",
+            "name": "Webster's 1913 Dictionary (HTML)",
+            "category": "silesia",
+            "tags": ["text", "html", "dictionary", "very_large"],
+            "importance": "high",
+            "gz_file": "silesia-webster.gz",
+            "raw_size_approx": 41458703,
+            "acquisition": {
+                "method": "archive_member",
+                "archive_url": "https://sun.aei.polsl.pl/~sdeor/corpus/silesia.zip",
+                "archive_format": "zip",
+                "member_path": "webster"
+            },
+            "notes": "1913 Webster Dictionary in HTML (~41MB). Very large HTML/text hybrid with repetitive markup around word definitions. Large enough to thoroughly exercise parallel chunking."
+        },
+        {
+            "id": "silesia-xml",
+            "name": "XML document collection",
+            "category": "silesia",
+            "tags": ["structured", "xml", "markup"],
+            "importance": "high",
+            "gz_file": "silesia-xml.gz",
+            "raw_size_approx": 5345280,
+            "acquisition": {
+                "method": "archive_member",
+                "archive_url": "https://sun.aei.polsl.pl/~sdeor/corpus/silesia.zip",
+                "archive_format": "zip",
+                "member_path": "xml"
+            },
+            "notes": "Concatenation of 21 XML files (~5.3MB). Structured markup with repeated tags and mixed content. Tests decompression where tag names provide excellent back-reference targets while content varies."
+        },
+        {
+            "id": "silesia-xray",
+            "name": "X-ray medical image",
+            "category": "silesia",
+            "tags": ["binary", "image", "medical", "grayscale"],
+            "importance": "medium",
+            "gz_file": "silesia-x-ray.gz",
+            "raw_size_approx": 8474240,
+            "acquisition": {
+                "method": "archive_member",
+                "archive_url": "https://sun.aei.polsl.pl/~sdeor/corpus/silesia.zip",
+                "archive_format": "zip",
+                "member_path": "x-ray"
+            },
+            "notes": "12-bit grayscale X-ray of a child's hand (~8.5MB). Medical imaging data with spatial correlations. Tests binary image data where pixel neighborhoods create specific compression patterns."
+        },
+
+        {
+            "id": "enwik8",
+            "name": "Wikipedia XML dump (first 100MB)",
+            "category": "large-text",
+            "tags": ["text", "xml", "wikipedia", "large"],
+            "importance": "high",
+            "gz_file": "enwik8.gz",
+            "raw_size_approx": 100000000,
+            "acquisition": {
+                "method": "archive_member",
+                "archive_url": "http://mattmahoney.net/dc/enwik8.zip",
+                "archive_format": "zip",
+                "member_path": "enwik8"
+            },
+            "notes": "First 100MB of English Wikipedia XML dump from 2006. UTF-8 encoded XML with article titles, revision metadata, and wikitext. Very large text with mixed content. Excellent parallel decompression test due to size and heterogeneous content."
+        },
+        {
+            "id": "genomics-ERR2432917",
+            "name": "Illumina FASTQ (ERR2432917)",
+            "category": "genomics",
+            "tags": ["genomics", "fastq", "already_gzipped"],
+            "importance": "high",
+            "gz_file": "genomics-ERR2432917_1.fastq.gz",
+            "raw_size_approx": null,
+            "acquisition": {
+                "method": "local_copy",
+                "path": "../../ERR2432917_1.fastq.gz"
+            },
+            "notes": "Real Illumina sequencing data from NCBI SRA. FASTQ format with quality scores. Already gzip-compressed by bioinformatics tools. Tests decompression of a real gzipped file from the wild. File must be present at project root."
+        },
+        {
+            "id": "linux-6.6",
+            "name": "Linux 6.6 kernel source tarball",
+            "category": "kernel",
+            "tags": ["tar", "source_code", "mixed", "very_large", "already_gzipped"],
+            "importance": "high",
+            "gz_file": "linux-6.6.tar.gz",
+            "raw_size_approx": 1300000000,
+            "acquisition": {
+                "method": "download_gz",
+                "url": "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.tar.gz"
+            },
+            "notes": "Linux 6.6 LTS kernel source tarball (~200MB compressed, ~1.3GB decompressed tar). The ultimate parallel decompression stress test: huge, with extremely varied content (C source, headers, Kconfig, Makefiles, device trees, scripts). Large enough to saturate many parallel decode threads."
+        },
+        {
+            "id": "gutenberg-shakespeare",
+            "name": "Complete Works of Shakespeare (Gutenberg)",
+            "category": "text",
+            "tags": ["text", "english", "drama", "poetry"],
+            "importance": "medium",
+            "gz_file": "gutenberg-shakespeare.txt.gz",
+            "raw_size_approx": 5600000,
+            "acquisition": {
+                "method": "download_and_gzip",
+                "url": "https://www.gutenberg.org/cache/epub/100/pg100.txt"
+            },
+            "notes": "Complete Works of Shakespeare from Project Gutenberg (~5.6MB). Large text combining plays, sonnets, and narrative poems. Complements Canterbury's As You Like It with the full Shakespeare canon."
+        }
+    ]
+}

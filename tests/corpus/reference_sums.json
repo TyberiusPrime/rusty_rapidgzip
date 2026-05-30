@@ -1,0 +1,197 @@
+{
+  "synth-empty.gz": {
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "raw_size": 0,
+    "gz_size": 20
+  },
+  "synth-single-byte.gz": {
+    "sha256": "559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd",
+    "raw_size": 1,
+    "gz_size": 21
+  },
+  "synth-zeros-1m.gz": {
+    "sha256": "30e14955ebf1352266dc2ff8067e68104607e750abb9d3b36582b8af909fcb58",
+    "raw_size": 1048576,
+    "gz_size": 1051
+  },
+  "synth-concat-members.gz": {
+    "sha256": "872e4e50ce9990d8b041330c47c9ddd11bec6b503ae9386a99da8584e9bb12c4",
+    "raw_size": 10,
+    "gz_size": 50
+  },
+  "synth-level1.gz": {
+    "sha256": "aecf3c2ab8aca74852bca07b54136cecb3fdafdc35540068ed952c0b89538e0d",
+    "raw_size": 10485760,
+    "gz_size": 78737
+  },
+  "synth-level9.gz": {
+    "sha256": "aecf3c2ab8aca74852bca07b54136cecb3fdafdc35540068ed952c0b89538e0d",
+    "raw_size": 10485760,
+    "gz_size": 41000
+  },
+  "canterbury-alice29.txt.gz": {
+    "sha256": "7467306ee0feed4971260f3c87421154a05be571d944e9cb021a5713700c38f0",
+    "raw_size": 152089,
+    "gz_size": 54423
+  },
+  "canterbury-grammar.lsp.gz": {
+    "sha256": "1b0805dfc0ae706b35aac2bb4e15f02485efd24dda5dbd29de7b2f84d1a88c15",
+    "raw_size": 3721,
+    "gz_size": 1234
+  },
+  "canterbury-kennedy.xls.gz": {
+    "sha256": "9af47239ca29dfe20e633f80bbbb9a4cc9783d0803d7b2b5626f42e4c3790420",
+    "raw_size": 1029744,
+    "gz_size": 206767
+  },
+  "canterbury-ptt5.gz": {
+    "sha256": "0ec3a75089bb52342813496b17e51377bc9eba3cb519a444d67025354841d650",
+    "raw_size": 513216,
+    "gz_size": 56438
+  },
+  "synth-random-1m.gz": {
+    "sha256": "dcecd680a19145bb3875ceae41d6c6d54c3befa6b7e634b035351a467e61ffd9",
+    "raw_size": 1048576,
+    "gz_size": 1048754
+  },
+  "synth-repeated-pattern.gz": {
+    "sha256": "8d37cc4e14b3417d68ebc5d4e81c1fc0211282ce901216472a98beb9050cc5b0",
+    "raw_size": 1048576,
+    "gz_size": 1568
+  },
+  "synth-spaces-1m.gz": {
+    "sha256": "f954ac8b009f965c052519c4e1e395a9f15328596a2b1eaf373d74fe7e169a5f",
+    "raw_size": 1048576,
+    "gz_size": 1052
+  },
+  "synth-0xff-1m.gz": {
+    "sha256": "f5fb04aa5b882706b9309e885f19477261336ef76a150c3b4d3489dfac3953ec",
+    "raw_size": 1048576,
+    "gz_size": 1051
+  },
+  "canterbury-asyoulik.txt.gz": {
+    "sha256": "eaa3526fe53859f34ecdf255712f9ecf0b2c903451d4755b2edaa2e2599cb0fc",
+    "raw_size": 125179,
+    "gz_size": 48938
+  },
+  "canterbury-cp.html.gz": {
+    "sha256": "e0cd21cef5b6c4069461e949be100080c3ce887de6f1dd8626c480528efaaf61",
+    "raw_size": 24603,
+    "gz_size": 7991
+  },
+  "canterbury-fields.c.gz": {
+    "sha256": "85d73e354cc50cec76cb5a50537cf8dc035f8cbb8480f9e1cbe2f7d6c23393c7",
+    "raw_size": 11150,
+    "gz_size": 3134
+  },
+  "canterbury-lcet10.txt.gz": {
+    "sha256": "5314ba1dbb03f471df88bec6cd120a938ef60d0fd3511c5c1dce61bf7463245f",
+    "raw_size": 426754,
+    "gz_size": 144874
+  },
+  "canterbury-plrabn12.txt.gz": {
+    "sha256": "07e2e0b461af78c7c647cb53dab39de560198e16f799b4516eccf0fbd69f764c",
+    "raw_size": 481861,
+    "gz_size": 195195
+  },
+  "canterbury-sum.gz": {
+    "sha256": "ee5733cd76ecc2f9d8ff156adc3c02a7a851051dcf43a2d56ff4ee4ff606bdb3",
+    "raw_size": 38240,
+    "gz_size": 12920
+  },
+  "canterbury-xargs.1.gz": {
+    "sha256": "c58aeb5d2d1e12751d47e7412b45784405fc30a5671b03d480fa05776e183619",
+    "raw_size": 4227,
+    "gz_size": 1748
+  },
+  "canterbury-large-E.coli.gz": {
+    "sha256": "9125dfd87315961ef4286f3856098069e050cc3a2abe65735fe43e69d1996f40",
+    "raw_size": 4638690,
+    "gz_size": 1341243
+  },
+  "canterbury-large-bible.txt.gz": {
+    "sha256": "4e0a7e8dff7d9c82dbded57305c0ca3cdd3c4ca014db27121782fe9710f4723f",
+    "raw_size": 4047392,
+    "gz_size": 1191061
+  },
+  "canterbury-large-world192.txt.gz": {
+    "sha256": "1aebdc97d29904b25791da9aa32be90b69d7da6dc0ac9b95512ed27ed40d2112",
+    "raw_size": 2473400,
+    "gz_size": 724593
+  },
+  "genomics-ERR2432917_1.fastq.gz": {
+    "sha256": "08c00397d544e52813de471363e5e154371bcd4c73ad026635213d69af99dd1b",
+    "raw_size": 4820713734,
+    "gz_size": 1563111339
+  },
+  "gutenberg-shakespeare.txt.gz": {
+    "sha256": "041e8f1d7a6aa622268942c5c07a29274fe02311f1547ac43c698ddf1f49c680",
+    "raw_size": 5638483,
+    "gz_size": 2136525
+  },
+  "silesia-dickens.gz": {
+    "sha256": "b24c37886142e11d0ee687db6ab06f936207aa7f2ea1fd1d9a36763c7a507e6a",
+    "raw_size": 10192446,
+    "gz_size": 3868770
+  },
+  "silesia-mozilla.gz": {
+    "sha256": "657fc3764b0c75ac9de9623125705831ebbfbe08fed248df73bc2dc66e2a963b",
+    "raw_size": 51220480,
+    "gz_size": 19048737
+  },
+  "silesia-mr.gz": {
+    "sha256": "68637ed52e3e4860174ed2dc0840ac77d5f1a60abbcb13770d5754e3774d53e6",
+    "raw_size": 9970564,
+    "gz_size": 3690569
+  },
+  "silesia-nci.gz": {
+    "sha256": "fc63a31770947b8c2062d3b19ca94c00485a232bb91b502021948fee983e1635",
+    "raw_size": 33553445,
+    "gz_size": 3199449
+  },
+  "silesia-ooffice.gz": {
+    "sha256": "e7ee013880d34dd5208283d0d3d91b07f442e067454276095ded14f322a656eb",
+    "raw_size": 6152192,
+    "gz_size": 3097073
+  },
+  "silesia-osdb.gz": {
+    "sha256": "60f027179302ca3ad87c58ac90b6be72ec23588aaa7a3b7fe8ecc0f11def3fa3",
+    "raw_size": 10085684,
+    "gz_size": 3739573
+  },
+  "silesia-reymont.gz": {
+    "sha256": "0eac0114a3dfe6e2ee1f345a0f79d653cb26c3bc9f0ed79238af4933422b7578",
+    "raw_size": 6627202,
+    "gz_size": 1858621
+  },
+  "silesia-samba.gz": {
+    "sha256": "93ba07bc44d8267789c1d911992f40b089ffa2140b4a160fac11ccae9a40e7b2",
+    "raw_size": 21606400,
+    "gz_size": 5460531
+  },
+  "silesia-sao.gz": {
+    "sha256": "c2d0ea2cc59d4c21b7fe43a71499342a00cbe530a1d5548770e91ecd6214adcc",
+    "raw_size": 7251944,
+    "gz_size": 5332822
+  },
+  "silesia-webster.gz": {
+    "sha256": "6a68f69b26daf09f9dd84f7470368553194a0b294fcfa80f1604efb11143a383",
+    "raw_size": 41458703,
+    "gz_size": 12201972
+  },
+  "silesia-xml.gz": {
+    "sha256": "0e82e54e695c1938e4193448022543845b33020c8be6bf3bf3ead2224903e08c",
+    "raw_size": 5345280,
+    "gz_size": 691988
+  },
+  "silesia-x-ray.gz": {
+    "sha256": "7de9fce1405dc44ae5e6813ed21cd5751e761bd4265655a005d39b9685d1c9ad",
+    "raw_size": 8474240,
+    "gz_size": 6037788
+  },
+  "enwik8.gz": {
+    "sha256": "2b49720ec4d78c3c9fabaee6e4179a5e997302b3a70029f30f2d582218c024a8",
+    "raw_size": 100000000,
+    "gz_size": 36518322
+  }
+}
