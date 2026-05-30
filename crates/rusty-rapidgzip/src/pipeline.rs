@@ -31,7 +31,7 @@
 use std::sync::Arc;
 use std::thread;
 
-use crossbeam_channel::{bounded, Sender};
+use crossbeam_channel::{bounded, Receiver, Sender};
 
 /// Compressed input backing store. Either an mmap'd file (production) or a
 /// heap buffer (tests / small inputs). Both deref to `&[u8]`.
@@ -165,6 +165,14 @@ pub fn parallel_decode_member(
     let body: &[u8] = &input.as_slice()[body_offset..];
     let num_threads = effective_threads(config);
     let verbose = config.verbose.is_on();
+
+    // Single worker: there is no parallelism to gain from speculation, so skip
+    // the boundary scan / marker machinery entirely and decode serially with a
+    // real 32 KiB window (plain u8 output, no marker-window overhead).
+    if num_threads == 1 {
+        return serial_decode_member(input, body_offset, sink, config);
+    }
+
     let recycle_rx = config.recycle_rx.clone();
     let recycle_tx_for_crc = config.recycle_tx.clone();
     let total_bits = (body.len() as u64) * 8;
@@ -664,6 +672,150 @@ fn effective_threads(config: &Config) -> usize {
         config.num_threads
     };
     n.max(1)
+}
+
+/// Fully serial, marker-less streaming decode for the single-worker case.
+///
+/// With one thread there is nothing to parallelise, so speculation is pure
+/// overhead. Instead we decode the deflate body block-by-block carrying a real
+/// 32 KiB window: `fast_inflate::decode_one_block` resolves every back-ref in
+/// place and emits plain `u8` output, avoiding the `u16` marker-window cost
+/// (double the output bandwidth + the `extract_from_u16` lowering pass + the
+/// marker-resolution sweep) the parallel path pays. Output is streamed to
+/// `sink` in ~`chunk_size_bytes` pieces while the trailing 32 KiB is retained
+/// for subsequent copies, so memory stays bounded regardless of member size.
+/// CRC32 + ISIZE are validated inline per member.
+///
+/// Returns `(total_uncompressed, body_consumed, chunks_sent)`.
+fn serial_decode_member(
+    input: Arc<InputBytes>,
+    body_offset: usize,
+    sink: &Sender<Arc<Vec<u8>>>,
+    config: &Config,
+) -> Result<(u64, usize, u64), Error> {
+    // Retained window == max DEFLATE back-ref distance. Keeping exactly the
+    // last 32 KiB is enough for every copy source to stay in `out`.
+    const SERIAL_WINDOW: usize = 32 * 1024;
+
+    let body: &[u8] = &input.as_slice()[body_offset..];
+    let chunk_target = config.chunk_size_bytes.max(64 * 1024);
+    let recycle_rx = config.recycle_rx.clone();
+
+    // Pull a recycled buffer (warm pages) or allocate a fresh one, sized for a
+    // chunk's worth of decode plus the window carried into it.
+    let take_buf = |recycle_rx: &Option<Receiver<Vec<u8>>>| -> Vec<u8> {
+        let mut b = recycle_rx
+            .as_ref()
+            .and_then(|r| r.try_recv().ok())
+            .unwrap_or_default();
+        b.clear();
+        b.reserve(chunk_target + SERIAL_WINDOW + 64 * 1024);
+        b
+    };
+
+    let mut br = BitReader::new(body);
+    // `out` holds `[not-yet-emitted output]`. We decode into it, then hand the
+    // whole Vec off to `sink` (no output copy) and carry only the trailing
+    // 32 KiB window into a fresh buffer so back-refs in the next chunk resolve.
+    let mut out: Vec<u8> = take_buf(&recycle_rx);
+
+    let mut total_uncompressed: u64 = 0;
+    let mut chunks_sent: u64 = 0;
+    let mut member_idx: u32 = 0;
+
+    // Per-member running CRC + uncompressed byte count. Each output byte is
+    // folded into the CRC exactly once, at the moment it is emitted.
+    let mut member_crc = crc32fast::Hasher::new();
+    let mut member_uncompressed: u64 = 0;
+
+    loop {
+        let bfinal =
+            fast_inflate::decode_one_block(&mut br, &mut out).map_err(Error::Deflate)?;
+
+        if !bfinal {
+            // Mid-member: emit whole chunks while keeping the 32 KiB window.
+            // Hand `out` off by value; seed the next buffer with the window.
+            while out.len() >= chunk_target + SERIAL_WINDOW {
+                let emit_len = out.len() - SERIAL_WINDOW;
+                let mut next = take_buf(&recycle_rx);
+                next.extend_from_slice(&out[emit_len..]); // carry 32 KiB window
+                out.truncate(emit_len);
+                member_crc.update(&out);
+                let n = out.len() as u64;
+                let chunk_vec = std::mem::replace(&mut out, next);
+                if sink.send(Arc::new(chunk_vec)).is_err() {
+                    return Ok((total_uncompressed, 0, chunks_sent));
+                }
+                total_uncompressed += n;
+                member_uncompressed += n;
+                chunks_sent += 1;
+            }
+            continue;
+        }
+
+        // Final block of this member — flush everything it produced. (Member
+        // boundaries reset the window, so nothing here carries into the next
+        // member; each emitted chunk belongs to exactly one member.)
+        member_crc.update(&out);
+        if !out.is_empty() {
+            let n = out.len() as u64;
+            let next = take_buf(&recycle_rx);
+            let chunk_vec = std::mem::replace(&mut out, next);
+            if sink.send(Arc::new(chunk_vec)).is_err() {
+                return Ok((total_uncompressed, 0, chunks_sent));
+            }
+            total_uncompressed += n;
+            member_uncompressed += n;
+            chunks_sent += 1;
+        }
+
+        // Byte-align and read the 8-byte trailer.
+        br.byte_align();
+        let after_bit = br.tell_bit();
+        debug_assert_eq!(after_bit % 8, 0);
+        let trailer_byte = (after_bit / 8) as usize;
+        if trailer_byte + 8 > body.len() {
+            return Err(Error::Gzip(crate::GzipError::Truncated));
+        }
+        let crc_expected =
+            u32::from_le_bytes(body[trailer_byte..trailer_byte + 4].try_into().unwrap());
+        let isize_expected =
+            u32::from_le_bytes(body[trailer_byte + 4..trailer_byte + 8].try_into().unwrap());
+
+        let crc_got = std::mem::replace(&mut member_crc, crc32fast::Hasher::new()).finalize();
+        if crc_got != crc_expected {
+            return Err(Error::Gzip(crate::GzipError::CrcMismatch {
+                expected: crc_expected,
+                got: crc_got,
+                member: member_idx,
+                uncompressed: member_uncompressed,
+                trailer_byte: (body_offset + trailer_byte) as u64,
+            }));
+        }
+        if (member_uncompressed & 0xFFFF_FFFF) as u32 != isize_expected {
+            return Err(Error::Gzip(crate::GzipError::IsizeMismatch {
+                expected: isize_expected,
+                got: member_uncompressed,
+                member: member_idx,
+                trailer_byte: (body_offset + trailer_byte) as u64,
+            }));
+        }
+
+        let after_trailer = trailer_byte + 8;
+        member_idx += 1;
+        if after_trailer >= body.len() {
+            // Real EOF — last member consumed.
+            return Ok((total_uncompressed, after_trailer, chunks_sent));
+        }
+
+        // Another member follows: parse its header and reset per-member state.
+        let header_len =
+            crate::gzip::parse_header(&body[after_trailer..]).map_err(Error::Gzip)?;
+        let next_block_byte = after_trailer + header_len;
+        br.seek_to_bit((next_block_byte as u64) * 8).map_err(Error::Deflate)?;
+        member_uncompressed = 0;
+        // `out` is already empty; the new member starts with a fresh window.
+    }
 }
 
 

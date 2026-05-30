@@ -117,13 +117,30 @@ pub fn decode_until(
 /// `chunk_base = 0` here: the full `out` history is the DEFLATE window.
 pub fn inflate_fast(br: &mut BitReader<'_>, out: &mut Vec<u8>) -> Result<(), DeflateError> {
     loop {
-        let bfinal = br.read(1)? != 0;
-        let btype = br.read(2)?;
-        decode_block::<false>(br, out, btype, 0, core::ptr::null_mut())?;
-        if bfinal {
+        if decode_one_block(br, out)? {
             return Ok(());
         }
     }
+}
+
+/// Decode a single deflate block (non-speculative) appending its output to
+/// `out`. Returns `true` if this was the final block (BFINAL set).
+///
+/// Back-references resolve within `out` via relative distances, so the caller
+/// must guarantee that the last 32 KiB of valid window precede the write head
+/// (`out` holds at least `min(out.len(), 32768)` bytes of real history). This
+/// is the streaming counterpart to [`inflate_fast`]: a serial driver can call
+/// it block-by-block and periodically drain emitted bytes off the front of
+/// `out` while retaining a 32 KiB window, decoding an arbitrarily long member
+/// in bounded memory with no marker machinery.
+pub fn decode_one_block(
+    br: &mut BitReader<'_>,
+    out: &mut Vec<u8>,
+) -> Result<bool, DeflateError> {
+    let bfinal = br.read(1)? != 0;
+    let btype = br.read(2)?;
+    decode_block::<false>(br, out, btype, 0, core::ptr::null_mut())?;
+    Ok(bfinal)
 }
 
 // ── Block dispatcher ─────────────────────────────────────────────────────────
