@@ -15,9 +15,10 @@ use rusty_rapidgzip_deflate::{inflate, safe_inflate, BitReader, DeflateError};
 
 /// Which DEFLATE engine to use for the framed-gzip and BGZF paths.
 ///
-/// The speculative parallel pipeline always uses the in-tree zlib-rs engine
-/// (it's the only one with marker-resolution support); this selector controls
-/// the *window-known* serial paths only.
+/// The speculative parallel pipeline always uses the in-tree `fast_inflate`
+/// kernel (it carries the marker machinery); this selector controls the
+/// *window-known* serial paths only (the BGZF per-member decode and the
+/// serial-gzip `decode_one_indexed`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum InflateEngine {
     /// In-tree rapidgzip-deflate inflater (perf-tuned, contains `unsafe`).
