@@ -19,6 +19,7 @@ repository = "https://github.com/TyberiusPrime/rusty-rapidgzip"
 rusty-rapidgzip-deflate = { path = "crates/rusty-rapidgzip-deflate" }
 rusty-rapidgzip = { path = "crates/rusty-rapidgzip" }
 rusty-rapidgzip-inflate = { path = "crates/rusty-rapidgzip-inflate" }
+rusty-rapidgzip-srtingpod = { path = "crates/rusty-rapidgzip-stringpod" }
 
 crc32fast = "1.4"
 crossbeam-channel = "0.5"
