@@ -2,11 +2,18 @@
 """AFL fuzzing driver for rusty-rapidgzip.
 
 Usage:
-    python dev/fuzz.py          # build + run fuzzer
-    python dev/fuzz.py build    # build fuzz target only
-    python dev/fuzz.py run      # run fuzzer (builds first if needed)
+    python dev/fuzz.py          # build + run the decode fuzzer
+    python dev/fuzz.py build    # build fuzz targets only
+    python dev/fuzz.py run      # run the decode fuzzer (builds first if needed)
+    python dev/fuzz.py fastq    # run the FASTQ columnar-split fuzzer
     python dev/fuzz.py minimize # minimize corpus
     python dev/fuzz.py crash    # replay crashes
+
+Two targets:
+  * fuzz_rapidgzip (run) — gzip/BGZF decode kernels, fast/safe differential.
+  * fuzz_fastq (fastq)   — the FASTQ columnar split, with a chunk-boundary
+                           invariance oracle (same stream split differently must
+                           yield identical columns; exercises the carry-stitch).
 
 The fast `fast_inflate` kernel is the default decode path now — there is no
 `RAPIDGZIP_KERNEL` knob anymore. The harness drives it directly (see MAIN_RS):
@@ -32,10 +39,14 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 FUZZ_DIR = PROJECT_ROOT / "fuzz"
 CORPUS_DIR = FUZZ_DIR / "corpus"
 OUTPUT_DIR = FUZZ_DIR / "findings"
+# Separate corpus/output for the FASTQ-split target (`fastq` command): it eats
+# the *decompressed* stream, so it wants plain FASTQ text seeds, not gzip.
+FASTQ_CORPUS_DIR = FUZZ_DIR / "corpus_fastq"
+FASTQ_OUTPUT_DIR = FUZZ_DIR / "findings_fastq"
 
 
-def binary_path():
-    """Resolve the fuzz binary, honoring any target-dir override (this repo
+def binary_path(name="fuzz_rapidgzip"):
+    """Resolve a fuzz binary by name, honoring any target-dir override (this repo
     redirects cargo's target dir, so it is not the literal `fuzz/target`)."""
     target_dir = FUZZ_DIR / "target"
     try:
@@ -46,7 +57,7 @@ def binary_path():
         target_dir = Path(json.loads(meta)["target_directory"])
     except (subprocess.CalledProcessError, FileNotFoundError, KeyError, ValueError):
         pass
-    return target_dir / "release" / "fuzz_rapidgzip"
+    return target_dir / "release" / name
 
 CARGO_TOML = """\
 # Detached from the parent /project workspace: this crate lives inside the
@@ -63,9 +74,62 @@ publish = false
 name = "fuzz_rapidgzip"
 path = "src/main.rs"
 
+[[bin]]
+name = "fuzz_fastq"
+path = "src/fastq.rs"
+
 [dependencies]
 afl = "*"
 rusty-rapidgzip = { path = "../crates/rusty-rapidgzip" }
+"""
+
+FASTQ_RS = """\
+//! Fuzz target for the FASTQ columnar split (the `read_gz_into_fastq` record
+//! parser, reached via the `fastq_split_for_test` hook so we feed the
+//! decompressed stream directly, chopped into arbitrary chunks).
+//!
+//! Oracle: **chunk-boundary independence**. The columns must be byte-identical
+//! no matter where the stream was split — whole, an irregular data-driven
+//! chunking, and (for small inputs) byte-by-byte, which forces the
+//! partial-record carry-stitch at every position. Any divergence — in the
+//! columns OR in the Ok/Err status — is a real stitcher bug, not just a panic.
+
+use rusty_rapidgzip::{fastq_split_for_test as split, Error};
+
+type Cols = (Vec<u8>, Vec<u8>, Vec<u8>);
+
+/// Irregular chunking with sizes driven by the data bytes (1..=17).
+fn derive(data: &[u8]) -> Vec<&[u8]> {
+    let mut v = Vec::new();
+    let mut i = 0;
+    while i < data.len() {
+        let step = 1 + (data[i] as usize % 17);
+        let end = (i + step).min(data.len());
+        v.push(&data[i..end]);
+        i = end;
+    }
+    v
+}
+
+fn agree(a: &Result<Cols, Error>, b: &Result<Cols, Error>, label: &str) {
+    match (a, b) {
+        (Ok(x), Ok(y)) => assert_eq!(x, y, "columns differ between chunkings: {label}"),
+        (Err(_), Err(_)) => {}
+        _ => panic!("Ok/Err status depends on chunk boundaries: {label}"),
+    }
+}
+
+fn main() {
+    afl::fuzz!(|data: &[u8]| {
+        let whole = split(&[data]);
+        agree(&whole, &split(&derive(data)), "irregular");
+        if data.len() <= 4096 {
+            let bb: Vec<&[u8]> = data.chunks(1).collect();
+            let bb = if bb.is_empty() { vec![&data[..]] } else { bb };
+            agree(&whole, &split(&bb), "byte-by-byte");
+        }
+    });
+}
 """
 
 MAIN_RS = """\
@@ -108,6 +172,7 @@ def ensure_crate():
     # Always rewrite the generated sources so edits here take effect on rebuild.
     (FUZZ_DIR / "Cargo.toml").write_text(CARGO_TOML)
     (src / "main.rs").write_text(MAIN_RS)
+    (src / "fastq.rs").write_text(FASTQ_RS)
 
 
 def _seed_from(glob_dirs, pattern, limit=200_000):
@@ -179,6 +244,49 @@ def run():
     )
 
 
+def seed_fastq_corpus():
+    """Seed the FASTQ-split corpus with small valid FASTQ files. Mutations of
+    valid FASTQ are what reach the interesting carry-stitch happy path; without
+    them raw AFL bytes almost always fail validation immediately."""
+    FASTQ_CORPUS_DIR.mkdir(parents=True, exist_ok=True)
+    seeds = {
+        "basic.fq": b"@r1 desc\nACGT\n+\nIIII\n@r2\nGGGG\n+\n####\n",
+        # quality lines that start with '@' / contain '+' — the ambiguity trap.
+        "ambiguous_qual.fq": b"@a\nACGT\n+\n@!+I\n@b\nTTTT\n+\n+@?J\n",
+        "varlen.fq": b"@a\nA\n+\nI\n@b\nACGTACGT\n+\nIIIIIIII\n@c\nACG\n+\nJJJ\n",
+        "crlf.fq": b"@a\r\nAC\r\n+\r\nII\r\n@b\r\nGT\r\n+\r\n##\r\n",
+        "no_final_nl.fq": b"@a\nAC\n+\nII\n@b\nGT\n+\n##",
+    }
+    copied = 0
+    for name, body in seeds.items():
+        dst = FASTQ_CORPUS_DIR / name
+        if not dst.exists():
+            dst.write_bytes(body)
+            copied += 1
+    print(f"[*] Seeded FASTQ corpus: {copied} new seed(s) -> {FASTQ_CORPUS_DIR}")
+
+
+def run_fastq():
+    binary = binary_path("fuzz_fastq")
+    if not binary.exists():
+        build()
+    seed_fastq_corpus()
+    FASTQ_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"[*] Corpus : {FASTQ_CORPUS_DIR}")
+    print(f"[*] Output : {FASTQ_OUTPUT_DIR}")
+    print(f"[*] Binary : {binary}")
+    print()
+    subprocess.check_call(
+        [
+            "cargo", "afl", "fuzz",
+            "-i", str(FASTQ_CORPUS_DIR),
+            "-o", str(FASTQ_OUTPUT_DIR),
+            "-m", "none",
+            str(binary),
+        ],
+    )
+
+
 def minimize():
     queue = OUTPUT_DIR / "default" / "queue"
     if not queue.exists():
@@ -241,6 +349,7 @@ def main():
     commands = {
         "build": build,
         "run": run,
+        "fastq": run_fastq,
         "minimize": minimize,
         "crash": replay_crashes,
     }
