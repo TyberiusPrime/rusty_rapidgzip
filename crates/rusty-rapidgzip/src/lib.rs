@@ -401,10 +401,10 @@ fn collect(
         let plus = b[src(2)].take().expect("rotation is a permutation");
         let quals = b[src(3)].take().expect("rotation is a permutation");
 
-        if !names.is_empty() && names.get(0).first() != Some(&b'@') {
+        if !names.is_empty() && !names.iter().all(|name| name.first() == Some(&b'@')) {
             return Err(Error::Fastq("header line does not start with '@'".to_string()));
         }
-        if !plus.is_empty() && plus.get(0).first() != Some(&b'+') {
+        if !plus.is_empty() && !plus.iter().all(|plus| plus.first() == Some(&b'+')) {
             return Err(Error::Fastq("separator line does not start with '+'".to_string()));
         }
         names.cut_start(1); // drop the leading '@' from every header, O(1)
