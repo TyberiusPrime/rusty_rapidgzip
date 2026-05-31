@@ -380,6 +380,7 @@ impl DualStringPodAliasBuilder {
                 positions: self.positions,
                 head_skip: 0,
                 tail_skip: 0,
+                front_skip: 0,
             },
         }
     }

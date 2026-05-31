@@ -362,6 +362,7 @@ fn demux_chunk(idx: u64, data: &[u8], prev_tail: &[u8]) -> DemuxResult {
     let mut lines: u64 = 1; // the boundary line, completed by `first_nl`
     let mut local: usize = 0;
     let mut start = first_nl + 1;
+    //TODO: Check if this get's any real world performance boost from memchr crate
     while let Some(rel) = data[start..].iter().position(|&c| c == b'\n') {
         let nl = start + rel;
         push_line(&mut builders[local & 3], est, strip_cr(&data[start..nl]));
@@ -371,14 +372,138 @@ fn demux_chunk(idx: u64, data: &[u8], prev_tail: &[u8]) -> DemuxResult {
     }
     // data[start..] is this chunk's trailing partial line — carried by Stage A.
 
-    let buckets = builders.map(|b| b.map(StringPodBuilder::finish).unwrap_or_else(StringPod::empty));
+    // Reserve a little slack on every bucket so the collector's per-boundary
+    // appends (≤3 lines completing a straddling record) land in place instead
+    // of reallocating these (potentially multi-MB) buffers.
+    let buckets = builders.map(|b| {
+        let mut pod = b.map(StringPodBuilder::finish).unwrap_or_else(StringPod::empty);
+        pod.reserve_for_appends(4);
+        pod
+    });
     DemuxResult { idx, buckets, lines }
 }
 
-/// Reorder demux results by chunk index, rotate each chunk's four buckets onto
-/// roles using the running global line count, strip the `@`, validate `@`/`+`,
-/// and emit a [`FastqChunk`] per chunk. Finally emit any unterminated trailing
-/// line. Runs serially in stream order.
+/// Role-indexed columns for one chunk: `[name, seq, plus, qual]` (role = line
+/// index mod 4). The collector keeps the previous chunk's `Cols` as `held`
+/// until the next chunk supplies the lines completing its trailing record.
+type Cols = [StringPod; 4];
+
+/// Validate and emit one chunk of *whole* records. `cols` must already hold
+/// equal-length, record-aligned columns (the collector guarantees this). The
+/// `+` separator is validated and dropped; the leading `@` is stripped O(1).
+fn emit_records(cols: Cols, emit: &mut impl FnMut(FastqChunk)) -> Result<(), Error> {
+    let [mut names, seqs, plus, quals] = cols;
+    debug_assert_eq!(names.len(), seqs.len());
+    debug_assert_eq!(seqs.len(), quals.len());
+
+    if names.is_empty() {
+        return Ok(()); // nothing to emit
+    }
+    if !names.iter().all(|name| name.first() == Some(&b'@')) {
+        return Err(Error::Fastq("header line does not start with '@'".to_string()));
+    }
+    if !plus.is_empty() && !plus.iter().all(|p| p.first() == Some(&b'+')) {
+        return Err(Error::Fastq("separator line does not start with '+'".to_string()));
+    }
+    for i in 0..seqs.len() {
+        if seqs.entry_len(i) != quals.entry_len(i) {
+            return Err(Error::Fastq("sequence/quality length mismatch".to_string()));
+        }
+    }
+    names.cut_start(1); // drop the leading '@' from every header, O(1)
+    emit(FastqChunk { names, seqs, quals });
+    Ok(())
+}
+
+/// Absorb one in-order chunk. The demux buckets are rotated onto roles using
+/// the running phase (`global_lines % 4`), then merged into `held` via the
+/// "complete the previous chunk's straddling record from this chunk's head"
+/// scheme: any record that begins in `held` but spills into this chunk is
+/// finished by appending this chunk's leading lines onto `held` (≤3 tiny line
+/// copies), and those same lines are front-skipped off this chunk. `held` then
+/// holds only whole records and is emitted; this chunk (record-aligned at its
+/// head) becomes the new `held`.
+fn absorb(
+    res: DemuxResult,
+    held: &mut Option<Cols>,
+    global_lines: &mut u64,
+    emit: &mut impl FnMut(FastqChunk),
+) -> Result<(), Error> {
+    let phase = (*global_lines % 4) as usize; // = held's trailing-record line count
+    let g = phase as i64;
+    // role r is held by bucket b where (g + 1 + b) % 4 == r.
+    let src = |r: i64| ((r - g - 1).rem_euclid(4)) as usize;
+    let mut b: [Option<StringPod>; 4] = res.buckets.map(Some);
+    let mut cur: Cols = [
+        b[src(0)].take().expect("rotation is a permutation"),
+        b[src(1)].take().expect("rotation is a permutation"),
+        b[src(2)].take().expect("rotation is a permutation"),
+        b[src(3)].take().expect("rotation is a permutation"),
+    ];
+    let avail = res.lines as usize;
+    *global_lines += res.lines;
+
+    match held.take() {
+        None => {
+            // Only reachable at a record boundary (phase 0): this chunk starts a
+            // fresh record run.
+            debug_assert_eq!(phase, 0);
+            *held = Some(cur);
+        }
+        Some(mut h) => {
+            let need = (4 - phase) % 4; // lines to finish held's trailing record
+            let take = need.min(avail);
+            for role in phase..phase + take {
+                // role ∈ [phase, 4): the straddling record's missing lines, in
+                // order, at the head of `cur`. Move them onto `held`.
+                let line = cur[role].get(0).to_vec();
+                h[role].push(&line);
+                cur[role].pop_front(1);
+            }
+            if take == need {
+                // held's trailing record is complete → flush it.
+                emit_records(h, emit)?;
+                // `cur` (front-skipped past the lines we consumed) now starts at
+                // a record boundary; it becomes the next `held`.
+                *held = if avail - take > 0 { Some(cur) } else { None };
+            } else {
+                // Consumed all of `cur` without completing the record (tiny
+                // chunk straddling >2 chunks); keep accumulating into `held`.
+                *held = Some(h);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Flush at end of stream: fold the file's final unterminated line (if any,
+/// from `tail_rx` / the leftover carry) onto `held`, then emit the remaining
+/// whole records. Any trailing incomplete record (truncated input) is dropped.
+fn finish_eof(
+    held: Option<Cols>,
+    carry: &[u8],
+    global_lines: u64,
+    emit: &mut impl FnMut(FastqChunk),
+) -> Result<(), Error> {
+    let Some(mut h) = held else {
+        // No records seen at all — at most a lone partial line; nothing to emit.
+        return Ok(());
+    };
+    if !carry.is_empty() {
+        let role = (global_lines % 4) as usize;
+        h[role].push(strip_cr(carry));
+    }
+    // Keep only whole records (drops a truncated trailing record, if present).
+    let complete = h[0].len().min(h[1].len()).min(h[3].len());
+    for col in &mut h {
+        col.truncate(complete);
+    }
+    emit_records(h, emit)
+}
+
+/// Reorder demux results by chunk index and run the serial record-alignment
+/// (`absorb` / `finish_eof`), emitting a record-aligned [`FastqChunk`] per
+/// input chunk. Runs serially in stream order.
 fn collect(
     done_rx: Receiver<DemuxResult>,
     tail_rx: Receiver<Vec<u8>>,
@@ -387,71 +512,69 @@ fn collect(
     use std::collections::BTreeMap;
     let mut reorder: BTreeMap<u64, DemuxResult> = BTreeMap::new();
     let mut next: u64 = 0;
-    // Global count of lines completed so far; `g = global_lines % 4` is the
-    // role of each chunk's boundary line, and bucket `b` holds role `(g+1+b)%4`.
     let mut global_lines: u64 = 0;
-
-    let handle = |res: DemuxResult, global_lines: &mut u64| -> Result<(), Error> {
-        let g = (*global_lines % 4) as i64;
-        // role r is held by bucket `b` where (g + 1 + b) % 4 == r.
-        let src = |r: i64| ((r - g - 1).rem_euclid(4)) as usize;
-        let mut b: [Option<StringPod>; 4] = res.buckets.map(Some);
-        let mut names = b[src(0)].take().expect("rotation is a permutation");
-        let seqs = b[src(1)].take().expect("rotation is a permutation");
-        let plus = b[src(2)].take().expect("rotation is a permutation");
-        let quals = b[src(3)].take().expect("rotation is a permutation");
-
-        if !names.is_empty() && !names.iter().all(|name| name.first() == Some(&b'@')) {
-            return Err(Error::Fastq("header line does not start with '@'".to_string()));
-        }
-        if !plus.is_empty() && !plus.iter().all(|plus| plus.first() == Some(&b'+')) {
-            return Err(Error::Fastq("separator line does not start with '+'".to_string()));
-        }
-        names.cut_start(1); // drop the leading '@' from every header, O(1)
-
-        *global_lines += res.lines;
-        let _ = sink.send(FastqChunk { names, seqs, quals });
-        Ok(())
+    let mut held: Option<Cols> = None;
+    let mut emit = |chunk: FastqChunk| {
+        let _ = sink.send(chunk);
     };
 
     for res in done_rx {
         reorder.insert(res.idx, res);
         while let Some(res) = reorder.remove(&next) {
-            handle(res, &mut global_lines)?;
+            absorb(res, &mut held, &mut global_lines, &mut emit)?;
             next += 1;
         }
     }
     // Any stragglers (shouldn't happen once done_rx is closed, but be safe).
     while let Some(res) = reorder.remove(&next) {
-        handle(res, &mut global_lines)?;
+        absorb(res, &mut held, &mut global_lines, &mut emit)?;
         next += 1;
     }
 
-    // Trailing unterminated line, if the file lacked a final newline.
-    if let Ok(carry) = tail_rx.recv() {
-        if !carry.is_empty() {
-            let line = strip_cr(&carry);
-            let mut pb = StringPodBuilder::with_capacity(line.len(), 1);
-            pb.push(line);
-            let pod = pb.finish();
-            let empty = StringPod::empty;
-            let chunk = match (global_lines % 4) as usize {
-                0 => {
-                    if pod.get(0).first() != Some(&b'@') {
-                        return Err(Error::Fastq("trailing header does not start with '@'".to_string()));
-                    }
-                    let mut names = pod;
-                    names.cut_start(1);
-                    Some(FastqChunk { names, seqs: empty(), quals: empty() })
-                }
-                1 => Some(FastqChunk { names: empty(), seqs: pod, quals: empty() }),
-                3 => Some(FastqChunk { names: empty(), seqs: empty(), quals: pod }),
-                _ => None, // a stray '+' separator — drop
-            };
-            if let Some(chunk) = chunk {
-                let _ = sink.send(chunk);
+    let carry = tail_rx.recv().unwrap_or_default();
+    finish_eof(held, &carry, global_lines, &mut emit)
+}
+
+/// Test hook: run the full demux + record-alignment over an explicit sequence
+/// of decode chunks (no gzip, no threads) and return the concatenated
+/// `(names, seqs, quals)` columns, each entry newline-terminated. Lets
+/// `tests/fastq.rs` assert chunk-boundary independence and the complete-records
+/// invariant directly against the real `absorb` / `finish_eof` logic.
+#[doc(hidden)]
+pub fn fastq_split_for_test(chunks: &[&[u8]]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), Error> {
+    let (mut names, mut seqs, mut quals) = (Vec::new(), Vec::new(), Vec::new());
+    let mut emit = |c: FastqChunk| {
+        for x in c.names.iter() {
+            names.extend_from_slice(x);
+            names.push(b'\n');
+        }
+        for x in c.seqs.iter() {
+            seqs.extend_from_slice(x);
+            seqs.push(b'\n');
+        }
+        for x in c.quals.iter() {
+            quals.extend_from_slice(x);
+            quals.push(b'\n');
+        }
+    };
+
+    let mut held: Option<Cols> = None;
+    let mut global_lines: u64 = 0;
+    let mut carry: Vec<u8> = Vec::new();
+    let mut idx: u64 = 0;
+    for chunk in chunks {
+        match rposition_nl(chunk) {
+            Some(last_nl) => {
+                let next_carry = chunk[last_nl + 1..].to_vec();
+                let prev_tail = std::mem::take(&mut carry);
+                let res = demux_chunk(idx, chunk, &prev_tail);
+                absorb(res, &mut held, &mut global_lines, &mut emit)?;
+                idx += 1;
+                carry = next_carry;
             }
+            None => carry.extend_from_slice(chunk),
         }
     }
-    Ok(())
+    finish_eof(held, &carry, global_lines, &mut emit)?;
+    Ok((names, seqs, quals))
 }

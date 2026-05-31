@@ -95,6 +95,66 @@ impl StringPod {
         self.storage.drain(range);
     }
 
+    /// Append one entry to a *finished* pod, mirroring builder semantics
+    /// (stride-fast-path with auto-promotion). The bytes are copied into the
+    /// buffer's tail.
+    ///
+    /// Requires unique ownership of the byte buffer — call before the pod is
+    /// shared (cloned / sent). Relies on reserved slack (see
+    /// [`reserve_for_appends`](Self::reserve_for_appends)) to avoid
+    /// reallocating a large buffer.
+    ///
+    /// # Panics
+    /// If the buffer is shared (`Arc` strong count > 1).
+    pub fn push(&mut self, bytes: &[u8]) {
+        let data = Arc::get_mut(&mut self.data)
+            .expect("StringPod::push requires a uniquely-owned buffer");
+        if let Some(stride) = self.storage.current_stride() {
+            if bytes.len() as u64 == u64::from(stride) {
+                data.extend_from_slice(bytes);
+                self.storage.builder_push_strided();
+                return;
+            }
+        }
+        let start = u32::try_from(data.len()).expect("byte buffer exceeds u32::MAX");
+        let stop =
+            u32::try_from(data.len() + bytes.len()).expect("byte buffer exceeds u32::MAX");
+        data.extend_from_slice(bytes);
+        self.storage.builder_push_position(start, stop);
+    }
+
+    /// Drop the first `n` entries from the view. O(1): a byte offset on
+    /// `FixedLength`, an entry-index skip on `Variable`. No bytes move.
+    pub fn pop_front(&mut self, n: usize) {
+        self.storage.pop_front(u32::try_from(n).unwrap_or(u32::MAX));
+    }
+
+    /// Truncate the view to at most `len` entries (drops from the back). O(1).
+    pub fn truncate(&mut self, len: usize) {
+        self.storage.truncate(len);
+    }
+
+    /// Ensure the buffer has spare capacity for roughly `n` more average-sized
+    /// entries, so subsequent [`push`](Self::push) calls land in place instead
+    /// of reallocating a (possibly multi-MB) shared buffer. No-op if the buffer
+    /// is already shared.
+    pub fn reserve_for_appends(&mut self, n: usize) {
+        let per = match self.storage.current_stride() {
+            Some(stride) => stride as usize,
+            None => {
+                let len = self.len();
+                if len == 0 {
+                    64
+                } else {
+                    (self.data.len() / len).max(1)
+                }
+            }
+        };
+        if let Some(data) = Arc::get_mut(&mut self.data) {
+            data.reserve(n.saturating_mul(per.max(1)));
+        }
+    }
+
     /// Iterate visible entries as `&BStr` in order.
     #[must_use]
     pub fn iter(&self) -> Iter<'_> {
@@ -306,6 +366,7 @@ impl StringPodAliasBuilder {
                 positions: self.positions,
                 head_skip: 0,
                 tail_skip: 0,
+                front_skip: 0,
             },
         }
     }
