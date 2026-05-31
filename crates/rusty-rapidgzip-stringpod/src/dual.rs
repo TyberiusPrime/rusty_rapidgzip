@@ -2,7 +2,37 @@ use bstr::BStr;
 use std::ops::Range;
 use std::sync::Arc;
 
+use crate::single::StringPod;
 use crate::storage::Storage;
+
+/// Error returned by [`DualStringPod::from_columns`] when the two columns do
+/// not share the per-entry length invariant a [`DualStringPod`] requires — i.e.
+/// some entry's sequence and quality strings have different lengths, or the
+/// columns have different entry counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColumnLengthMismatch {
+    /// Entry index at which the lengths diverged. For a column-count mismatch
+    /// this is the shorter column's entry count.
+    pub index: usize,
+    /// Sequence-side length: the entry's byte length, or — for a count
+    /// mismatch — the sequence column's entry count.
+    pub seq_len: usize,
+    /// Quality-side length: the entry's byte length, or — for a count
+    /// mismatch — the quality column's entry count.
+    pub qual_len: usize,
+}
+
+impl std::fmt::Display for ColumnLengthMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "sequence/quality length mismatch at entry {}: seq {} != qual {}",
+            self.index, self.seq_len, self.qual_len
+        )
+    }
+}
+
+impl std::error::Error for ColumnLengthMismatch {}
 
 /// Two parallel byte columns (e.g. sequence + quality) sharing a single
 /// metadata layout. The shared metadata makes the per-entry length invariant
@@ -22,6 +52,74 @@ impl DualStringPod {
     #[must_use]
     pub fn empty() -> Self {
         DualStringPodBuilder::with_capacity(0, 0).finish()
+    }
+
+    /// Fuse two equal-layout columns (e.g. FASTQ sequence + quality) into a
+    /// single dual pod **without copying any bytes**: both byte buffers are
+    /// moved in as-is and the shared per-entry metadata is taken from `seq`.
+    ///
+    /// This is the zero-copy bridge from a columnar split that builds `seq` and
+    /// `qual` as independent [`StringPod`]s to the structural
+    /// `seq[i].len() == qual[i].len()` invariant a [`DualStringPod`] enforces.
+    ///
+    /// The two columns must have the same entry count and, for every entry, the
+    /// same length. When they also share an identical byte *layout* (same
+    /// offsets, not just lengths) the fusion is genuinely zero-copy — both
+    /// buffers are moved in as-is and `seq`'s metadata indexes both. That holds
+    /// in the common case (a single member with no cross-boundary stitching).
+    /// When the layouts diverge (equal lengths but different buffer offsets, as
+    /// happens when records are stitched across decode-chunk or gzip-member
+    /// boundaries) the columns are rebuilt into one shared contiguous layout —
+    /// a single copy of each column.
+    ///
+    /// # Errors
+    /// Returns [`ColumnLengthMismatch`] at the first entry whose sequence and
+    /// quality lengths differ (or if the columns have different entry counts) —
+    /// i.e. malformed FASTQ where a quality string is not the same length as
+    /// its read.
+    pub fn from_columns(seq: StringPod, qual: StringPod) -> Result<Self, ColumnLengthMismatch> {
+        if seq.len() != qual.len() {
+            return Err(ColumnLengthMismatch {
+                index: seq.len().min(qual.len()),
+                seq_len: seq.len(),
+                qual_len: qual.len(),
+            });
+        }
+        // Validate the per-entry length invariant and, in the same pass, learn
+        // whether the two columns already share an identical byte layout.
+        let mut same_layout = true;
+        for i in 0..seq.len() {
+            let sr = seq.storage.entry_range(i);
+            let qr = qual.storage.entry_range(i);
+            if (sr.end - sr.start) != (qr.end - qr.start) {
+                return Err(ColumnLengthMismatch {
+                    index: i,
+                    seq_len: sr.end - sr.start,
+                    qual_len: qr.end - qr.start,
+                });
+            }
+            if sr != qr {
+                same_layout = false;
+            }
+        }
+
+        if same_layout {
+            // Zero-copy: both buffers are indexed identically, so reuse them and
+            // share `seq`'s metadata.
+            Ok(DualStringPod {
+                seq: seq.data,
+                qual: qual.data,
+                storage: seq.storage,
+            })
+        } else {
+            // Equal lengths but divergent offsets — rebuild into one shared
+            // contiguous layout (one copy of each column).
+            let mut b = DualStringPodBuilder::with_capacity(0, seq.len());
+            for i in 0..seq.len() {
+                b.push(seq.get(i), qual.get(i));
+            }
+            Ok(b.finish())
+        }
     }
 
     #[must_use]
@@ -602,5 +700,65 @@ mod tests {
         let p = bld.finish();
         let s = format!("{p:?}");
         assert!(s.contains("DualStringPod"));
+    }
+
+    // ── from_columns ──────────────────────────────────────────────────────
+
+    use crate::single::{StringPod, StringPodBuilder};
+
+    fn seq_pod(entries: &[&str]) -> StringPod {
+        let mut bld = StringPodBuilder::with_capacity(0, entries.len());
+        for e in entries {
+            bld.push(b(e));
+        }
+        bld.finish()
+    }
+
+    #[test]
+    fn from_columns_zero_copy_fixed() {
+        let seq = seq_pod(&["ACGT", "TTTT", "GGGG"]);
+        let qual = seq_pod(&["IIII", "FFFF", "####"]);
+        // Buffers we expect to be reused (no copy) — capture the pointers.
+        let seq_ptr = seq.data.as_ptr();
+        let qual_ptr = qual.data.as_ptr();
+        let dual = DualStringPod::from_columns(seq, qual).unwrap();
+        assert_eq!(dual.len(), 3);
+        assert_eq!(dual.seq(0), BStr::new("ACGT"));
+        assert_eq!(dual.qual(0), BStr::new("IIII"));
+        assert_eq!(dual.seq(2), BStr::new("GGGG"));
+        assert_eq!(dual.qual(2), BStr::new("####"));
+        // Zero-copy: the dual pod's buffers are the very same allocations.
+        assert_eq!(dual.seq.as_ptr(), seq_ptr);
+        assert_eq!(dual.qual.as_ptr(), qual_ptr);
+    }
+
+    #[test]
+    fn from_columns_variable_lengths() {
+        let seq = seq_pod(&["A", "ACGTACGT", "ACG"]);
+        let qual = seq_pod(&["I", "FFFFFFFF", "JJJ"]);
+        let dual = DualStringPod::from_columns(seq, qual).unwrap();
+        let pairs: Vec<(&BStr, &BStr)> = dual.iter().collect();
+        assert_eq!(pairs[1].0, BStr::new("ACGTACGT"));
+        assert_eq!(pairs[1].1, BStr::new("FFFFFFFF"));
+    }
+
+    #[test]
+    fn from_columns_entry_length_mismatch_errors() {
+        let seq = seq_pod(&["ACGT", "TT"]);
+        let qual = seq_pod(&["IIII", "F"]); // entry 1: 2 != 1
+        let err = DualStringPod::from_columns(seq, qual).unwrap_err();
+        assert_eq!(err.index, 1);
+        assert_eq!(err.seq_len, 2);
+        assert_eq!(err.qual_len, 1);
+        assert!(err.to_string().contains("length mismatch"));
+    }
+
+    #[test]
+    fn from_columns_count_mismatch_errors() {
+        let seq = seq_pod(&["ACGT", "TTTT"]);
+        let qual = seq_pod(&["IIII"]);
+        let err = DualStringPod::from_columns(seq, qual).unwrap_err();
+        assert_eq!(err.seq_len, 2);
+        assert_eq!(err.qual_len, 1);
     }
 }

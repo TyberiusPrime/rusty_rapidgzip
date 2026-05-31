@@ -26,7 +26,7 @@ use thiserror::Error;
 
 use pipeline::InputBytes;
 
-use fastqrab_stringpod::{StringPod, StringPodBuilder};
+use fastqrab_stringpod::{DualStringPod, StringPod, StringPodBuilder};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -170,22 +170,24 @@ pub fn read_gz(
 
 /// One decode chunk's worth of FASTQ, split into per-role columns.
 ///
-/// Each column is an independent [`StringPod`]: `names` (header lines with the
-/// leading `@` stripped via an O(1) `cut_start`), `seqs`, and `quals`. The
-/// separator (`+`) line is validated and dropped. A column is
-/// `Storage::FixedLength` when every entry in *this* emission shares a length
-/// (the common fixed-read-length case) and `Variable` otherwise — the pod
-/// builders start fixed on the first line's length and auto-promote on the
+/// `names` is a [`StringPod`] of header lines with the leading `@` stripped via
+/// an O(1) `cut_start`. `reads` is a [`DualStringPod`] fusing the sequence and
+/// quality columns: because every record satisfies `seq.len() == qual.len()`,
+/// the two share a single metadata column and the invariant is structural
+/// rather than re-checked downstream. The separator (`+`) line is validated and
+/// dropped.
+///
+/// A column is `Storage::FixedLength` when every entry in *this* emission shares
+/// a length (the common fixed-read-length case) and `Variable` otherwise — the
+/// pod builders start fixed on the first line's length and auto-promote on the
 /// first mismatch.
 ///
-/// Per-emission the three column lengths may differ by one (the record line
-/// straddling a chunk boundary lands in a single column), but across the whole
-/// stream each column receives exactly one entry per record, in order.
+/// Across the whole stream each column receives exactly one entry per record, in
+/// order; every emitted chunk is record-aligned (`names.len() == reads.len()`).
 #[derive(Debug)]
 pub struct FastqChunk {
     pub names: StringPod,
-    pub seqs: StringPod,
-    pub quals: StringPod,
+    pub reads: DualStringPod,
 }
 
 /// A decode chunk handed to a demux worker, with the trailing partial line of
@@ -405,13 +407,14 @@ fn emit_records(cols: Cols, emit: &mut impl FnMut(FastqChunk)) -> Result<(), Err
     if !plus.is_empty() && !plus.iter().all(|p| p.first() == Some(&b'+')) {
         return Err(Error::Fastq("separator line does not start with '+'".to_string()));
     }
-    for i in 0..seqs.len() {
-        if seqs.entry_len(i) != quals.entry_len(i) {
-            return Err(Error::Fastq("sequence/quality length mismatch".to_string()));
-        }
-    }
+    // Sequence and quality share the FASTQ per-entry length invariant, so fuse
+    // them into a single DualStringPod (zero-copy — both byte buffers move in
+    // as-is). `from_columns` verifies seq.len() == qual.len() for every record
+    // and surfaces a mismatch as an error rather than emitting a malformed
+    // chunk.
+    let reads = DualStringPod::from_columns(seqs, quals).map_err(|m| Error::Fastq(m.to_string()))?;
     names.cut_start(1); // drop the leading '@' from every header, O(1)
-    emit(FastqChunk { names, seqs, quals });
+    emit(FastqChunk { names, reads });
     Ok(())
 }
 
@@ -548,11 +551,11 @@ pub fn fastq_split_for_test(chunks: &[&[u8]]) -> Result<(Vec<u8>, Vec<u8>, Vec<u
             names.extend_from_slice(x);
             names.push(b'\n');
         }
-        for x in c.seqs.iter() {
+        for x in c.reads.iter_seq() {
             seqs.extend_from_slice(x);
             seqs.push(b'\n');
         }
-        for x in c.quals.iter() {
+        for x in c.reads.iter_qual() {
             quals.extend_from_slice(x);
             quals.push(b'\n');
         }

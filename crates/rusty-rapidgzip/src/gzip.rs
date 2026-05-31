@@ -378,39 +378,97 @@ mod tests {
             .join("tests/corpus")
     }
 
-    /// Decode every fixture and compare sha256 to the recorded sidecar.
-    /// Falls through silently if no corpus is present.
+    /// Decode every present corpus fixture via the serial byte-slice
+    /// `decode_all` path and compare its sha256 to the value recorded in
+    /// `reference_sums.json`. Skips cleanly when the config or the fixtures are
+    /// absent; skips large fixtures unless `RAPIDGZIP_FULL_CORPUS` is set.
     #[test]
     fn corpus_roundtrip() {
         let dir = corpus_dir();
-        let Ok(rd) = fs::read_dir(&dir) else {
-            eprintln!("no corpus at {} — skipping", dir.display());
+        let Ok(json) = fs::read_to_string(dir.join("reference_sums.json")) else {
+            eprintln!("no reference_sums.json at {} — skipping", dir.display());
             return;
         };
+        let entries = parse_reference_sums(&json);
+        assert!(!entries.is_empty(), "reference_sums.json parsed to zero entries");
+
+        let full = std::env::var_os("RAPIDGZIP_FULL_CORPUS").is_some();
         let mut checked = 0;
-        for entry in rd.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("gz") {
+        for (file, expected, gz_size) in entries {
+            let path = dir.join(&file);
+            if !path.exists() {
                 continue;
             }
-            let Ok(expected) =
-                fs::read_to_string(path.with_extension("gz.sha256"))
-            else {
+            if !full && gz_size > 200 * 1024 * 1024 {
+                eprintln!("skip (large; set RAPIDGZIP_FULL_CORPUS=1) {file}");
                 continue;
-            };
-            let expected = expected.trim();
-
+            }
             let bytes = fs::read(&path).expect("read fixture");
             let mut out = Vec::new();
-            decode_all(&bytes, &mut out)
-                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            decode_all(&bytes, &mut out).unwrap_or_else(|e| panic!("{file}: {e}"));
             let mut h = Sha256::new();
             h.update(&out);
             let got = hex::encode(h.finalize());
-            assert_eq!(got, expected, "{}: sha256 mismatch", path.display());
+            assert_eq!(got, expected, "{file}: sha256 mismatch");
             checked += 1;
-            eprintln!("ok  {}", path.display());
+            eprintln!("ok  {file}");
         }
-        assert!(checked > 0, "corpus directory is empty");
+        if checked == 0 {
+            eprintln!("no corpus fixtures present — fine for a fresh checkout");
+        }
+    }
+
+    /// Minimal dependency-free reader for `reference_sums.json`, returning
+    /// `(file, sha256, gz_size)` per entry. Mirrors the parser in the
+    /// `golden_hash` integration test (kept local to avoid a shared test crate).
+    fn parse_reference_sums(json: &str) -> Vec<(String, String, u64)> {
+        fn object_key_ending_gz(line: &str) -> Option<String> {
+            let line = line.trim();
+            let rest = line.strip_prefix('"')?;
+            let end = rest.find('"')?;
+            let key = &rest[..end];
+            if !key.ends_with(".gz") {
+                return None;
+            }
+            let after = rest[end + 1..].trim_start();
+            let after = after.strip_prefix(':')?.trim_start();
+            after.starts_with('{').then(|| key.to_string())
+        }
+        fn string_field(line: &str, field: &str) -> Option<String> {
+            let line = line.trim();
+            let after = line.strip_prefix(&format!("\"{field}\""))?.trim_start();
+            let after = after.strip_prefix(':')?.trim_start();
+            let after = after.strip_prefix('"')?;
+            let end = after.find('"')?;
+            Some(after[..end].to_string())
+        }
+        fn number_field(line: &str, field: &str) -> Option<u64> {
+            let line = line.trim();
+            let after = line.strip_prefix(&format!("\"{field}\""))?.trim_start();
+            let after = after.strip_prefix(':')?.trim_start();
+            let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+            digits.parse().ok()
+        }
+
+        let mut out = Vec::new();
+        let (mut file, mut sha, mut size): (Option<String>, Option<String>, Option<u64>) =
+            (None, None, None);
+        for line in json.lines() {
+            if let Some(name) = object_key_ending_gz(line) {
+                if let (Some(f), Some(s)) = (file.take(), sha.take()) {
+                    out.push((f, s, size.take().unwrap_or(0)));
+                }
+                size = None;
+                file = Some(name);
+            } else if let Some(v) = string_field(line, "sha256") {
+                sha = Some(v);
+            } else if let Some(v) = number_field(line, "gz_size") {
+                size = Some(v);
+            }
+        }
+        if let (Some(f), Some(s)) = (file, sha) {
+            out.push((f, s, size.unwrap_or(0)));
+        }
+        out
     }
 }

@@ -176,12 +176,13 @@ fn end_to_end_read_gz_into_fastq() {
 
             let (mut n, mut s, mut q) = (Vec::new(), Vec::new(), Vec::new());
             for c in rx {
-                // Complete-records invariant: equal-length columns.
-                assert_eq!(c.names.len(), c.seqs.len());
-                assert_eq!(c.names.len(), c.quals.len());
+                // Complete-records invariant: equal-length columns. seq/qual
+                // share one metadata column in the DualStringPod, so their
+                // counts are structurally equal; assert names match too.
+                assert_eq!(c.names.len(), c.reads.len());
                 for x in c.names.iter() { n.extend_from_slice(x); n.push(b'\n'); }
-                for x in c.seqs.iter() { s.extend_from_slice(x); s.push(b'\n'); }
-                for x in c.quals.iter() { q.extend_from_slice(x); q.push(b'\n'); }
+                for x in c.reads.iter_seq() { s.extend_from_slice(x); s.push(b'\n'); }
+                for x in c.reads.iter_qual() { q.extend_from_slice(x); q.push(b'\n'); }
             }
             producer.join().unwrap().unwrap();
             assert_eq!(n, exp_n.as_bytes(), "names t={threads} cs={chunk_size}");

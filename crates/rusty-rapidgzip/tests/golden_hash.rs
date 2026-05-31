@@ -1,10 +1,14 @@
-//! Golden-hash test: for every `<name>.gz` in `tests/corpus/` with a
-//! sibling `<name>.gz.sha256`, decode via `read_gz` and compare sha256 of
+//! Golden-hash test: for every fixture listed in `tests/corpus/reference_sums.json`
+//! whose `.gz` file is present, decode via `read_gz` and compare the sha256 of
 //! the streamed-out bytes to the recorded ground truth.
 //!
-//! The corpus is built by `cargo run -p xtask -- build-corpus`. Tests skip
-//! cleanly if no corpus is present, so a fresh checkout doesn't fail CI just
-//! because nobody ran xtask yet.
+//! The reference sums live in a single JSON config (`reference_sums.json`),
+//! produced alongside the corpus by `cargo run -p xtask -- build-corpus`. Tests
+//! skip cleanly when the JSON or the fixtures are absent, so a fresh checkout
+//! doesn't fail CI just because nobody fetched the (large) corpus yet.
+//!
+//! Large fixtures are skipped by default to keep `cargo test` fast even when a
+//! full corpus is present on disk; set `RAPIDGZIP_FULL_CORPUS=1` to check them.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,25 +24,91 @@ fn corpus_dir() -> PathBuf {
         .join("tests/corpus")
 }
 
-fn fixtures() -> Vec<(PathBuf, String)> {
-    let dir = corpus_dir();
-    let Ok(rd) = fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for entry in rd.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("gz") {
-            continue;
-        }
-        let sha_path = path.with_extension("gz.sha256");
-        let Ok(expected) = fs::read_to_string(&sha_path) else {
-            continue;
-        };
-        out.push((path, expected.trim().to_string()));
+/// One fixture's recorded ground truth.
+#[derive(Debug, Clone)]
+struct RefEntry {
+    file: String,
+    sha256: String,
+    gz_size: u64,
+}
+
+// ── minimal, dependency-free JSON reader for `reference_sums.json` ──────────
+//
+// The file is machine-generated and regular:
+//
+//   {
+//     "<name>.gz": { "sha256": "<hex>", "raw_size": <n>, "gz_size": <n> },
+//     ...
+//   }
+//
+// so a line-oriented scan is sufficient and avoids pulling in a JSON crate.
+
+/// If `line` (already a config line) is a top-level `"<name>.gz": {` object key,
+/// return the file name.
+fn object_key_ending_gz(line: &str) -> Option<String> {
+    let line = line.trim();
+    let rest = line.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    let key = &rest[..end];
+    if !key.ends_with(".gz") {
+        return None;
     }
-    out.sort_by(|a, b| a.0.cmp(&b.0));
+    let after = rest[end + 1..].trim_start();
+    let after = after.strip_prefix(':')?.trim_start();
+    after.starts_with('{').then(|| key.to_string())
+}
+
+/// Extract a quoted string field, e.g. `"sha256": "abc"` → `Some("abc")`.
+fn string_field(line: &str, field: &str) -> Option<String> {
+    let line = line.trim();
+    let after = line.strip_prefix(&format!("\"{field}\""))?.trim_start();
+    let after = after.strip_prefix(':')?.trim_start();
+    let after = after.strip_prefix('"')?;
+    let end = after.find('"')?;
+    Some(after[..end].to_string())
+}
+
+/// Extract an unsigned integer field, e.g. `"gz_size": 20` → `Some(20)`.
+fn number_field(line: &str, field: &str) -> Option<u64> {
+    let line = line.trim();
+    let after = line.strip_prefix(&format!("\"{field}\""))?.trim_start();
+    let after = after.strip_prefix(':')?.trim_start();
+    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+fn parse_reference_sums(json: &str) -> Vec<RefEntry> {
+    let mut out = Vec::new();
+    let mut file: Option<String> = None;
+    let mut sha: Option<String> = None;
+    let mut size: Option<u64> = None;
+
+    let finalize = |file: &mut Option<String>, sha: &mut Option<String>, size: &mut Option<u64>, out: &mut Vec<RefEntry>| {
+        if let (Some(f), Some(s)) = (file.take(), sha.take()) {
+            out.push(RefEntry { file: f, sha256: s, gz_size: size.unwrap_or(0) });
+        }
+        *size = None;
+    };
+
+    for line in json.lines() {
+        if let Some(name) = object_key_ending_gz(line) {
+            finalize(&mut file, &mut sha, &mut size, &mut out);
+            file = Some(name);
+        } else if let Some(v) = string_field(line, "sha256") {
+            sha = Some(v);
+        } else if let Some(v) = number_field(line, "gz_size") {
+            size = Some(v);
+        }
+    }
+    finalize(&mut file, &mut sha, &mut size, &mut out);
+    out.sort_by(|a, b| a.file.cmp(&b.file));
     out
+}
+
+fn reference_entries() -> Option<Vec<RefEntry>> {
+    let path = corpus_dir().join("reference_sums.json");
+    let json = fs::read_to_string(&path).ok()?;
+    Some(parse_reference_sums(&json))
 }
 
 fn decode_and_hash(path: &Path) -> anyhow::Result<String> {
@@ -56,50 +126,79 @@ fn decode_and_hash(path: &Path) -> anyhow::Result<String> {
     Ok(hex::encode(h.finalize()))
 }
 
+/// Default ceiling on compressed fixture size; larger ones are skipped unless
+/// `RAPIDGZIP_FULL_CORPUS` is set.
+const MAX_DEFAULT_GZ: u64 = 200 * 1024 * 1024;
+
 #[test]
 fn golden_hash_all_corpus() {
-    let fixtures = fixtures();
-    if fixtures.is_empty() {
+    let dir = corpus_dir();
+    let Some(entries) = reference_entries() else {
         eprintln!(
-            "no corpus found at {} — run `cargo run -p xtask -- build-corpus`",
-            corpus_dir().display()
+            "no reference_sums.json at {} — run `cargo run -p xtask -- build-corpus`",
+            dir.join("reference_sums.json").display()
         );
         return;
-    }
+    };
+    assert!(
+        !entries.is_empty(),
+        "reference_sums.json parsed to zero entries — the parser or the file format changed"
+    );
 
+    let full = std::env::var_os("RAPIDGZIP_FULL_CORPUS").is_some();
+    let mut checked = 0usize;
+    let mut absent = 0usize;
+    let mut large = 0usize;
     let mut failures = Vec::new();
-    for (path, expected) in fixtures {
+
+    for e in entries {
+        let path = dir.join(&e.file);
+        if !path.exists() {
+            absent += 1;
+            continue;
+        }
+        if !full && e.gz_size > MAX_DEFAULT_GZ {
+            large += 1;
+            eprintln!("skip (large; set RAPIDGZIP_FULL_CORPUS=1) {}", e.file);
+            continue;
+        }
         match decode_and_hash(&path) {
-            Ok(actual) if actual == expected => {
-                eprintln!("ok  {}", path.display());
+            Ok(actual) if actual == e.sha256 => {
+                checked += 1;
+                eprintln!("ok  {}", e.file);
             }
-            Ok(actual) => {
-                failures.push(format!(
-                    "MISMATCH {}\n  expected {expected}\n  got      {actual}",
-                    path.display()
-                ));
-            }
-            Err(e) => {
-                failures.push(format!("ERROR {}: {e:#}", path.display()));
-            }
+            Ok(actual) => failures.push(format!(
+                "MISMATCH {}\n  expected {}\n  got      {actual}",
+                e.file, e.sha256
+            )),
+            Err(err) => failures.push(format!("ERROR {}: {err:#}", e.file)),
         }
     }
 
+    eprintln!("golden_hash: {checked} checked, {absent} absent, {large} large-skipped");
     if !failures.is_empty() {
-        panic!("{} fixtures failed:\n{}", failures.len(), failures.join("\n"));
+        panic!("{} fixture(s) failed:\n{}", failures.len(), failures.join("\n"));
+    }
+    if checked == 0 {
+        eprintln!("no corpus fixtures present to check — that's fine for a fresh checkout");
     }
 }
 
-/// Smoke test that doesn't depend on the decoder — just checks the harness
-/// itself wires up. Always runs.
+/// Harness self-check independent of the decoder: parse the config and verify
+/// every recorded sha256 is well-formed. Always runs (the config is committed).
 #[test]
-fn corpus_harness_self_check() {
-    let dir = corpus_dir();
-    if !dir.exists() {
-        eprintln!("no corpus dir — that's fine for a fresh checkout");
+fn corpus_config_self_check() {
+    let Some(entries) = reference_entries() else {
+        eprintln!("no reference_sums.json — fine for a fresh checkout");
         return;
-    }
-    for (path, expected) in fixtures() {
-        assert_eq!(expected.len(), 64, "{}: bad sha256 sidecar", path.display());
+    };
+    assert!(!entries.is_empty(), "reference_sums.json parsed to zero entries");
+    for e in &entries {
+        assert_eq!(e.sha256.len(), 64, "{}: bad sha256 length", e.file);
+        assert!(
+            e.sha256.bytes().all(|b| b.is_ascii_hexdigit()),
+            "{}: non-hex sha256",
+            e.file
+        );
     }
 }

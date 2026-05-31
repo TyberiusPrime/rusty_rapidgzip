@@ -66,12 +66,12 @@ fn main() -> Result<()> {
             name_w.write_all(b"\n")?;
             payload += name.len() as u64;
         }
-        for seq in chunk.seqs.iter() {
+        for seq in chunk.reads.iter_seq() {
             seq_w.write_all(seq)?;
             seq_w.write_all(b"\n")?;
             payload += seq.len() as u64;
         }
-        for qual in chunk.quals.iter() {
+        for qual in chunk.reads.iter_qual() {
             qual_w.write_all(qual)?;
             qual_w.write_all(b"\n")?;
             payload += qual.len() as u64;
