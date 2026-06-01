@@ -1,0 +1,7 @@
+error /home/finkernagel/upstream/fastqrab/rusty_rapidgzip/crates/rusty-rapidgzip-stringpod/src/lib.rs:30:5 unresolved import `dual::ColumnLengthMismatch`
+error /home/finkernagel/upstream/fastqrab/rusty_rapidgzip/crates/rusty-rapidgzip-stringpod/src/dual.rs:75:24 cannot find struct, variant or union type `ColumnLengthMismatch` in this scope
+error /home/finkernagel/upstream/fastqrab/rusty_rapidgzip/crates/rusty-rapidgzip-stringpod/src/dual.rs:114:36 cannot find struct, variant or union type `ColumnLengthMismatch` in this scope
+error /home/finkernagel/upstream/fastqrab/rusty_rapidgzip/crates/rusty-rapidgzip-stringpod/src/dual.rs:131:40 cannot find struct, variant or union type `ColumnLengthMismatch` in this scope
+error /home/finkernagel/upstream/fastqrab/rusty_rapidgzip/crates/rusty-rapidgzip-stringpod/src/dual.rs:144:48 cannot find struct, variant or union type `ColumnLengthMismatch` in this scope
+warning /home/finkernagel/upstream/fastqrab/rusty_rapidgzip/crates/rusty-rapidgzip-stringpod/src/dual.rs:157:9 unreachable expression
+warning /home/finkernagel/upstream/fastqrab/rusty_rapidgzip/crates/rusty-rapidgzip-stringpod/src/dual.rs:21:19 unused variable: `f`

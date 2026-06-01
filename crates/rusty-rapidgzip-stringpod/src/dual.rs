@@ -10,29 +10,20 @@ use crate::storage::Storage;
 /// some entry's sequence and quality strings have different lengths, or the
 /// columns have different entry counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ColumnLengthMismatch {
-    /// Entry index at which the lengths diverged. For a column-count mismatch
-    /// this is the shorter column's entry count.
-    pub index: usize,
-    /// Sequence-side length: the entry's byte length, or — for a count
-    /// mismatch — the sequence column's entry count.
-    pub seq_len: usize,
-    /// Quality-side length: the entry's byte length, or — for a count
-    /// mismatch — the quality column's entry count.
-    pub qual_len: usize,
+
+enum ColumnError {
+    EqualCountViolated,
+    UnequalLengths,
+    NotATranslation,
 }
 
-impl std::fmt::Display for ColumnLengthMismatch {
+impl std::fmt::Display for ColumnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "sequence/quality length mismatch at entry {}: seq {} != qual {}",
-            self.index, self.seq_len, self.qual_len
-        )
+        todo!()
     }
 }
 
-impl std::error::Error for ColumnLengthMismatch {}
+impl std::error::Error for ColumnError {}
 
 /// Two parallel byte columns (e.g. sequence + quality) sharing a single
 /// metadata layout. The shared metadata makes the per-entry length invariant
@@ -46,6 +37,9 @@ pub struct DualStringPod {
     pub(crate) seq: Arc<Vec<u8>>,
     pub(crate) qual: Arc<Vec<u8>>,
     pub(crate) storage: Storage,
+
+    seq_first_byte: usize,
+    qual_first_byte: usize,
 }
 
 impl DualStringPod {
@@ -62,22 +56,21 @@ impl DualStringPod {
     /// `qual` as independent [`StringPod`]s to the structural
     /// `seq[i].len() == qual[i].len()` invariant a [`DualStringPod`] enforces.
     ///
+    /// The second invariant is that the starts of seq are the qual starts +- an offset
+    /// (which may be negative, if seq is the one with the stray bytes at the start,
+    /// from our 'pull into previous block' schema.)
+    ///
     /// The two columns must have the same entry count and, for every entry, the
-    /// same length. When they also share an identical byte *layout* (same
-    /// offsets, not just lengths) the fusion is genuinely zero-copy — both
-    /// buffers are moved in as-is and `seq`'s metadata indexes both. That holds
-    /// in the common case (a single member with no cross-boundary stitching).
-    /// When the layouts diverge (equal lengths but different buffer offsets, as
-    /// happens when records are stitched across decode-chunk or gzip-member
-    /// boundaries) the columns are rebuilt into one shared contiguous layout —
-    /// a single copy of each column.
+    /// same length. Their starts must also be a translation of each other.
     ///
     /// # Errors
-    /// Returns [`ColumnLengthMismatch`] at the first entry whose sequence and
-    /// quality lengths differ (or if the columns have different entry counts) —
-    /// i.e. malformed FASTQ where a quality string is not the same length as
-    /// its read.
-    pub fn from_columns(seq: StringPod, qual: StringPod) -> Result<Self, ColumnLengthMismatch> {
+    ///
+    /// ColumnError::EqualCountViolated when seq.len() != qual.len()
+    /// ColumnError::UnequalLengths when two entries are of the wrong length
+    /// ColumnError::NotATranslation when we can't map them one-to-one.
+    ///
+    /// At that point it's time to tell the consumer that this ain't FASTQ.
+    pub fn from_columns(seq: StringPod, qual: StringPod) -> Result<Self, ColumnError> {
         if seq.len() != qual.len() {
             return Err(ColumnLengthMismatch {
                 index: seq.len().min(qual.len()),
@@ -87,39 +80,107 @@ impl DualStringPod {
         }
         // Validate the per-entry length invariant and, in the same pass, learn
         // whether the two columns already share an identical byte layout.
-        let mut same_layout = true;
-        for i in 0..seq.len() {
-            let sr = seq.storage.entry_range(i);
-            let qr = qual.storage.entry_range(i);
-            if (sr.end - sr.start) != (qr.end - qr.start) {
-                return Err(ColumnLengthMismatch {
-                    index: i,
-                    seq_len: sr.end - sr.start,
-                    qual_len: qr.end - qr.start,
-                });
-            }
-            if sr != qr {
-                same_layout = false;
-            }
-        }
+        let (storage, seq_first_byte, qual_first_byte): (Storage, usize, usize) =
+            match (&seq.storage, &qual.storage) {
+                (
+                    Storage::FixedLength {
+                        stride: seq_stride,
+                        head_skip: seq_head_skip,
+                        visible_len: seq_visible_len,
+                        count: seq_count,
+                        front_byte: seq_front_byte,
+                    },
+                    Storage::FixedLength {
+                        stride: qual_stride,
+                        head_skip: qual_head_skip,
+                        visible_len: qual_visible_len,
+                        count: qual_count,
+                        front_byte: qual_front_byte,
+                    },
+                ) => {
+                    if seq_stride == qual_stride
+                        && seq_head_skip == qual_head_skip
+                        && seq_visible_len == qual_visible_len
+                        && seq_count == qual_count
+                    {
+                        // Both columns have identical fixed-length layout, with
+                        // maybe a front_byte offset. Safe for zero copy
+                        todo!()
+                    } else if seq_visible_len == qual_visible_len {
+                        // Both columns are fixed-length but their layouts differ — must rebuild.
+                        todo!();
+                    } else {
+                        //todo: this error must be better.
+                        return Err(ColumnLengthMismatch {
+                            index: 0, // all entries have different length, so report the first
+                            seq_len: *seq_visible_len as usize,
+                            qual_len: *qual_visible_len as usize,
+                        });
+                    }
+                }
+                (Storage::Variable { .. }, Storage::FixedLength { .. })
+                | (Storage::FixedLength { .. }, Storage::Variable { .. }) => {
+                    todo!("error return");
+                }
+                (Storage::Variable { .. }, Storage::Variable { .. }) => {
+                    let mut offset = None;
+                    for i in 0..seq.len() {
+                        let sr = seq.storage.entry_range(i);
+                        let qr = qual.storage.entry_range(i);
+                        if (sr.end - sr.start) != (qr.end - qr.start) {
+                            return Err(ColumnLengthMismatch {
+                                index: i,
+                                seq_len: sr.end - sr.start,
+                                qual_len: qr.end - qr.start,
+                            });
+                        }
+                        let o = sr.start as i64 - qr.start as i64;
+                        match offset {
+                            None => {
+                                offset = Some(o);
+                            }
+                            Some(last) => {
+                                if last != o {
+                                    return Err(ColumnLengthMismatch {
+                                        index: i,
+                                        seq_len: sr.end - sr.start,
+                                        qual_len: qr.end - qr.start,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    todo!();
+                }
+            };
 
-        if same_layout {
-            // Zero-copy: both buffers are indexed identically, so reuse them and
-            // share `seq`'s metadata.
-            Ok(DualStringPod {
-                seq: seq.data,
-                qual: qual.data,
-                storage: seq.storage,
-            })
-        } else {
-            // Equal lengths but divergent offsets — rebuild into one shared
-            // contiguous layout (one copy of each column).
-            let mut b = DualStringPodBuilder::with_capacity(0, seq.len());
-            for i in 0..seq.len() {
-                b.push(seq.get(i), qual.get(i));
-            }
-            Ok(b.finish())
-        }
+        Ok(DualStringPod {
+            seq: seq.data,
+            qual: qual.data,
+            storage,
+            seq_first_byte,
+            qual_first_byte,
+        })
+        //
+        // if same_layout {
+        //     // Zero-copy: both buffers are indexed identically, so reuse them and
+        //     // share `seq`'s metadata.
+        //     Ok(DualStringPod {
+        //         seq: seq.data,
+        //         qual: qual.data,
+        //         storage: seq.storage,
+        //         seq_offset: 0,
+        //         qual_offset: 0,
+        //     })
+        // } else {
+        //     // Equal lengths but divergent offsets — rebuild into one shared
+        //     // contiguous layout (one copy of each column).
+        //     let mut b = DualStringPodBuilder::with_capacity(0, seq.len());
+        //     for i in 0..seq.len() {
+        //         b.push(seq.get(i), qual.get(i));
+        //     }
+        //     Ok(b.finish())
+        // }
     }
 
     #[must_use]
@@ -422,6 +483,8 @@ impl DualStringPodBuilder {
             seq: Arc::new(self.seq),
             qual: Arc::new(self.qual),
             storage: self.storage,
+            seq_first_byte: 0,
+            qual_first_byte: 0,
         }
     }
 }
@@ -480,6 +543,8 @@ impl DualStringPodAliasBuilder {
                 tail_skip: 0,
                 front_skip: 0,
             },
+            seq_first_byte: 0,
+            qual_first_byte: 0,
         }
     }
 }

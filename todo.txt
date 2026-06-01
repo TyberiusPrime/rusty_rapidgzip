@@ -1,4 +1,9 @@
 
+0. The copying in DualStringPod on 'mismatched by a constant offset'
+is idiotic. We can do better here if we keep two offsets for seq/qual around.
+
+
+
   1. u32 per-chunk byte cap (likely a real bug for pathological input).
   StringPod/Storage positions are u32; the builders panic!("byte buffer exceeds 
   u32::MAX"). A single 4 MiB compressed chunk of synth-zeros decodes to ~4 GiB —
@@ -8,6 +13,10 @@
   ratio. This is the highest-value item: it's a crash on adversarial/degenerate
   data.
 
+
+This is probably a good idea anyway, we should be pushing off every (configurable) n
+reads anyway.
+
   2. Strict 4-line FASTQ is assumed but never asserted globally. The columnar
   splitter is correct only if every record is exactly 4 lines (no blank lines,
   no wrapped sequences). The @/+ first-char checks are necessary but not
@@ -16,29 +25,44 @@
   only", and consider validating that every + line lands on phase 2 across the
   whole stream, not just per chunk.
 
+
+Add in test cases for truncated FASTQ.
+Don't know what it wants with 'phase 2 across the whole stream...'
+
   3. Truncated trailing record is silently dropped. finish_eof truncates to
   min(names, seqs, quals). That's a lenient policy applied silently. → Make it
   explicit and ideally configurable (error vs. drop), and at minimum count/log
   it so data loss is visible.
+
+Yeah, that totally should be an error.
 
   4. BGZF detection from the first member only. If the first member carries the
   BC subfield, the whole file is assumed BGZF. A file that starts BGZF then
   concatenates a plain gzip member would be mishandled. → Validate per member,
   or document the assumption.
 
+Yes, add test case, then fix.
 
 
   5. mmap assumes a seekable regular file. Pipes/FIFOs/stdin and zero-length
   files will fail or panic at Mmap::map. → Document "regular file only" and
   handle the 0-byte case explicitly.
 
+That is true, we need a fallback. Zero byte size is an invalid file / will
+not pass gzip detection, but still, we should handle this here. 
+
   6. 64-bit-only. Several try_from(...).expect("exceeds usize on this platform")
   sites assume 64-bit. → State it in rust-version/README, or guard.
+
+Yes, state and add guard.
 
   7. Undocumented env-var surface. RAPIDGZIP_INFLIGHT, RAPIDGZIP_AUTOTUNE,
   RAPIDGZIP_RESOLVE_THREADS, RAPIDGZIP_FASTQ_DEMUX_THREADS, RAPIDGZIP_INFLATE,
   and now RAPIDGZIP_FULL_CORPUS all change behavior but aren't documented. →
   List them in the README; validate values.
+
+  Remove autotune, replace env vars with arguments to rusty_rapidgzip-bin
+
 
   8. Speculation false-positives. End-to-end correctness on the parallel path
   ultimately rests on find_next_dynamic_block never producing a false boundary
@@ -46,9 +70,11 @@
   but it should be stated as the one residual correctness assumption, with
   fuzzing as the mitigation.
 
-  (does that mean that crc errors get evaluated twice?)
+(does that mean that crc errors get evaluated twice?)
 
-  B. Testing & CI program
+And we absolutly need to do the correct thing here. It's highly unlikely (1/2^32). 
+What does rapidgzip-cpp do though?
+
 
   - Property tests (proptest): (i) gzip(x) round-trips to x for arbitrary x,
   arbitrary member splits, arbitrary chunk sizes × thread counts — generalizing
@@ -87,6 +113,9 @@
   change to demux_chunk/absorb/collect, worth doing if FASTQ-of-concatenated-.gz
   is a hot path (it often is in bioinformatics).
 
-  (that's wrong, we should just have two byte/entry offsets).
+That's wrong, it's just going to make the the stitching even more complicated.
+I suppose we need 'dual offsets' to go along with the dual buffers and then 
+see if the entry_ranges are at a constant difference from each other, instead of 
+identical byte values.
 
 
