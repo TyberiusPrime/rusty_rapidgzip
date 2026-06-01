@@ -31,4 +31,7 @@ No random access, no `Read`/`Seek`, no upstream-compatible `.gzi` (for now).
 [1]: https://github.com/mxmlnkn/rapidgzip
 [2]: https://github.com/Piezoid/pugz
 
+## Alternatives
 
+Besides just running rapidgzip in an external process,
+there's also a set of [rust bindings](https://github.com/alekseizarubin/rapidgzip-rs/)!
