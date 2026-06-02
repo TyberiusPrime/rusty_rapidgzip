@@ -262,6 +262,86 @@ fn end_to_end_read_gz_into_fastq() {
     }
 }
 
+/// The streaming-parallel pipe path (>1 worker, non-seekable input) must
+/// produce byte-identical output to the mmap path, across many decode chunks
+/// and multiple gzip members. This is the regression guard for the boundary
+/// cutting + cross-member trailer/header handling in `streaming.rs`.
+#[test]
+#[cfg(unix)]
+fn streaming_parallel_pipe_matches_mmap_multichunk() {
+    use crossbeam_channel::bounded;
+    use rusty_rapidgzip::{read_gz, Config};
+    use std::io::Write;
+    use std::sync::Arc;
+
+    // ~2 MB uncompressed of varied (compressible but not trivial) FASTQ so that
+    // a 64 KiB chunk target yields many speculative chunks with real markers.
+    let mut payload = Vec::new();
+    for i in 0..12000u32 {
+        let len = 60 + (i as usize * 7) % 90;
+        let seq: String = (0..len).map(|j| b"ACGT"[((i as usize + j) * 31) % 4] as char).collect();
+        let qual: String = std::iter::repeat('I').take(len).collect();
+        payload.extend_from_slice(format!("@read{i} run:1:flow\n{seq}\n+\n{qual}\n").as_bytes());
+    }
+
+    // Single-member and two-member (concatenated) inputs.
+    let Some(gz_a) = gzip(&payload) else {
+        eprintln!("system gzip unavailable — skipping streaming-parallel pipe test");
+        return;
+    };
+    let gz_b = gzip(&payload[..payload.len() / 3]).unwrap();
+    let mut gz_multi = gz_a.clone();
+    gz_multi.extend_from_slice(&gz_b);
+
+    // Collect the whole decompressed stream from `read_gz` for a given input
+    // path + config.
+    fn decode(path: &std::path::Path, cfg: Config) -> Vec<u8> {
+        let (tx, rx) = bounded::<Arc<Vec<u8>>>(8);
+        let p = path.to_path_buf();
+        let producer = std::thread::spawn(move || read_gz(&p, tx, cfg));
+        let mut out = Vec::new();
+        for chunk in rx {
+            out.extend_from_slice(&chunk);
+        }
+        producer.join().unwrap().unwrap();
+        out
+    }
+
+    for (label, gz) in [("single", &gz_a), ("multi", &gz_multi)] {
+        // Reference: mmap path on a regular file.
+        let file_path = std::env::temp_dir().join(format!("rgz_stream_{label}.gz"));
+        std::fs::write(&file_path, gz).unwrap();
+        let reference = decode(
+            &file_path,
+            Config { num_threads: 4, chunk_size_bytes: 64 * 1024, ..Config::default() },
+        );
+        let _ = std::fs::remove_file(&file_path);
+
+        // Streaming-parallel path: same bytes through a named pipe.
+        let pipe_path = std::env::temp_dir().join(format!("rgz_stream_{label}.fifo"));
+        let _ = std::fs::remove_file(&pipe_path);
+        let status = std::process::Command::new("mkfifo").arg(&pipe_path).status().expect("mkfifo");
+        assert!(status.success(), "mkfifo failed");
+
+        let writer_path = pipe_path.clone();
+        let gz_owned = gz.clone();
+        let writer = std::thread::spawn(move || {
+            let mut f = std::fs::OpenOptions::new().write(true).open(&writer_path).unwrap();
+            f.write_all(&gz_owned).unwrap();
+        });
+
+        let got = decode(
+            &pipe_path,
+            Config { num_threads: 4, chunk_size_bytes: 64 * 1024, ..Config::default() },
+        );
+        writer.join().expect("writer panicked");
+        let _ = std::fs::remove_file(&pipe_path);
+
+        assert_eq!(got, reference, "{label}: streaming-parallel pipe != mmap");
+        assert!(got.len() > 1_000_000, "{label}: expected a multi-chunk payload");
+    }
+}
+
 /// read_gz_into_fastq must work when the input arrives through a named pipe
 /// (no mmap available). This exercises the buffered-read fallback.
 #[test]

@@ -12,7 +12,7 @@ use rusty_rapidgzip::{elapsed_since_start, read_gz, Config, Verbosity};
 #[derive(Parser, Debug)]
 #[command(name = "rapidgzip-rs", version)]
 struct Args {
-    /// Input .gz file.
+    /// Input .gz file, or `-` for stdin.
     input: PathBuf,
     /// Number of worker threads (0 = auto).
     #[arg(short = 'P', long, default_value_t = 0)]
@@ -47,7 +47,14 @@ fn main() -> Result<()> {
 
     let (tx, rx) = bounded::<Arc<Vec<u8>>>(16);
 
-    let input = args.input.clone();
+    // `-` means stdin. `/dev/stdin` lets `read_gz` open it as a normal path:
+    // when stdin is a pipe it routes to the streaming decoder, and when it's a
+    // redirected regular file (`< foo.gz`) it still mmaps.
+    let input = if args.input.as_os_str() == "-" {
+        PathBuf::from("/dev/stdin")
+    } else {
+        args.input.clone()
+    };
     let producer = std::thread::spawn(move || read_gz(&input, tx, cfg));
 
     let stdout = std::io::stdout();

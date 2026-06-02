@@ -834,7 +834,7 @@ pub fn parallel_decode_member(
 
 /// Build the next chunk's prev_tail by applying only the markers that land in
 /// the last 32 KiB of this chunk's output.
-fn build_prev_tail_fast(chunk: &SpeculativeChunk, prev_tail: &[u8]) -> Vec<u8> {
+pub(crate) fn build_prev_tail_fast(chunk: &SpeculativeChunk, prev_tail: &[u8]) -> Vec<u8> {
     const WINDOW: usize = 32 * 1024;
     let len = chunk.bytes.len();
     let tail_start = len.saturating_sub(WINDOW);

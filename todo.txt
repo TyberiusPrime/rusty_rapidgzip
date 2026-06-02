@@ -119,3 +119,6 @@ see if the entry_ranges are at a constant difference from each other, instead of
 identical byte values.
 
 
+ the serial read path is slower than the parallel one without any need.
+
+--
