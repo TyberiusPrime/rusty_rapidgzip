@@ -904,7 +904,118 @@ pub fn fastq_split_for_test(chunks: &[&[u8]]) -> Result<(Vec<u8>, Vec<u8>, Vec<u
 
 #[cfg(test)]
 mod tests {
-    use super::{fastq_len_guard, MAX_FASTQ_COLUMN_BYTES};
+    use super::{fastq_len_guard, Config, MAX_FASTQ_COLUMN_BYTES};
+
+    // ── BGZF / gzip member helpers ──────────────────────────────────────────
+
+    /// Build a minimal single-member gzip stream for `data` (stored deflate,
+    /// no compression, no extra header fields).
+    fn make_gz_member(data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff]);
+        let len = data.len() as u16;
+        out.push(0x01); // BFINAL=1, BTYPE=00 (stored)
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&(!len).to_le_bytes()); // NLEN = one's-complement of LEN
+        out.extend_from_slice(data);
+        out.extend_from_slice(&crc32fast::hash(data).to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out
+    }
+
+    /// Build a minimal single-member BGZF stream for `data` (stored deflate,
+    /// BC FEXTRA subfield, BSIZE = total block size − 1).
+    fn make_bgzf_member(data: &[u8]) -> Vec<u8> {
+        // Build deflate body first so we know total size.
+        let len = data.len() as u16;
+        let mut body = vec![0x01]; // BFINAL=1, BTYPE=00
+        body.extend_from_slice(&len.to_le_bytes());
+        body.extend_from_slice(&(!len).to_le_bytes());
+        body.extend_from_slice(data);
+
+        // 10 (fixed header) + 2 (XLEN) + 6 (BC subfield) + body + 8 (trailer)
+        let total = 10 + 2 + 6 + body.len() + 8;
+        let bsize = (total - 1) as u16;
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff]);
+        out.extend_from_slice(&[0x06, 0x00]); // XLEN = 6
+        out.push(b'B');
+        out.push(b'C');
+        out.extend_from_slice(&[0x02, 0x00]); // SLEN = 2
+        out.extend_from_slice(&bsize.to_le_bytes()); // BSIZE−1
+        out.extend_from_slice(&body);
+        out.extend_from_slice(&crc32fast::hash(data).to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out
+    }
+
+    /// Write `bytes` to a temp file, decode it via [`read_gz`], and return the
+    /// concatenated decompressed output.
+    fn decode_gz_bytes(bytes: &[u8]) -> Result<Vec<u8>, super::Error> {
+        use std::sync::Arc;
+        let path = std::env::temp_dir().join(format!(
+            "rr_bgzf_test_{}.gz",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        std::fs::write(&path, bytes).expect("write temp file");
+        let (sink, rx) = crossbeam_channel::unbounded::<Arc<Vec<u8>>>();
+        let config = Config {
+            num_threads: 2,
+            chunk_size_bytes: 1 << 20,
+            verbose: super::Verbosity::Off,
+            recycle_rx: None,
+            recycle_tx: None,
+        };
+        let result = super::read_gz(&path, sink, config);
+        let _ = std::fs::remove_file(&path);
+        result?;
+        let mut out = Vec::new();
+        for chunk in rx {
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out)
+    }
+
+    // ── BGZF × gz combination tests ─────────────────────────────────────────
+
+    #[test]
+    fn bgzf_bgzf_decodes_both_members() {
+        let mut input = make_bgzf_member(b"hello ");
+        input.extend(make_bgzf_member(b"world"));
+        let out = decode_gz_bytes(&input).expect("bgzf+bgzf should decode");
+        assert_eq!(out, b"hello world");
+    }
+
+    #[test]
+    fn gz_gz_decodes_both_members() {
+        let mut input = make_gz_member(b"hello ");
+        input.extend(make_gz_member(b"world"));
+        let out = decode_gz_bytes(&input).expect("gz+gz should decode");
+        assert_eq!(out, b"hello world");
+    }
+
+    #[test]
+    fn bgzf_gz_decodes_both_members() {
+        // First member triggers BGZF detection; second is plain gzip.
+        let mut input = make_bgzf_member(b"hello ");
+        input.extend(make_gz_member(b"world"));
+        let out = decode_gz_bytes(&input).expect("bgzf+gz should decode");
+        assert_eq!(out, b"hello world");
+    }
+
+    #[test]
+    fn gz_bgzf_decodes_both_members() {
+        // First member is plain gzip so BGZF path is NOT taken; second is BGZF
+        // (which is valid gzip and must be handled by the regular path).
+        let mut input = make_gz_member(b"hello ");
+        input.extend(make_bgzf_member(b"world"));
+        let out = decode_gz_bytes(&input).expect("gz+bgzf should decode");
+        assert_eq!(out, b"hello world");
+    }
 
     #[test]
     fn len_guard_accepts_up_to_the_limit() {
