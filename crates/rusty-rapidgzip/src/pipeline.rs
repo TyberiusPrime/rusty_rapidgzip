@@ -1714,4 +1714,49 @@ mod tests {
         }
     }
 
+    /// A zero-byte file is not valid gzip; read_gz must return an error rather
+    /// than panicking (mmap of an empty file is undefined/platform-specific).
+    #[test]
+    fn zero_byte_file_returns_error() {
+        let path = write_tmp("zero_byte.gz", b"");
+        let (tx, rx) = bounded::<Arc<Vec<u8>>>(8);
+        let producer = std::thread::spawn(move || read_gz(&path, tx, Config::default()));
+        drop(rx);
+        let result = producer.join().expect("producer thread panicked");
+        assert!(result.is_err(), "zero-byte file should return an error, not succeed");
+    }
+
+    /// A named pipe (FIFO) cannot be mmap'd; read_gz must fall back to
+    /// buffered reading and decode correctly.
+    #[test]
+    #[cfg(unix)]
+    fn named_pipe_decodes_correctly() {
+        use std::io::Write;
+
+        let pipe_path = std::env::temp_dir().join("rapidgzip_rs_pipe_test.fifo");
+        let _ = std::fs::remove_file(&pipe_path);
+        let status = Command::new("mkfifo").arg(&pipe_path).status().expect("mkfifo");
+        assert!(status.success(), "mkfifo failed");
+
+        let payload = ascii_payload(256 * 1024);
+        let gz = gz_encode(&payload, 1);
+
+        // The writer must run on a separate thread: opening a FIFO for writing
+        // blocks until a reader opens the read end, and vice versa.
+        let writer_path = pipe_path.clone();
+        let writer = std::thread::spawn(move || {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&writer_path)
+                .expect("open pipe for writing");
+            f.write_all(&gz).expect("write gz to pipe");
+        });
+
+        let out = decode_via_read_gz(&pipe_path, Config::default());
+        writer.join().expect("writer thread panicked");
+
+        let _ = std::fs::remove_file(&pipe_path);
+        assert_eq!(sha(&out), sha(&payload), "pipe-decoded output does not match");
+    }
+
 }

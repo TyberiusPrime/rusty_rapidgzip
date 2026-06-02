@@ -17,6 +17,7 @@ pub fn elapsed_since_start() -> f64 {
 }
 
 use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
@@ -112,26 +113,49 @@ pub fn read_gz(
     let path = path.as_ref();
     let verbose = config.verbose.is_on();
     let t_open = std::time::Instant::now();
-    // mmap so workers can fault pages in on demand instead of paying for the
-    // whole file up front. For multi-GB inputs the wall-time savings vs.
-    // `fs::read` are very large; for small files the mmap setup is cheap.
+
     let file = File::open(path)?;
-    let mmap = unsafe { memmap2::Mmap::map(&file)? };
-    // Best-effort hint for sequential access; OS may ignore.
-    let _ = mmap.advise(memmap2::Advice::Sequential);
-    let compressed_bytes = mmap.len() as u64;
-    let input = Arc::new(InputBytes::Mapped(mmap));
-    if verbose {
-        eprintln!(
-            "[rapidgzip +{:.2}s] {}: mmaped {} bytes in {:.3}s, {} threads, chunk_size={}",
-            elapsed_since_start(),
-            path.display(),
-            compressed_bytes,
-            t_open.elapsed().as_secs_f64(),
-            if config.num_threads == 0 { "auto".to_string() } else { config.num_threads.to_string() },
-            config.chunk_size_bytes,
-        );
-    }
+    let meta = file.metadata()?;
+
+    // mmap for regular non-empty files: workers fault pages in on demand,
+    // avoiding paying for the whole file up front (significant for multi-GB).
+    // For non-seekable sources (named pipes, stdin, sockets) and zero-byte
+    // regular files, mmap is unavailable or useless — read the stream into a
+    // heap buffer instead.
+    let (input, compressed_bytes) = if meta.file_type().is_file() && meta.len() > 0 {
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        // Best-effort hint for sequential access; OS may ignore.
+        let _ = mmap.advise(memmap2::Advice::Sequential);
+        let len = mmap.len() as u64;
+        if verbose {
+            eprintln!(
+                "[rapidgzip +{:.2}s] {}: mmaped {} bytes in {:.3}s, {} threads, chunk_size={}",
+                elapsed_since_start(),
+                path.display(),
+                len,
+                t_open.elapsed().as_secs_f64(),
+                if config.num_threads == 0 { "auto".to_string() } else { config.num_threads.to_string() },
+                config.chunk_size_bytes,
+            );
+        }
+        (Arc::new(InputBytes::Mapped(mmap)), len)
+    } else {
+        let mut buf = Vec::new();
+        std::io::BufReader::new(file).read_to_end(&mut buf)?;
+        let len = buf.len() as u64;
+        if verbose {
+            eprintln!(
+                "[rapidgzip +{:.2}s] {}: read {} bytes in {:.3}s, {} threads, chunk_size={}",
+                elapsed_since_start(),
+                path.display(),
+                len,
+                t_open.elapsed().as_secs_f64(),
+                if config.num_threads == 0 { "auto".to_string() } else { config.num_threads.to_string() },
+                config.chunk_size_bytes,
+            );
+        }
+        (Arc::new(InputBytes::Owned(buf)), len)
+    };
 
     // BGZF fast-path: if the first member carries a BC FEXTRA subfield, the
     // whole file is bgzip — every member is an independent deflate stream

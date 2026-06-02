@@ -261,3 +261,66 @@ fn end_to_end_read_gz_into_fastq() {
         }
     }
 }
+
+/// read_gz_into_fastq must work when the input arrives through a named pipe
+/// (no mmap available). This exercises the buffered-read fallback.
+#[test]
+#[cfg(unix)]
+fn end_to_end_read_gz_into_fastq_named_pipe() {
+    use crossbeam_channel::bounded;
+    use rusty_rapidgzip::{read_gz_into_fastq, Config, FastqChunk};
+    use std::io::Write;
+    use std::process::Command;
+
+    let mut payload = Vec::new();
+    let mut exp_n = String::new();
+    let mut exp_s = String::new();
+    let mut exp_q = String::new();
+    for i in 0..500u32 {
+        let len = 4 + (i as usize % 20);
+        let seq: String = std::iter::repeat('G').take(len).collect();
+        let qual: String = std::iter::repeat('J').take(len).collect();
+        payload.extend_from_slice(format!("@r{i}\n{seq}\n+\n{qual}\n").as_bytes());
+        exp_n.push_str(&format!("r{i}\n"));
+        exp_s.push_str(&format!("{seq}\n"));
+        exp_q.push_str(&format!("{qual}\n"));
+    }
+    let Some(gz) = gzip(&payload) else {
+        eprintln!("system gzip unavailable — skipping named-pipe fastq test");
+        return;
+    };
+
+    let pipe_path = std::env::temp_dir().join("rapidgzip_rs_fastq_pipe.fifo");
+    let _ = std::fs::remove_file(&pipe_path);
+    let status = Command::new("mkfifo").arg(&pipe_path).status().expect("mkfifo");
+    assert!(status.success(), "mkfifo failed");
+
+    let writer_path = pipe_path.clone();
+    let writer = std::thread::spawn(move || {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&writer_path)
+            .expect("open pipe write end");
+        f.write_all(&gz).expect("write gz to pipe");
+    });
+
+    let (tx, rx) = bounded::<FastqChunk>(8);
+    let cfg = Config { num_threads: 2, ..Config::default() };
+    let p = pipe_path.clone();
+    let producer = std::thread::spawn(move || read_gz_into_fastq(&p, tx, cfg));
+
+    let (mut n, mut s, mut q) = (Vec::new(), Vec::new(), Vec::new());
+    for c in rx {
+        assert_eq!(c.names.len(), c.reads.len());
+        for x in c.names.iter() { n.extend_from_slice(x); n.push(b'\n'); }
+        for x in c.reads.iter_seq() { s.extend_from_slice(x); s.push(b'\n'); }
+        for x in c.reads.iter_qual() { q.extend_from_slice(x); q.push(b'\n'); }
+    }
+    writer.join().expect("writer thread panicked");
+    producer.join().unwrap().unwrap();
+
+    let _ = std::fs::remove_file(&pipe_path);
+    assert_eq!(n, exp_n.as_bytes(), "names");
+    assert_eq!(s, exp_s.as_bytes(), "seqs");
+    assert_eq!(q, exp_q.as_bytes(), "quals");
+}
