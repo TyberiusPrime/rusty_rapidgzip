@@ -255,7 +255,8 @@ pub fn read_gz_into_fastq(
 
     // Demux pool — phase-agnostic per-chunk bucketing (the heavy scan + copy).
     let (job_tx, job_rx) = crossbeam_channel::bounded::<DemuxJob>(num_threads * 2);
-    let (done_tx, done_rx) = crossbeam_channel::bounded::<DemuxResult>(num_threads * 2);
+    let (done_tx, done_rx) =
+        crossbeam_channel::bounded::<Result<DemuxResult, Error>>(num_threads * 2);
     let mut workers = Vec::with_capacity(demux_threads);
     for _ in 0..demux_threads {
         let job_rx = job_rx.clone();
@@ -333,11 +334,38 @@ fn rposition_nl(data: &[u8]) -> Option<usize> {
     data.iter().rposition(|&c| c == b'\n')
 }
 
+/// FASTQ columns address their byte buffer with `u32` offsets, so any single
+/// column — and therefore any single read's sequence or quality line — cannot
+/// exceed `u32::MAX` bytes. Degenerate/adversarial input (a multi-GiB single
+/// read, or a tiny compressed chunk that inflates past 4 GiB) would otherwise
+/// overflow the `u32` position in `StringPodBuilder::push` and panic; the guard
+/// below turns that into a clean error instead.
+const MAX_FASTQ_COLUMN_BYTES: usize = u32::MAX as usize;
+
+/// Reject a push that would grow a FASTQ column past [`MAX_FASTQ_COLUMN_BYTES`]
+/// with a clear error rather than letting the underlying `u32` cast panic.
 #[inline]
-fn push_line(bucket: &mut Option<StringPodBuilder>, est: usize, line: &[u8]) {
+fn fastq_len_guard(current: usize, add: usize) -> Result<(), Error> {
+    // `current` is always ≤ u32::MAX (every prior push was guarded), so this
+    // sum cannot overflow usize on the 64-bit targets this crate supports.
+    if current + add > MAX_FASTQ_COLUMN_BYTES {
+        return Err(Error::Fastq(
+            "FASTQ read length exceeds the allowed maximum of 4 GiB".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[inline]
+fn push_line(bucket: &mut Option<StringPodBuilder>, est: usize, line: &[u8]) -> Result<(), Error> {
+    // Guard before `with_capacity`, which itself casts the entry length to u32
+    // and would panic on a >4 GiB line before we ever reach `push`.
+    let current = bucket.as_ref().map_or(0, StringPodBuilder::buffer_bytes);
+    fastq_len_guard(current, line.len())?;
     bucket
         .get_or_insert_with(|| StringPodBuilder::with_capacity(line.len(), est))
         .push(line);
+    Ok(())
 }
 
 /// Split one chunk into four buckets keyed by `line_index mod 4`, phase
@@ -347,18 +375,21 @@ fn push_line(bucket: &mut Option<StringPodBuilder>, est: usize, line: &[u8]) {
 /// line (local index 0 → bucket 0), so it shares bucket 0's predecessor slot.
 /// After the collector's rotation this lands in the correct role column, in
 /// order, with no further copy. `data` is guaranteed to contain ≥1 newline.
-fn demux_chunk(idx: u64, data: &[u8], prev_tail: &[u8]) -> DemuxResult {
+fn demux_chunk(idx: u64, data: &[u8], prev_tail: &[u8]) -> Result<DemuxResult, Error> {
     let est = (data.len() / 300).max(16);
     let mut builders: [Option<StringPodBuilder>; 4] = [None, None, None, None];
 
     let first_nl = data.iter().position(|&c| c == b'\n').expect("≥1 newline");
 
-    // Reassemble the boundary-straddling line and push it into bucket 3.
+    // Reassemble the boundary-straddling line and push it into bucket 3. Guard
+    // its assembled length up front so an adversarial multi-GiB line is rejected
+    // before we materialise the (equally multi-GiB) `split` buffer.
     let head = strip_cr(&data[..first_nl]);
+    fastq_len_guard(0, prev_tail.len() + head.len())?;
     let mut split = Vec::with_capacity(prev_tail.len() + head.len());
     split.extend_from_slice(prev_tail);
     split.extend_from_slice(head);
-    push_line(&mut builders[3], est, strip_cr(&split));
+    push_line(&mut builders[3], est, strip_cr(&split))?;
 
     // Fully-contained lines: between consecutive newlines, local index from 0.
     let mut lines: u64 = 1; // the boundary line, completed by `first_nl`
@@ -367,7 +398,7 @@ fn demux_chunk(idx: u64, data: &[u8], prev_tail: &[u8]) -> DemuxResult {
     //TODO: Check if this get's any real world performance boost from memchr crate
     while let Some(rel) = data[start..].iter().position(|&c| c == b'\n') {
         let nl = start + rel;
-        push_line(&mut builders[local & 3], est, strip_cr(&data[start..nl]));
+        push_line(&mut builders[local & 3], est, strip_cr(&data[start..nl]))?;
         lines += 1;
         local += 1;
         start = nl + 1;
@@ -382,7 +413,7 @@ fn demux_chunk(idx: u64, data: &[u8], prev_tail: &[u8]) -> DemuxResult {
         pod.reserve_for_appends(4);
         pod
     });
-    DemuxResult { idx, buckets, lines }
+    Ok(DemuxResult { idx, buckets, lines })
 }
 
 /// Role-indexed columns for one chunk: `[name, seq, plus, qual]` (role = line
@@ -461,6 +492,7 @@ fn absorb(
                 // role ∈ [phase, 4): the straddling record's missing lines, in
                 // order, at the head of `cur`. Move them onto `held`.
                 let line = cur[role].get(0).to_vec();
+                fastq_len_guard(h[role].buffer_bytes(), line.len())?;
                 h[role].push(&line);
                 cur[role].pop_front(1);
             }
@@ -495,7 +527,9 @@ fn finish_eof(
     };
     if !carry.is_empty() {
         let role = (global_lines % 4) as usize;
-        h[role].push(strip_cr(carry));
+        let line = strip_cr(carry);
+        fastq_len_guard(h[role].buffer_bytes(), line.len())?;
+        h[role].push(line);
     }
     // Keep only whole records (drops a truncated trailing record, if present).
     let complete = h[0].len().min(h[1].len()).min(h[3].len());
@@ -509,7 +543,7 @@ fn finish_eof(
 /// (`absorb` / `finish_eof`), emitting a record-aligned [`FastqChunk`] per
 /// input chunk. Runs serially in stream order.
 fn collect(
-    done_rx: Receiver<DemuxResult>,
+    done_rx: Receiver<Result<DemuxResult, Error>>,
     tail_rx: Receiver<Vec<u8>>,
     sink: &Sender<FastqChunk>,
 ) -> Result<(), Error> {
@@ -523,6 +557,7 @@ fn collect(
     };
 
     for res in done_rx {
+        let res = res?; // a worker hit invalid/oversized input — surface it
         reorder.insert(res.idx, res);
         while let Some(res) = reorder.remove(&next) {
             absorb(res, &mut held, &mut global_lines, &mut emit)?;
@@ -571,7 +606,7 @@ pub fn fastq_split_for_test(chunks: &[&[u8]]) -> Result<(Vec<u8>, Vec<u8>, Vec<u
             Some(last_nl) => {
                 let next_carry = chunk[last_nl + 1..].to_vec();
                 let prev_tail = std::mem::take(&mut carry);
-                let res = demux_chunk(idx, chunk, &prev_tail);
+                let res = demux_chunk(idx, chunk, &prev_tail)?;
                 absorb(res, &mut held, &mut global_lines, &mut emit)?;
                 idx += 1;
                 carry = next_carry;
@@ -581,4 +616,28 @@ pub fn fastq_split_for_test(chunks: &[&[u8]]) -> Result<(Vec<u8>, Vec<u8>, Vec<u
     }
     finish_eof(held, &carry, global_lines, &mut emit)?;
     Ok((names, seqs, quals))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fastq_len_guard, MAX_FASTQ_COLUMN_BYTES};
+
+    #[test]
+    fn len_guard_accepts_up_to_the_limit() {
+        // A column filled exactly to u32::MAX is fine; one more byte is not.
+        assert!(fastq_len_guard(MAX_FASTQ_COLUMN_BYTES - 10, 10).is_ok());
+        assert!(fastq_len_guard(0, MAX_FASTQ_COLUMN_BYTES).is_ok());
+    }
+
+    #[test]
+    fn len_guard_rejects_oversized_with_clear_message() {
+        let err = fastq_len_guard(0, MAX_FASTQ_COLUMN_BYTES + 1).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("FASTQ read length exceeds the allowed maximum of 4 GiB"),
+            "unexpected error: {err}"
+        );
+        // Also rejects a cumulative overflow (small add onto a near-full column).
+        assert!(fastq_len_guard(MAX_FASTQ_COLUMN_BYTES, 1).is_err());
+    }
 }
