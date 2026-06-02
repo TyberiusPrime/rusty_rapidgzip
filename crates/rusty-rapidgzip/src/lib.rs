@@ -1,6 +1,5 @@
 //! Streaming, parallel gzip decoder.
 
-pub mod autotune;
 pub mod gzip;
 pub mod pipeline;
 mod streaming;

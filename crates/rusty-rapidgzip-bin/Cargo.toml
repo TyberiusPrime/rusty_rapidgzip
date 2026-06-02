@@ -16,10 +16,6 @@ name = "bench-inflate"
 path = "src/bench_inflate.rs"
 
 [[bin]]
-name = "bench-autotune"
-path = "src/bench_autotune.rs"
-
-[[bin]]
 name = "bench-fastq"
 path = "src/bench_fastq.rs"
 

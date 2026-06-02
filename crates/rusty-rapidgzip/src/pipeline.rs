@@ -28,14 +28,10 @@
 //!   attempt false-boundary recovery; the block finder's full-header
 //!   verification keeps false positives extremely rare in practice.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
-
-use crate::autotune::{AutoTune, Policy};
 
 /// Compressed input backing store. Either an mmap'd file (production) or a
 /// heap buffer (tests / small inputs). Both deref to `&[u8]`.
@@ -96,73 +92,6 @@ impl WorkerKernel {
     }
 }
 
-/// Runtime throttle for the decode worker pool.
-///
-/// All `max_workers` decode threads are spawned up front and stay alive for the
-/// whole decode; this gate decides, *between work items*, how many of them are
-/// allowed to pull from the work channel at any moment. A worker whose index is
-/// `>= desired_active` parks on the condvar (consuming no CPU) but keeps its
-/// thread — and therefore its warm [`WorkerKernel`] scratch pages — resident, so
-/// re-activating it is a wake, not a respawn + page-fault.
-///
-/// The active count is only ever sampled at the top of a worker's loop, so a
-/// worker already blocked in `recv()` (already 0 CPU) isn't interrupted; the
-/// throttle takes effect the moment it finishes its current item. The ceiling
-/// (`-P`, or `available_parallelism` when auto) is the spawn count; a future
-/// controller sheds *below* it under back-pressure via [`PoolGate::set_active`].
-struct PoolGate {
-    inner: Mutex<GateState>,
-    cv: Condvar,
-}
-
-struct GateState {
-    desired_active: usize,
-    shutdown: bool,
-}
-
-impl PoolGate {
-    fn new(desired_active: usize) -> Self {
-        Self {
-            inner: Mutex::new(GateState { desired_active, shutdown: false }),
-            cv: Condvar::new(),
-        }
-    }
-
-    /// Block until worker `index` is permitted to run, or the pool is shutting
-    /// down. Returns `true` to process another item, `false` to exit.
-    fn wait_active(&self, index: usize) -> bool {
-        let mut g = self.inner.lock().unwrap();
-        loop {
-            if g.shutdown {
-                return false;
-            }
-            if index < g.desired_active {
-                return true;
-            }
-            g = self.cv.wait(g).unwrap();
-        }
-    }
-
-    /// Set how many workers (lowest indices) may run. Wakes parked workers if
-    /// the bound rose. Clamped to `[1, max]` by the caller/controller.
-    #[allow(dead_code)] // wired by the (not-yet-added) autotune controller
-    fn set_active(&self, n: usize) {
-        let mut g = self.inner.lock().unwrap();
-        g.desired_active = n;
-        drop(g);
-        self.cv.notify_all();
-    }
-
-    /// Tell every parked worker to exit. Active workers still exit via the work
-    /// channel disconnecting; this only releases those asleep on the condvar.
-    fn shutdown(&self) {
-        let mut g = self.inner.lock().unwrap();
-        g.shutdown = true;
-        drop(g);
-        self.cv.notify_all();
-    }
-}
-
 /// Dispatch-side back-pressure on the number of *decoded chunks in flight*.
 ///
 /// A decoded chunk carries its full `bytes` (≈3–4× the compressed chunk) plus a
@@ -172,8 +101,7 @@ impl PoolGate {
 /// not the active worker count — is what fixes peak RSS. This counting
 /// semaphore caps outstanding chunks: dispatch [`acquire`]s a slot before
 /// sending each work item, and the output stage [`release`]s it once the chunk
-/// has been streamed to the sink. The ceiling is mutable so the autotune
-/// controller can shrink it in lock-step with the active worker count.
+/// has been streamed to the sink.
 ///
 /// On by default at [`INFLIGHT_DEFAULT_FACTOR`] chunks per worker (floored by
 /// [`INFLIGHT_FLOOR`]); `RAPIDGZIP_INFLIGHT=<factor>` overrides the factor and
@@ -223,14 +151,6 @@ impl InflightCap {
         g.in_flight = g.in_flight.saturating_sub(1);
         drop(g);
         self.cv.notify_one();
-    }
-
-    /// Raise or lower the ceiling (autotune). Wakes dispatch if it rose.
-    fn set_max(&self, max: usize) {
-        let mut g = self.inner.lock().unwrap();
-        g.max = max.max(1);
-        drop(g);
-        self.cv.notify_all();
     }
 
     /// Release a dispatcher blocked in [`acquire`] during teardown.
@@ -446,30 +366,19 @@ pub fn parallel_decode_member(
     let (result_tx, result_rx) = bounded::<Result<WorkResult, Error>>(num_threads * 2);
 
     // Spawn the decode pool. All `num_threads` workers are spawned up front and
-    // stay alive for the whole decode; `gate` throttles how many may pull work
-    // at once (see [`PoolGate`]). `num_threads` is the ceiling; the gate starts
-    // wide open (== ceiling) so this is behaviourally identical to a plain fixed
-    // pool until a controller calls `set_active` to shed under back-pressure.
-    //
-    // Because the pool is fully spawned here, ramp-up is an unpark — there are no
-    // channel clones to retain for spawning later, so the eager drops below stay.
-    let gate = Arc::new(PoolGate::new(num_threads));
+    // stay alive for the whole decode, pulling from the work channel until it
+    // drains. Because the pool is fully spawned here, there are no channel clones
+    // to retain for spawning later, so the eager drops below stay.
     let mut worker_handles = Vec::with_capacity(num_threads);
-    for index in 0..num_threads {
+    for _index in 0..num_threads {
         let input = Arc::clone(&input);
         let work_rx = work_rx.clone();
         let result_tx = result_tx.clone();
         let recycle_rx = recycle_rx.clone();
-        let gate = Arc::clone(&gate);
         let handle = thread::spawn(move || {
             let body = &input.as_slice()[body_offset..];
             let mut wk = WorkerKernel::new();
             loop {
-                // Park (keeping warm scratch) until this worker is in the active
-                // set, or exit on shutdown.
-                if !gate.wait_active(index) {
-                    return;
-                }
                 let Ok(item) = work_rx.recv() else {
                     // Work channel drained + dispatch done → decode is finished.
                     return;
@@ -494,50 +403,8 @@ pub fn parallel_decode_member(
     //
     // Bounds the number of decoded chunks outstanding between dispatch and the
     // sink (see [`InflightCap`]). On by default; `RAPIDGZIP_INFLIGHT=0` disables
-    // it. The factor is "chunks per active worker"; when autotune is on the
-    // controller rescales the ceiling as it sheds, so RSS tracks `active`.
-    let inflight_factor = inflight_factor();
-    let inflight = make_inflight_cap(num_threads, inflight_factor);
-
-    // ── Autotune controller (opt-in) ─────────────────────────────────────────
-    //
-    // Polls how full the worker→stage-A `result` channel is and sheds/restores
-    // decode workers via the gate (see [`crate::autotune`]). A full channel ==
-    // decode is out-producing everything downstream (slow consumer / serial-stage
-    // ceiling) ⇒ shed; an empty channel == downstream starved ⇒ restore up to the
-    // ceiling. Off by default; enable with `RAPIDGZIP_AUTOTUNE=1`.
-    let tune_stop = Arc::new(AtomicBool::new(false));
-    let tune_handle = if std::env::var("RAPIDGZIP_AUTOTUNE").map(|v| v != "0" && !v.is_empty()).unwrap_or(false) {
-        let gate = Arc::clone(&gate);
-        let rx = result_rx.clone();
-        let stop = Arc::clone(&tune_stop);
-        let cap = (num_threads * 2).max(1);
-        let policy = Policy::from_env();
-        let inflight = inflight.clone();
-        Some(thread::spawn(move || {
-            let mut tune = AutoTune::new(num_threads, policy);
-            while !stop.load(Ordering::Relaxed) {
-                thread::sleep(Duration::from_millis(50));
-                let occ = rx.len() as f64 / cap as f64;
-                if let Some(n) = tune.observe(occ) {
-                    gate.set_active(n);
-                    // Shrink/grow the in-flight ceiling in lock-step so RSS
-                    // tracks the active worker count, not just the static -P.
-                    if let (Some(cap), Some(f)) = (&inflight, inflight_factor) {
-                        cap.set_max((n * f).max(INFLIGHT_FLOOR));
-                    }
-                    if verbose {
-                        eprintln!(
-                            "[rapidgzip +{:.2}s] autotune: active={n} (result occ={occ:.2})",
-                            crate::elapsed_since_start(),
-                        );
-                    }
-                }
-            }
-        }))
-    } else {
-        None
-    };
+    // it. The factor is "chunks per worker".
+    let inflight = make_inflight_cap(num_threads, inflight_factor());
 
     // Dispatch work — send all items. The bounded channel applies backpressure;
     // the optional in-flight cap additionally throttles how many decoded chunks
@@ -790,21 +657,13 @@ pub fn parallel_decode_member(
 
     // Tear down. Dropping `done_rx` unblocks the pool if we exited early; the
     // channel disconnects then cascade upstream (pool → stage A → workers →
-    // dispatch), so the joins below complete. `gate.shutdown()` additionally
-    // wakes any *parked* workers (asleep on the condvar, not on `recv`) so they
-    // drop their `work_rx`/`result_tx` clones — without it the work channel
-    // never disconnects and `dispatch` could block forever on a full send.
+    // dispatch), so the joins below complete.
     drop(crc_tx);
     drop(done_rx);
-    tune_stop.store(true, Ordering::Relaxed);
-    gate.shutdown();
     // Wake `dispatch` if it's parked in `InflightCap::acquire` (e.g. we broke at
     // the final block before processing every dispatched item) so it can exit.
     if let Some(cap) = &inflight {
         cap.shutdown();
-    }
-    if let Some(h) = tune_handle {
-        let _ = h.join();
     }
     let _ = stage_a.join();
     for h in resolve_handles {
@@ -1223,7 +1082,6 @@ pub fn parallel_decode_bgzf(
 
     // In-flight cap: bound decoded batches outstanding between dispatch and the
     // sink (same default-on policy as the speculative path; see [`InflightCap`]).
-    // BGZF has no autotune controller, so the ceiling is static.
     let inflight = make_inflight_cap(num_threads, inflight_factor());
 
     // Dispatch all work items, then close the work channel. The in-flight cap
@@ -1645,46 +1503,10 @@ mod tests {
         assert_eq!(sha(&out), sha(&payload));
     }
 
-    /// PoolGate: a worker above the active bound parks until the bound rises,
-    /// and `shutdown` releases a parked worker.
-    #[test]
-    fn pool_gate_park_unpark_shutdown() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::time::Duration;
-
-        // Worker index 1 starts parked (only index 0 active).
-        let gate = Arc::new(PoolGate::new(1));
-        let woke = Arc::new(AtomicUsize::new(0));
-
-        let g = Arc::clone(&gate);
-        let w = Arc::clone(&woke);
-        let h = std::thread::spawn(move || {
-            // Should block here: index 1 >= desired_active (1).
-            assert!(g.wait_active(1), "expected to be activated, not shut down");
-            w.fetch_add(1, Ordering::SeqCst);
-            // Now parked again at a lower bound, then released by shutdown.
-            g.set_active(1);
-            assert!(!g.wait_active(1), "expected shutdown");
-        });
-
-        // Index-1 worker must still be parked.
-        std::thread::sleep(Duration::from_millis(50));
-        assert_eq!(woke.load(Ordering::SeqCst), 0, "worker woke too early");
-
-        // Raise the bound to admit index 1.
-        gate.set_active(2);
-        std::thread::sleep(Duration::from_millis(50));
-        assert_eq!(woke.load(Ordering::SeqCst), 1, "worker did not wake on set_active");
-
-        // Release the now re-parked worker via shutdown.
-        gate.shutdown();
-        h.join().unwrap();
-    }
-
     /// InflightCap: acquire blocks at the ceiling, release admits the next,
-    /// `set_max` can raise/lower it live, and `shutdown` frees a blocked waiter.
+    /// and `shutdown` frees a blocked waiter.
     #[test]
-    fn inflight_cap_blocks_releases_resizes_shuts_down() {
+    fn inflight_cap_blocks_releases_shuts_down() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
 
@@ -1707,14 +1529,9 @@ mod tests {
         h.join().unwrap();
         assert_eq!(admitted.load(Ordering::SeqCst), 1);
 
-        // We're at 2 in flight again (waiter took the freed slot + one held).
-        // Raising the ceiling admits another without a release.
-        cap.set_max(3);
-        assert!(cap.acquire());
-
-        // Lowering below the current count just makes the next acquire wait;
-        // shutdown releases a blocked waiter with `false`.
-        cap.set_max(1);
+        // We're at 2 in flight again (waiter took the freed slot + one held), so
+        // we're back at the ceiling; a further acquire blocks until shutdown
+        // releases it with `false`.
         let c = Arc::clone(&cap);
         let shut = std::thread::spawn(move || c.acquire());
         std::thread::sleep(Duration::from_millis(50));
