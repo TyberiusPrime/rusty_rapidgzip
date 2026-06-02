@@ -1115,12 +1115,16 @@ pub fn parallel_decode_bgzf(
     let num_threads = effective_threads(config);
     let verbose = config.verbose.is_on();
 
-    // Walk member boundaries up front.
+    // Walk member boundaries up front. The walk stops at the first member that
+    // is not a BGZF block; everything before `pos` is decoded here in parallel.
+    // A non-BGZF member is not necessarily an error: a file may be BGZF blocks
+    // with a plain gzip member concatenated on the end (e.g. `cat a.bgz b.gz`).
+    // In that case `pos` marks where the regular member path takes over below.
     let mut members: Vec<(usize, usize)> = Vec::new();
     let mut pos = 0usize;
     while pos < file.len() {
         let Some(size) = crate::gzip::parse_bgzf_block_size(&file[pos..]) else {
-            return Err(Error::Gzip(crate::gzip::GzipError::Truncated));
+            break;
         };
         let size = size as usize;
         if pos + size > file.len() {
@@ -1129,6 +1133,8 @@ pub fn parallel_decode_bgzf(
         members.push((pos, pos + size));
         pos += size;
     }
+    // Byte offset where the non-BGZF remainder (if any) begins.
+    let remainder_offset = pos;
 
     // Batch members so each work item covers ~chunk_size_bytes of compressed
     // input. With BGZF blocks typically ~16 KiB compressed, a 4 MiB chunk
@@ -1291,6 +1297,24 @@ pub fn parallel_decode_bgzf(
     if let Some(e) = last_err {
         return Err(e);
     }
+
+    // The BGZF prefix has been fully streamed in order. If a non-BGZF gzip
+    // remainder was concatenated after it, decode it through the regular member
+    // path, which transparently handles any further concatenated members. Its
+    // output is appended after the BGZF output, preserving stream order.
+    if remainder_offset < file.len() {
+        let header_len = crate::gzip::parse_header(&file[remainder_offset..])
+            .map_err(Error::Gzip)?;
+        let (uc, _body_consumed, ch) = parallel_decode_member(
+            Arc::clone(&file),
+            remainder_offset + header_len,
+            sink,
+            config,
+        )?;
+        total_uncompressed += uc;
+        chunks_sent += ch;
+    }
+
     Ok((total_uncompressed, chunks_sent))
 }
 
