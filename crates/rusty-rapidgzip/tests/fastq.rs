@@ -119,6 +119,76 @@ fn err_seq_qual_length_mismatch() {
     assert!(e.contains("length mismatch"), "unexpected error: {e}");
 }
 
+// ── Truncated-input errors ───────────────────────────────────────────────────
+//
+// Each test covers a different truncation point within or between records.
+// All should produce an error; the split_invariant helper verifies that the
+// error is independent of chunk boundaries.
+
+#[test]
+fn err_truncated_mid_header() {
+    // Truncated before the first newline — only a partial header.
+    let e = split_invariant(b"@r1").unwrap_err();
+    assert!(e.contains("truncated"), "unexpected error: {e}");
+}
+
+#[test]
+fn err_truncated_after_header_newline() {
+    // Header complete but no sequence line at all.
+    let e = split_invariant(b"@r1\n").unwrap_err();
+    assert!(e.contains("truncated"), "unexpected error: {e}");
+}
+
+#[test]
+fn err_truncated_mid_seq() {
+    // Sequence started but no terminating newline.
+    let e = split_invariant(b"@r1\nAC").unwrap_err();
+    assert!(e.contains("truncated"), "unexpected error: {e}");
+}
+
+#[test]
+fn err_truncated_after_seq_newline() {
+    // Sequence complete but no separator line.
+    let e = split_invariant(b"@r1\nACGT\n").unwrap_err();
+    assert!(e.contains("truncated"), "unexpected error: {e}");
+}
+
+#[test]
+fn err_truncated_mid_sep() {
+    // Separator started ('+') but no terminating newline.
+    let e = split_invariant(b"@r1\nACGT\n+").unwrap_err();
+    assert!(e.contains("truncated"), "unexpected error: {e}");
+}
+
+#[test]
+fn err_truncated_after_sep_newline() {
+    // Separator complete but no quality line.
+    let e = split_invariant(b"@r1\nACGT\n+\n").unwrap_err();
+    assert!(e.contains("truncated"), "unexpected error: {e}");
+}
+
+#[test]
+fn err_truncated_mid_qual() {
+    // Quality line shorter than sequence — caught as a length mismatch.
+    let e = split_invariant(b"@r1\nACGT\n+\nII").unwrap_err();
+    assert!(e.contains("length mismatch") || e.contains("truncated"), "unexpected error: {e}");
+}
+
+#[test]
+fn err_truncated_second_record_after_complete_first() {
+    // First record is complete; second record is truncated at its header line.
+    // The stream should error, not silently drop the partial record.
+    let e = split_invariant(b"@r1\nACGT\n+\nIIII\n@r2\n").unwrap_err();
+    assert!(e.contains("truncated"), "unexpected error: {e}");
+}
+
+#[test]
+fn err_truncated_second_record_mid_seq() {
+    // First record complete; second record has header and partial sequence.
+    let e = split_invariant(b"@r1\nACGT\n+\nIIII\n@r2\nGG").unwrap_err();
+    assert!(e.contains("truncated"), "unexpected error: {e}");
+}
+
 // ── End-to-end through the real decoder (requires system `gzip`) ────────────
 
 fn gzip(payload: &[u8]) -> Option<Vec<u8>> {

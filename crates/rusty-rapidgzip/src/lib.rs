@@ -514,7 +514,7 @@ fn absorb(
 
 /// Flush at end of stream: fold the file's final unterminated line (if any,
 /// from `tail_rx` / the leftover carry) onto `held`, then emit the remaining
-/// whole records. Any trailing incomplete record (truncated input) is dropped.
+/// whole records. Returns an error if the stream ends mid-record.
 fn finish_eof(
     held: Option<Cols>,
     carry: &[u8],
@@ -522,7 +522,11 @@ fn finish_eof(
     emit: &mut impl FnMut(FastqChunk),
 ) -> Result<(), Error> {
     let Some(mut h) = held else {
-        // No records seen at all — at most a lone partial line; nothing to emit.
+        if !carry.is_empty() {
+            return Err(Error::Fastq(
+                "truncated FASTQ: incomplete record at end of stream".to_string(),
+            ));
+        }
         return Ok(());
     };
     if !carry.is_empty() {
@@ -531,10 +535,11 @@ fn finish_eof(
         fastq_len_guard(h[role].buffer_bytes(), line.len())?;
         h[role].push(line);
     }
-    // Keep only whole records (drops a truncated trailing record, if present).
     let complete = h[0].len().min(h[1].len()).min(h[3].len());
-    for col in &mut h {
-        col.truncate(complete);
+    if h[0].len() != complete || h[1].len() != complete || h[3].len() != complete {
+        return Err(Error::Fastq(
+            "truncated FASTQ: incomplete record at end of stream".to_string(),
+        ));
     }
     emit_records(h, emit)
 }
