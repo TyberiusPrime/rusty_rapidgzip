@@ -409,10 +409,11 @@ fn emit_records(cols: Cols, emit: &mut impl FnMut(FastqChunk)) -> Result<(), Err
     }
     // Sequence and quality share the FASTQ per-entry length invariant, so fuse
     // them into a single DualStringPod (zero-copy — both byte buffers move in
-    // as-is). `from_columns` verifies seq.len() == qual.len() for every record
-    // and surfaces a mismatch as an error rather than emitting a malformed
-    // chunk.
-    let reads = DualStringPod::from_columns(seqs, quals).map_err(|m| Error::Fastq(m.to_string()))?;
+    // as-is). `try_from_columns` verifies seq.len() == qual.len() for every
+    // record and that the two layouts are a constant translation, surfacing any
+    // mismatch as an error rather than emitting a malformed chunk.
+    let reads =
+        DualStringPod::try_from_columns(seqs, quals).map_err(|m| Error::Fastq(m.to_string()))?;
     names.cut_start(1); // drop the leading '@' from every header, O(1)
     emit(FastqChunk { names, reads });
     Ok(())

@@ -5,21 +5,37 @@ use std::sync::Arc;
 use crate::single::StringPod;
 use crate::storage::Storage;
 
-/// Error returned by [`DualStringPod::from_columns`] when the two columns do
-/// not share the per-entry length invariant a [`DualStringPod`] requires — i.e.
-/// some entry's sequence and quality strings have different lengths, or the
-/// columns have different entry counts.
+/// Error returned by [`DualStringPod::try_from_columns`] when two columns
+/// cannot be fused into one [`DualStringPod`] without copying — i.e. they are
+/// not a valid sequence + quality pair sharing a single metadata layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-
-enum ColumnError {
+pub enum ColumnError {
+    /// The two columns have a different number of entries.
     EqualCountViolated,
+    /// Per-entry counts match, but some record's sequence and quality strings
+    /// have different lengths.
     UnequalLengths,
+    /// Per-entry lengths match, but the two byte layouts are not a constant
+    /// translation of each other (entry starts differ by a non-constant
+    /// offset), so they cannot share one metadata column. In practice this
+    /// means the input isn't well-formed FASTQ.
     NotATranslation,
 }
 
 impl std::fmt::Display for ColumnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        todo!()
+        let msg = match self {
+            ColumnError::EqualCountViolated => {
+                "sequence and quality columns have a different number of entries"
+            }
+            ColumnError::UnequalLengths => {
+                "sequence/quality entry length mismatch: a record's seq and qual differ in length"
+            }
+            ColumnError::NotATranslation => {
+                "sequence and quality byte layouts are not a constant translation of each other"
+            }
+        };
+        f.write_str(msg)
     }
 }
 
@@ -48,139 +64,120 @@ impl DualStringPod {
         DualStringPodBuilder::with_capacity(0, 0).finish()
     }
 
-    /// Fuse two equal-layout columns (e.g. FASTQ sequence + quality) into a
-    /// single dual pod **without copying any bytes**: both byte buffers are
-    /// moved in as-is and the shared per-entry metadata is taken from `seq`.
+    /// Fuse two columns (e.g. FASTQ sequence + quality) into a single dual pod
+    /// **without copying any bytes**: both byte buffers are moved in as-is and a
+    /// single shared metadata column describes their *relative* per-entry
+    /// layout. The two `*_first_byte` offsets record where each column's entry 0
+    /// actually starts, so the buffers may live at a constant offset from each
+    /// other (the "stray bytes at the start" from the 'pull into previous block'
+    /// schema) and still share one metadata column.
     ///
     /// This is the zero-copy bridge from a columnar split that builds `seq` and
     /// `qual` as independent [`StringPod`]s to the structural
     /// `seq[i].len() == qual[i].len()` invariant a [`DualStringPod`] enforces.
     ///
-    /// The second invariant is that the starts of seq are the qual starts +- an offset
-    /// (which may be negative, if seq is the one with the stray bytes at the start,
-    /// from our 'pull into previous block' schema.)
-    ///
     /// The two columns must have the same entry count and, for every entry, the
-    /// same length. Their starts must also be a translation of each other.
+    /// same length. Their entry starts must also be a constant translation of
+    /// each other — which, for lockstep-built columns, holds exactly when the
+    /// input is well-formed FASTQ.
     ///
     /// # Errors
     ///
-    /// ColumnError::EqualCountViolated when seq.len() != qual.len()
-    /// ColumnError::UnequalLengths when two entries are of the wrong length
-    /// ColumnError::NotATranslation when we can't map them one-to-one.
-    ///
-    /// At that point it's time to tell the consumer that this ain't FASTQ.
-    pub fn from_columns(seq: StringPod, qual: StringPod) -> Result<Self, ColumnError> {
+    /// - [`ColumnError::EqualCountViolated`] when `seq.len() != qual.len()`.
+    /// - [`ColumnError::UnequalLengths`] when some record's seq and qual differ
+    ///   in length.
+    /// - [`ColumnError::NotATranslation`] when the per-entry starts are not a
+    ///   constant translation of each other — at which point it's time to tell
+    ///   the consumer that this ain't FASTQ.
+    pub fn try_from_columns(seq: StringPod, qual: StringPod) -> Result<Self, ColumnError> {
         if seq.len() != qual.len() {
-            return Err(ColumnLengthMismatch {
-                index: seq.len().min(qual.len()),
-                seq_len: seq.len(),
-                qual_len: qual.len(),
-            });
+            return Err(ColumnError::EqualCountViolated);
         }
-        // Validate the per-entry length invariant and, in the same pass, learn
-        // whether the two columns already share an identical byte layout.
-        let (storage, seq_first_byte, qual_first_byte): (Storage, usize, usize) =
-            match (&seq.storage, &qual.storage) {
-                (
-                    Storage::FixedLength {
-                        stride: seq_stride,
-                        head_skip: seq_head_skip,
-                        visible_len: seq_visible_len,
-                        count: seq_count,
-                        front_byte: seq_front_byte,
-                    },
-                    Storage::FixedLength {
-                        stride: qual_stride,
-                        head_skip: qual_head_skip,
-                        visible_len: qual_visible_len,
-                        count: qual_count,
-                        front_byte: qual_front_byte,
-                    },
-                ) => {
-                    if seq_stride == qual_stride
-                        && seq_head_skip == qual_head_skip
-                        && seq_visible_len == qual_visible_len
-                        && seq_count == qual_count
-                    {
-                        // Both columns have identical fixed-length layout, with
-                        // maybe a front_byte offset. Safe for zero copy
-                        todo!()
-                    } else if seq_visible_len == qual_visible_len {
-                        // Both columns are fixed-length but their layouts differ — must rebuild.
-                        todo!();
-                    } else {
-                        //todo: this error must be better.
-                        return Err(ColumnLengthMismatch {
-                            index: 0, // all entries have different length, so report the first
-                            seq_len: *seq_visible_len as usize,
-                            qual_len: *qual_visible_len as usize,
-                        });
-                    }
-                }
-                (Storage::Variable { .. }, Storage::FixedLength { .. })
-                | (Storage::FixedLength { .. }, Storage::Variable { .. }) => {
-                    todo!("error return");
-                }
-                (Storage::Variable { .. }, Storage::Variable { .. }) => {
-                    let mut offset = None;
-                    for i in 0..seq.len() {
-                        let sr = seq.storage.entry_range(i);
-                        let qr = qual.storage.entry_range(i);
-                        if (sr.end - sr.start) != (qr.end - qr.start) {
-                            return Err(ColumnLengthMismatch {
-                                index: i,
-                                seq_len: sr.end - sr.start,
-                                qual_len: qr.end - qr.start,
-                            });
-                        }
-                        let o = sr.start as i64 - qr.start as i64;
-                        match offset {
-                            None => {
-                                offset = Some(o);
-                            }
-                            Some(last) => {
-                                if last != o {
-                                    return Err(ColumnLengthMismatch {
-                                        index: i,
-                                        seq_len: sr.end - sr.start,
-                                        qual_len: qr.end - qr.start,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                    todo!();
-                }
-            };
 
+        // Fast path: both columns are fixed-length with an identical *relative*
+        // layout (same stride / cut overlay / count). Only their `front_byte`
+        // may differ — that constant offset is captured by the two
+        // `*_first_byte` fields, so we keep the strided metadata (true O(1),
+        // no positions vec) and share it between both buffers.
+        if let (
+            Storage::FixedLength {
+                stride: seq_stride,
+                head_skip: seq_head_skip,
+                visible_len: seq_visible_len,
+                count: seq_count,
+                front_byte: seq_front_byte,
+            },
+            Storage::FixedLength {
+                stride: qual_stride,
+                head_skip: qual_head_skip,
+                visible_len: qual_visible_len,
+                front_byte: qual_front_byte,
+                ..
+            },
+        ) = (&seq.storage, &qual.storage)
+        {
+            if seq_stride == qual_stride
+                && seq_head_skip == qual_head_skip
+                && seq_visible_len == qual_visible_len
+            {
+                let storage = Storage::FixedLength {
+                    stride: *seq_stride,
+                    head_skip: *seq_head_skip,
+                    visible_len: *seq_visible_len,
+                    count: *seq_count,
+                    // Entry 0 is now relative to each column's own first byte.
+                    front_byte: 0,
+                };
+                return Ok(DualStringPod {
+                    seq: seq.data,
+                    qual: qual.data,
+                    storage,
+                    seq_first_byte: *seq_front_byte as usize,
+                    qual_first_byte: *qual_front_byte as usize,
+                });
+            }
+        }
+
+        // General path: validate the per-entry length invariant and the
+        // constant-translation invariant in a single pass, building a shared
+        // metadata column whose positions are relative to each column's entry-0
+        // start. Bytes are never touched — only this positions vec is built.
+        let n = seq.len();
+        let mut positions: Vec<(u32, u32)> = Vec::with_capacity(n);
+        let mut base_seq = 0usize;
+        let mut base_qual = 0usize;
+        for i in 0..n {
+            let sr = seq.storage.entry_range(i);
+            let qr = qual.storage.entry_range(i);
+            if (sr.end - sr.start) != (qr.end - qr.start) {
+                return Err(ColumnError::UnequalLengths);
+            }
+            if i == 0 {
+                base_seq = sr.start;
+                base_qual = qr.start;
+            } else if (sr.start - base_seq) != (qr.start - base_qual) {
+                // Entry starts drift apart — not a constant translation.
+                return Err(ColumnError::NotATranslation);
+            }
+            let rel_start =
+                u32::try_from(sr.start - base_seq).expect("entry start exceeds u32::MAX");
+            let rel_end = u32::try_from(sr.end - base_seq).expect("entry end exceeds u32::MAX");
+            positions.push((rel_start, rel_end));
+        }
+
+        let storage = Storage::Variable {
+            positions,
+            head_skip: 0,
+            tail_skip: 0,
+            front_skip: 0,
+        };
         Ok(DualStringPod {
             seq: seq.data,
             qual: qual.data,
             storage,
-            seq_first_byte,
-            qual_first_byte,
+            seq_first_byte: base_seq,
+            qual_first_byte: base_qual,
         })
-        //
-        // if same_layout {
-        //     // Zero-copy: both buffers are indexed identically, so reuse them and
-        //     // share `seq`'s metadata.
-        //     Ok(DualStringPod {
-        //         seq: seq.data,
-        //         qual: qual.data,
-        //         storage: seq.storage,
-        //         seq_offset: 0,
-        //         qual_offset: 0,
-        //     })
-        // } else {
-        //     // Equal lengths but divergent offsets — rebuild into one shared
-        //     // contiguous layout (one copy of each column).
-        //     let mut b = DualStringPodBuilder::with_capacity(0, seq.len());
-        //     for i in 0..seq.len() {
-        //         b.push(seq.get(i), qual.get(i));
-        //     }
-        //     Ok(b.finish())
-        // }
     }
 
     #[must_use]
@@ -200,7 +197,7 @@ impl DualStringPod {
     #[must_use]
     pub fn seq(&self, i: usize) -> &BStr {
         let r = self.storage.entry_range(i);
-        BStr::new(&self.seq[r])
+        BStr::new(&self.seq[r.start + self.seq_first_byte..r.end + self.seq_first_byte])
     }
 
     /// Quality bytes of entry `i`. Shares the same range as `seq(i)`.
@@ -210,7 +207,7 @@ impl DualStringPod {
     #[must_use]
     pub fn qual(&self, i: usize) -> &BStr {
         let r = self.storage.entry_range(i);
-        BStr::new(&self.qual[r])
+        BStr::new(&self.qual[r.start + self.qual_first_byte..r.end + self.qual_first_byte])
     }
 
     /// Both bytes of entry `i` at once.
@@ -220,7 +217,10 @@ impl DualStringPod {
     #[must_use]
     pub fn pair(&self, i: usize) -> (&BStr, &BStr) {
         let r = self.storage.entry_range(i);
-        (BStr::new(&self.seq[r.clone()]), BStr::new(&self.qual[r]))
+        (
+            BStr::new(&self.seq[r.start + self.seq_first_byte..r.end + self.seq_first_byte]),
+            BStr::new(&self.qual[r.start + self.qual_first_byte..r.end + self.qual_first_byte]),
+        )
     }
 
     #[must_use]
@@ -553,7 +553,7 @@ impl DualStringPodAliasBuilder {
 
 #[cfg(test)]
 mod tests {
-    use super::{DualStringPod, DualStringPodBuilder};
+    use super::{ColumnError, DualStringPod, DualStringPodBuilder};
     use bstr::BStr;
 
     fn b(s: &str) -> &[u8] {
@@ -779,14 +779,23 @@ mod tests {
         bld.finish()
     }
 
+    /// Build a `FixedLength`-storage pod (stride = entry length).
+    fn fixed_pod(stride: usize, entries: &[&str]) -> StringPod {
+        let mut bld = StringPodBuilder::with_capacity(stride, entries.len());
+        for e in entries {
+            bld.push(b(e));
+        }
+        bld.finish()
+    }
+
     #[test]
-    fn from_columns_zero_copy_fixed() {
+    fn from_columns_zero_copy() {
         let seq = seq_pod(&["ACGT", "TTTT", "GGGG"]);
         let qual = seq_pod(&["IIII", "FFFF", "####"]);
         // Buffers we expect to be reused (no copy) — capture the pointers.
         let seq_ptr = seq.data.as_ptr();
         let qual_ptr = qual.data.as_ptr();
-        let dual = DualStringPod::from_columns(seq, qual).unwrap();
+        let dual = DualStringPod::try_from_columns(seq, qual).unwrap();
         assert_eq!(dual.len(), 3);
         assert_eq!(dual.seq(0), BStr::new("ACGT"));
         assert_eq!(dual.qual(0), BStr::new("IIII"));
@@ -798,10 +807,48 @@ mod tests {
     }
 
     #[test]
+    fn from_columns_fixed_fast_path_keeps_strided() {
+        // Both columns FixedLength with identical layout → strided metadata
+        // is kept (no positions vec) and bytes are shared.
+        let seq = fixed_pod(4, &["ACGT", "TTTT", "GGGG"]);
+        let qual = fixed_pod(4, &["IIII", "FFFF", "####"]);
+        let seq_ptr = seq.data.as_ptr();
+        let qual_ptr = qual.data.as_ptr();
+        let dual = DualStringPod::try_from_columns(seq, qual).unwrap();
+        assert!(dual.is_fixed_length());
+        assert_eq!(dual.seq(1), BStr::new("TTTT"));
+        assert_eq!(dual.qual(1), BStr::new("FFFF"));
+        assert_eq!(dual.seq.as_ptr(), seq_ptr);
+        assert_eq!(dual.qual.as_ptr(), qual_ptr);
+    }
+
+    #[test]
+    fn from_columns_constant_offset_no_copy() {
+        // seq carries a stray leading entry (dropped via pop_front), so its
+        // first byte sits 4 bytes past qual's. The shared metadata plus the two
+        // per-column offsets must still index both correctly — and without
+        // copying any bytes.
+        let mut seq = fixed_pod(4, &["XXXX", "ACGT", "TTTT"]);
+        seq.pop_front(1); // front_byte now 4; entries "ACGT","TTTT"
+        let qual = fixed_pod(4, &["IIII", "FFFF"]); // front_byte 0
+        let seq_ptr = seq.data.as_ptr();
+        let qual_ptr = qual.data.as_ptr();
+        let dual = DualStringPod::try_from_columns(seq, qual).unwrap();
+        assert_eq!(dual.len(), 2);
+        assert_eq!(dual.seq(0), BStr::new("ACGT"));
+        assert_eq!(dual.qual(0), BStr::new("IIII"));
+        assert_eq!(dual.seq(1), BStr::new("TTTT"));
+        assert_eq!(dual.qual(1), BStr::new("FFFF"));
+        // Still zero-copy despite the divergent offsets.
+        assert_eq!(dual.seq.as_ptr(), seq_ptr);
+        assert_eq!(dual.qual.as_ptr(), qual_ptr);
+    }
+
+    #[test]
     fn from_columns_variable_lengths() {
         let seq = seq_pod(&["A", "ACGTACGT", "ACG"]);
         let qual = seq_pod(&["I", "FFFFFFFF", "JJJ"]);
-        let dual = DualStringPod::from_columns(seq, qual).unwrap();
+        let dual = DualStringPod::try_from_columns(seq, qual).unwrap();
         let pairs: Vec<(&BStr, &BStr)> = dual.iter().collect();
         assert_eq!(pairs[1].0, BStr::new("ACGTACGT"));
         assert_eq!(pairs[1].1, BStr::new("FFFFFFFF"));
@@ -811,10 +858,8 @@ mod tests {
     fn from_columns_entry_length_mismatch_errors() {
         let seq = seq_pod(&["ACGT", "TT"]);
         let qual = seq_pod(&["IIII", "F"]); // entry 1: 2 != 1
-        let err = DualStringPod::from_columns(seq, qual).unwrap_err();
-        assert_eq!(err.index, 1);
-        assert_eq!(err.seq_len, 2);
-        assert_eq!(err.qual_len, 1);
+        let err = DualStringPod::try_from_columns(seq, qual).unwrap_err();
+        assert_eq!(err, ColumnError::UnequalLengths);
         assert!(err.to_string().contains("length mismatch"));
     }
 
@@ -822,8 +867,18 @@ mod tests {
     fn from_columns_count_mismatch_errors() {
         let seq = seq_pod(&["ACGT", "TTTT"]);
         let qual = seq_pod(&["IIII"]);
-        let err = DualStringPod::from_columns(seq, qual).unwrap_err();
-        assert_eq!(err.seq_len, 2);
-        assert_eq!(err.qual_len, 1);
+        let err = DualStringPod::try_from_columns(seq, qual).unwrap_err();
+        assert_eq!(err, ColumnError::EqualCountViolated);
+    }
+
+    #[test]
+    fn from_columns_non_constant_offset_errors() {
+        // Equal per-entry lengths, but qual has an orphaned gap (from a drain)
+        // so the entry starts drift apart — not a constant translation.
+        let seq = seq_pod(&["ACGT", "TTTT"]);
+        let mut qual = seq_pod(&["IIII", "ZZZZ", "FFFF"]);
+        qual.drain(1..2); // entries "IIII"(0..4), "FFFF"(8..12)
+        let err = DualStringPod::try_from_columns(seq, qual).unwrap_err();
+        assert_eq!(err, ColumnError::NotATranslation);
     }
 }

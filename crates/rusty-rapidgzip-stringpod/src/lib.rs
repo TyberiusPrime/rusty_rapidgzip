@@ -27,6 +27,6 @@ mod single;
 mod storage;
 
 pub use dual::{
-    ColumnLengthMismatch, DualStringPod, DualStringPodAliasBuilder, DualStringPodBuilder,
+    ColumnError, DualStringPod, DualStringPodAliasBuilder, DualStringPodBuilder,
 };
 pub use single::{StringPod, StringPodAliasBuilder, StringPodBuilder};
