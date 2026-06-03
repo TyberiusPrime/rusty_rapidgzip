@@ -209,14 +209,18 @@ const COPY_HEADROOM: usize = COPY_N;
 #[inline(always)]
 #[allow(unsafe_code)]
 unsafe fn copy_one_chunk<const N: usize>(src: *const u8, dst: *mut u8) {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    // SIMD intrinsics are skipped under Miri (incomplete intrinsic coverage
+    // would abort the interpreter); the scalar `read_unaligned` fallback below
+    // exercises the exact same pointer-bounds contract, which is what we want
+    // Miri to validate.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(miri)))]
     if N == 32 {
         use core::arch::x86_64::{__m256i, _mm256_loadu_si256, _mm256_storeu_si256};
         let v = unsafe { _mm256_loadu_si256(src as *const __m256i) };
         unsafe { _mm256_storeu_si256(dst as *mut __m256i, v) };
         return;
     }
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
     if N == 16 {
         use core::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_storeu_si128};
         let v = unsafe { _mm_loadu_si128(src as *const __m128i) };

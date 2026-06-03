@@ -35,6 +35,43 @@
         rustStable = pkgs.rust-bin.stable.latest.default;
         rust = rustStable;
 
+        # Pinned nightly toolchain for the Miri UB check. Miri ships only on
+        # nightly, as the `miri` rustup component; `rust-src` is needed so
+        # `cargo miri setup` can build the std sysroot offline.
+        #
+        # The date must be one the *locked* rust-overlay knows about (run
+        # `nix flake metadata` / bump with `nix flake update rust-overlay` to
+        # move it forward — the newest the current lock exposes is 2026-05-25).
+        rustMiri = pkgs.rust-bin.nightly."2026-05-25".default.override {
+          extensions = [ "miri" "rust-src" ];
+        };
+
+        # Vendor dir for the Miri check. `cargo miri setup` rebuilds the std
+        # sysroot *from source*, so std's own crate deps (hashbrown, libc, …)
+        # must live in the same source-replacement directory as our project's
+        # deps — otherwise the offline sysroot build fails with
+        # "no matching package named `hashbrown`". We vendor both lockfiles and
+        # merge them into a single `cargo-vendor-dir` (the project's Cargo.lock
+        # stays at the root, since cargoSetupHook diffs it against ours).
+        miriProjectVendor = pkgs.rustPlatform.importCargoLock {
+          lockFile = ./Cargo.lock;
+        };
+        miriStdVendor = pkgs.rustPlatform.importCargoLock {
+          lockFile = "${rustMiri}/lib/rustlib/src/rust/library/Cargo.lock";
+        };
+        miriCargoVendor = pkgs.runCommandLocal "cargo-vendor-dir" { } ''
+          mkdir -p "$out/.cargo"
+          for src in ${miriStdVendor} ${miriProjectVendor}; do
+            for entry in "$src"/*; do
+              name=$(basename "$entry")
+              [ "$name" = "Cargo.lock" ] && continue
+              ln -sfn "$entry" "$out/$name"
+            done
+          done
+          cp ${miriStdVendor}/.cargo/config.toml "$out/.cargo/config.toml"
+          cp -f ${./Cargo.lock} "$out/Cargo.lock"
+        '';
+
         # Override the version used in naersk
         naersk-lib = naersk.lib."${system}".override {
           cargo = rust;
@@ -121,6 +158,45 @@
             src = ./.;
             mode = "clippy";
           };
+
+          # `nix build .#checks.<system>.miri` — run the remaining `unsafe`
+          # blocks in rusty-rapidgzip-deflate under Miri to catch UB
+          # (out-of-bounds, uninit reads, provenance/aliasing violations) in
+          # the back-reference copy kernels. Runs the self-contained
+          # `tests/miri_edge.rs` (no `gzip` subprocess — Miri can't exec) under
+          # both the default Stacked Borrows and the stricter Tree Borrows
+          # aliasing models.
+          miri =
+            pkgs.stdenv.mkDerivation {
+              name = "rusty-rapidgzip-miri";
+              src = ./.;
+              cargoDeps = miriCargoVendor;
+              nativeBuildInputs = [
+                rustMiri
+                pkgs.rustPlatform.cargoSetupHook
+              ];
+              # Miri interprets MIR — no host linker / cc needed, and the
+              # default check/fixup phases have nothing to do here.
+              dontFixup = true;
+              buildPhase = ''
+                runHook preBuild
+                export HOME=$(mktemp -d)
+                # Build the std sysroot Miri runs against (offline: rust-src is
+                # in the toolchain; cargoSetupHook vendored all crate deps).
+                cargo miri setup --offline
+
+                target="-p rusty-rapidgzip-deflate --test miri_edge --offline"
+                base="-Zmiri-strict-provenance -Zmiri-symbolic-alignment-check"
+
+                echo "── Miri: Stacked Borrows ──"
+                MIRIFLAGS="$base" cargo miri test $target
+
+                echo "── Miri: Tree Borrows ──"
+                MIRIFLAGS="$base -Zmiri-tree-borrows" cargo miri test $target
+                runHook postBuild
+              '';
+              installPhase = "touch $out";
+            };
         };
 
         # `nix develop`
