@@ -9,6 +9,8 @@
 //!   - no `unsafe` is used, so this serves as a clean baseline we can profile
 //!     and optimize against the existing zlib-rs-derived hot path.
 //!
+//! This is most useful in comparing with fast_inflate's output in our fuzzing.
+//!
 //! Use [`inflate`] for "give me the bytes" decoding, or [`inflate_into`] when
 //! the caller (e.g. gzip framing) needs to know how many input bytes were
 //! consumed.

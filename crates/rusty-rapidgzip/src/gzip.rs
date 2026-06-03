@@ -13,34 +13,6 @@ use thiserror::Error;
 
 use rusty_rapidgzip_deflate::{fast_inflate, inflate, safe_inflate, BitReader, DeflateError};
 
-/// Which DEFLATE engine to use for the framed-gzip and BGZF paths.
-///
-/// The speculative parallel pipeline always uses the in-tree `fast_inflate`
-/// kernel (it carries the marker machinery); this selector controls the
-/// *window-known* serial paths only (the BGZF per-member decode and the
-/// serial-gzip `decode_one_indexed`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum InflateEngine {
-    /// In-tree rapidgzip-deflate inflater (perf-tuned, contains `unsafe`).
-    #[default]
-    Intree,
-    /// Pure-safe puff-style inflater. Currently slower; here for safety and
-    /// as the target for iterative perf work.
-    Safe,
-}
-
-impl InflateEngine {
-    /// Read `RAPIDGZIP_INFLATE` and resolve to an engine. Unknown values
-    /// fall back to the in-tree engine (the historical default).
-    pub fn from_env() -> Self {
-        match std::env::var("RAPIDGZIP_INFLATE").as_deref() {
-            Ok("safe") => Self::Safe,
-            Ok("intree") => Self::Intree,
-            _ => Self::default(),
-        }
-    }
-}
-
 const GZ_MAGIC: [u8; 2] = [0x1f, 0x8b];
 const CM_DEFLATE: u8 = 8;
 
@@ -117,11 +89,6 @@ pub fn decode_one_indexed(
     out: &mut Vec<u8>,
     member: u32,
 ) -> Result<usize, GzipError> {
-    // Engine dispatch for the serial path: `Safe` uses the puff-style
-    // inflater, everything else uses the in-tree decoder below.
-    if let InflateEngine::Safe = InflateEngine::from_env() {
-        return decode_one_indexed_safe(input, out, member);
-    }
 
     let header_len = parse_header(input)?;
     let body_start = header_len;

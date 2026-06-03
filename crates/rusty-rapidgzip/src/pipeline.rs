@@ -71,8 +71,7 @@ impl std::ops::Deref for InputBytes {
 }
 
 use rusty_rapidgzip_deflate::{
-    find_next_dynamic_block, resolve_markers,
-    fast_inflate, BitReader, SpeculativeChunk,
+    fast_inflate, find_next_dynamic_block, resolve_markers, BitReader, SpeculativeChunk,
 };
 
 use crate::{Config, Error};
@@ -132,7 +131,11 @@ struct InflightState {
 impl InflightCap {
     fn new(max: usize) -> Self {
         Self {
-            inner: Mutex::new(InflightState { in_flight: 0, max: max.max(1), shutdown: false }),
+            inner: Mutex::new(InflightState {
+                in_flight: 0,
+                max: max.max(1),
+                shutdown: false,
+            }),
             cv: Condvar::new(),
         }
     }
@@ -372,11 +375,12 @@ pub fn parallel_decode_member(
     let mut work_items: Vec<WorkItem> = Vec::with_capacity(boundaries.len());
     for i in 0..boundaries.len() {
         let start_bit = boundaries[i];
-        let end_bit_hint = boundaries
-            .get(i + 1)
-            .copied()
-            .unwrap_or(u64::MAX);
-        work_items.push(WorkItem { id: i as u64, start_bit, end_bit_hint });
+        let end_bit_hint = boundaries.get(i + 1).copied().unwrap_or(u64::MAX);
+        work_items.push(WorkItem {
+            id: i as u64,
+            start_bit,
+            end_bit_hint,
+        });
     }
     let num_chunks = work_items.len();
     if verbose {
@@ -417,9 +421,7 @@ pub fn parallel_decode_member(
                 };
                 // Try to pull a recycled output buffer; pages on it are
                 // warm so subsequent writes don't take page faults.
-                let recycled = recycle_rx
-                    .as_ref()
-                    .and_then(|r| r.try_recv().ok());
+                let recycled = recycle_rx.as_ref().and_then(|r| r.try_recv().ok());
                 let result = decode_one_chunk(body, &item, &mut wk, recycled);
                 let outcome = WorkOutcome {
                     id: item.id,
@@ -505,10 +507,8 @@ pub fn parallel_decode_member(
             cur_crc.update(tail);
             cur_uncompressed += tail.len() as u64;
             drop(member_boundaries);
-            if let (Some(tx), Ok(mut v)) = (
-                recycle_tx_for_crc.as_ref(),
-                Arc::try_unwrap(bytes_arc),
-            ) {
+            if let (Some(tx), Ok(mut v)) = (recycle_tx_for_crc.as_ref(), Arc::try_unwrap(bytes_arc))
+            {
                 v.clear();
                 let _ = tx.try_send(v);
             }
@@ -603,7 +603,12 @@ pub fn parallel_decode_member(
             let mut spec_failures: u64 = 0;
             while next_id < num_chunks {
                 while let Some(outcome) = reorder.remove(&next_id) {
-                    let WorkOutcome { id, start_bit, end_bit_hint, result } = outcome;
+                    let WorkOutcome {
+                        id,
+                        start_bit,
+                        end_bit_hint,
+                        result,
+                    } = outcome;
                     debug_assert_eq!(id, next_id);
                     // Accept the speculative result only if it decoded cleanly
                     // *and* started exactly where the chain expects. Otherwise
@@ -766,12 +771,14 @@ pub fn parallel_decode_member(
         return Err(e);
     }
 
-    crc_handle.join().unwrap_or_else(|_| {
-        Err(Error::Io(std::io::Error::other("crc thread panicked")))
-    })?;
+    crc_handle
+        .join()
+        .unwrap_or_else(|_| Err(Error::Io(std::io::Error::other("crc thread panicked"))))?;
 
     let bc = final_byte.ok_or_else(|| {
-        Error::Io(std::io::Error::other("parallel decode produced no final block"))
+        Error::Io(std::io::Error::other(
+            "parallel decode produced no final block",
+        ))
     })?;
     Ok((total_uc, bc, sent, spec_failures))
 }
@@ -782,11 +789,15 @@ pub(crate) fn build_prev_tail_fast(chunk: &SpeculativeChunk, prev_tail: &[u8]) -
     const WINDOW: usize = 32 * 1024;
     let len = chunk.bytes.len();
     let tail_start = len.saturating_sub(WINDOW);
-    let first = chunk.markers.partition_point(|m| (m.out_pos as usize) < tail_start);
+    let first = chunk
+        .markers
+        .partition_point(|m| (m.out_pos as usize) < tail_start);
     let mut new_tail = chunk.bytes[tail_start..].to_vec();
     for m in &chunk.markers[first..] {
         let pos = m.out_pos as usize;
-        if pos >= tail_start + new_tail.len() { break; }
+        if pos >= tail_start + new_tail.len() {
+            break;
+        }
         let dst = pos - tail_start;
         let off = m.prefix_offset as usize;
         if off < prev_tail.len() {
@@ -857,12 +868,10 @@ fn decode_one_chunk(
         if trailer_byte + 8 > body.len() {
             return Err(Error::Gzip(crate::GzipError::Truncated));
         }
-        let crc_expected = u32::from_le_bytes(
-            body[trailer_byte..trailer_byte + 4].try_into().unwrap(),
-        );
-        let isize_expected = u32::from_le_bytes(
-            body[trailer_byte + 4..trailer_byte + 8].try_into().unwrap(),
-        );
+        let crc_expected =
+            u32::from_le_bytes(body[trailer_byte..trailer_byte + 4].try_into().unwrap());
+        let isize_expected =
+            u32::from_le_bytes(body[trailer_byte + 4..trailer_byte + 8].try_into().unwrap());
         member_boundaries.push(MemberBoundary {
             byte_offset_in_chunk: chunk.bytes.len(),
             crc_expected,
@@ -880,8 +889,7 @@ fn decode_one_chunk(
         }
 
         // Another member follows. Parse its gzip header and continue.
-        let header_len = crate::gzip::parse_header(&body[after_trailer..])
-            .map_err(Error::Gzip)?;
+        let header_len = crate::gzip::parse_header(&body[after_trailer..]).map_err(Error::Gzip)?;
         let next_block_byte = after_trailer + header_len;
         br.seek_to_bit((next_block_byte as u64) * 8)
             .map_err(Error::Deflate)?;
@@ -969,8 +977,7 @@ fn serial_decode_member(
     let mut member_uncompressed: u64 = 0;
 
     loop {
-        let bfinal =
-            fast_inflate::decode_one_block(&mut br, &mut out).map_err(Error::Deflate)?;
+        let bfinal = fast_inflate::decode_one_block(&mut br, &mut out).map_err(Error::Deflate)?;
 
         if !bfinal {
             // Mid-member: emit whole chunks while keeping the 32 KiB window.
@@ -1049,15 +1056,14 @@ fn serial_decode_member(
         }
 
         // Another member follows: parse its header and reset per-member state.
-        let header_len =
-            crate::gzip::parse_header(&body[after_trailer..]).map_err(Error::Gzip)?;
+        let header_len = crate::gzip::parse_header(&body[after_trailer..]).map_err(Error::Gzip)?;
         let next_block_byte = after_trailer + header_len;
-        br.seek_to_bit((next_block_byte as u64) * 8).map_err(Error::Deflate)?;
+        br.seek_to_bit((next_block_byte as u64) * 8)
+            .map_err(Error::Deflate)?;
         member_uncompressed = 0;
         // `out` is already empty; the new member starts with a fresh window.
     }
 }
-
 
 /// BGZF fast-path pipeline.
 ///
@@ -1135,10 +1141,8 @@ pub fn parallel_decode_bgzf(
 
     // Work channel: (batch_id, member_start, member_end_exclusive).
     let (work_tx, work_rx) = bounded::<(u64, usize, usize)>(num_threads * 2);
-    let (result_tx, result_rx) =
-        bounded::<Result<(u64, Vec<u8>), Error>>(num_threads * 2);
+    let (result_tx, result_rx) = bounded::<Result<(u64, Vec<u8>), Error>>(num_threads * 2);
 
-    let engine = crate::gzip::InflateEngine::from_env();
     let mut workers = Vec::with_capacity(num_threads);
     for _ in 0..num_threads {
         let work_rx = work_rx.clone();
@@ -1153,18 +1157,8 @@ pub fn parallel_decode_bgzf(
                 let mut err: Option<Error> = None;
                 for mi in m_start..m_end {
                     let (s, e) = members_ref[mi];
-                    let res = match engine {
-                        crate::gzip::InflateEngine::Safe => {
-                            crate::gzip::decode_one_indexed_safe(
-                                &file[s..e], &mut out, mi as u32,
-                            )
-                        }
-                        crate::gzip::InflateEngine::Intree => {
-                            crate::gzip::decode_one_indexed_fast(
-                                &file[s..e], &mut out, mi as u32,
-                            )
-                        }
-                    };
+                    let res =
+                        crate::gzip::decode_one_indexed_fast(&file[s..e], &mut out, mi as u32);
                     match res {
                         Ok(_) => {}
                         Err(ge) => {
@@ -1266,8 +1260,8 @@ pub fn parallel_decode_bgzf(
     // path, which transparently handles any further concatenated members. Its
     // output is appended after the BGZF output, preserving stream order.
     if remainder_offset < file.len() {
-        let header_len = crate::gzip::parse_header(&file[remainder_offset..])
-            .map_err(Error::Gzip)?;
+        let header_len =
+            crate::gzip::parse_header(&file[remainder_offset..]).map_err(Error::Gzip)?;
         let (uc, _body_consumed, ch, _spec_failures) = parallel_decode_member(
             Arc::clone(&file),
             remainder_offset + header_len,
@@ -1330,7 +1324,9 @@ mod tests {
         let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
         let mut p = Vec::with_capacity(n);
         while p.len() < n {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             p.push(((s >> 56) as u8 % 95) + 32);
         }
         p
@@ -1414,7 +1410,9 @@ mod tests {
         // Highly repetitive payload (RLE-heavy) to stress the prefix-overhang
         // propagation path (distance > emitted, with in-buffer extension).
         let mut rle = Vec::new();
-        for _ in 0..1000 { rle.extend_from_slice(b"ACGTACGTACGTACGT"); }
+        for _ in 0..1000 {
+            rle.extend_from_slice(b"ACGTACGTACGTACGT");
+        }
 
         // Random ASCII to exercise literals and varied back-refs.
         let ascii = ascii_payload(4 * 1024 * 1024);
@@ -1437,7 +1435,8 @@ mod tests {
                         },
                     );
                     assert_eq!(
-                        sha(&out), sha(payload),
+                        sha(&out),
+                        sha(payload),
                         "fast_inflate mismatch: payload={name} threads={threads} chunk={chunk_sz}"
                     );
                 }
@@ -1468,7 +1467,11 @@ mod tests {
                     ..Config::default()
                 },
             );
-            assert_eq!(sha(&out), sha(&expected), "fast_inflate multistream threads={threads}");
+            assert_eq!(
+                sha(&out),
+                sha(&expected),
+                "fast_inflate multistream threads={threads}"
+            );
         }
     }
 
@@ -1501,7 +1504,11 @@ mod tests {
         for threads in [1usize, 2, 4] {
             let out = decode_via_read_gz(
                 &path,
-                Config { num_threads: threads, chunk_size_bytes: 1 << 20, ..Config::default() },
+                Config {
+                    num_threads: threads,
+                    chunk_size_bytes: 1 << 20,
+                    ..Config::default()
+                },
             );
             assert_eq!(sha(&out), sha(&payload), "threads={threads}");
         }
@@ -1525,7 +1532,11 @@ mod tests {
         let path = write_tmp("multi3.gz", &gz);
         let out = decode_via_read_gz(
             &path,
-            Config { num_threads: 4, chunk_size_bytes: 64 * 1024, ..Config::default() },
+            Config {
+                num_threads: 4,
+                chunk_size_bytes: 64 * 1024,
+                ..Config::default()
+            },
         );
         assert_eq!(sha(&out), sha(&expected));
     }
@@ -1544,7 +1555,11 @@ mod tests {
         let path = write_tmp("multi_big_small.gz", &gz);
         let out = decode_via_read_gz(
             &path,
-            Config { num_threads: 4, chunk_size_bytes: 1 << 20, ..Config::default() },
+            Config {
+                num_threads: 4,
+                chunk_size_bytes: 1 << 20,
+                ..Config::default()
+            },
         );
         assert_eq!(sha(&out), sha(&expected));
     }
@@ -1558,7 +1573,11 @@ mod tests {
         let path = write_tmp("tiny.gz", &gz);
         let out = decode_via_read_gz(
             &path,
-            Config { num_threads: 4, chunk_size_bytes: 1 << 20, ..Config::default() },
+            Config {
+                num_threads: 4,
+                chunk_size_bytes: 1 << 20,
+                ..Config::default()
+            },
         );
         assert_eq!(out, payload);
     }
@@ -1576,10 +1595,15 @@ mod tests {
                 for &nt in &[1usize, 4] {
                     let out = decode_via_read_gz(
                         &path,
-                        Config { num_threads: nt, chunk_size_bytes: cs, ..Config::default() },
+                        Config {
+                            num_threads: nt,
+                            chunk_size_bytes: cs,
+                            ..Config::default()
+                        },
                     );
                     assert_eq!(
-                        sha(&out), sha(&payload),
+                        sha(&out),
+                        sha(&payload),
                         "size={size} chunk={cs} threads={nt}"
                     );
                 }
@@ -1595,7 +1619,9 @@ mod tests {
         let mut payload = ascii_payload(500_000);
         let mut s: u64 = 0xABCDEF0123456789;
         for _ in 0..(500_000 / 8) {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             payload.extend_from_slice(&s.to_le_bytes());
         }
         payload.extend_from_slice(&ascii_payload(500_000));
@@ -1603,7 +1629,11 @@ mod tests {
         let path = write_tmp("mixed.gz", &gz);
         let out = decode_via_read_gz(
             &path,
-            Config { num_threads: 4, chunk_size_bytes: 256 * 1024, ..Config::default() },
+            Config {
+                num_threads: 4,
+                chunk_size_bytes: 256 * 1024,
+                ..Config::default()
+            },
         );
         assert_eq!(sha(&out), sha(&payload));
     }
@@ -1629,7 +1659,11 @@ mod tests {
             a.fetch_add(1, Ordering::SeqCst);
         });
         std::thread::sleep(Duration::from_millis(50));
-        assert_eq!(admitted.load(Ordering::SeqCst), 0, "acquired over the ceiling");
+        assert_eq!(
+            admitted.load(Ordering::SeqCst),
+            0,
+            "acquired over the ceiling"
+        );
         cap.release(); // now 1 in flight → waiter proceeds
         h.join().unwrap();
         assert_eq!(admitted.load(Ordering::SeqCst), 1);
@@ -1641,7 +1675,10 @@ mod tests {
         let shut = std::thread::spawn(move || c.acquire());
         std::thread::sleep(Duration::from_millis(50));
         cap.shutdown();
-        assert!(!shut.join().unwrap(), "shutdown should abort a blocked acquire");
+        assert!(
+            !shut.join().unwrap(),
+            "shutdown should abort a blocked acquire"
+        );
     }
 
     /// Gzip levels 1..9 should all decode correctly. Different levels
@@ -1654,7 +1691,11 @@ mod tests {
             let path = write_tmp(&format!("level_{level}.gz"), &gz);
             let out = decode_via_read_gz(
                 &path,
-                Config { num_threads: 4, chunk_size_bytes: 512 * 1024, ..Config::default() },
+                Config {
+                    num_threads: 4,
+                    chunk_size_bytes: 512 * 1024,
+                    ..Config::default()
+                },
             );
             assert_eq!(sha(&out), sha(&payload), "level={level}");
         }
@@ -1669,7 +1710,10 @@ mod tests {
         let producer = std::thread::spawn(move || read_gz(&path, tx, Config::default()));
         drop(rx);
         let result = producer.join().expect("producer thread panicked");
-        assert!(result.is_err(), "zero-byte file should return an error, not succeed");
+        assert!(
+            result.is_err(),
+            "zero-byte file should return an error, not succeed"
+        );
     }
 
     /// A named pipe (FIFO) cannot be mmap'd; read_gz must fall back to
@@ -1681,7 +1725,10 @@ mod tests {
 
         let pipe_path = std::env::temp_dir().join("rapidgzip_rs_pipe_test.fifo");
         let _ = std::fs::remove_file(&pipe_path);
-        let status = Command::new("mkfifo").arg(&pipe_path).status().expect("mkfifo");
+        let status = Command::new("mkfifo")
+            .arg(&pipe_path)
+            .status()
+            .expect("mkfifo");
         assert!(status.success(), "mkfifo failed");
 
         let payload = ascii_payload(256 * 1024);
@@ -1702,7 +1749,10 @@ mod tests {
         writer.join().expect("writer thread panicked");
 
         let _ = std::fs::remove_file(&pipe_path);
-        assert_eq!(sha(&out), sha(&payload), "pipe-decoded output does not match");
+        assert_eq!(
+            sha(&out),
+            sha(&payload),
+            "pipe-decoded output does not match"
+        );
     }
-
 }

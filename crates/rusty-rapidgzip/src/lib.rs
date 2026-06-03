@@ -273,7 +273,7 @@ fn read_gz_streaming<R: Read>(
             }
             if bfinal {
                 out.clear();
-                crc_cursor = 0;
+                // crc_cursor = 0; never read.
                 break;
             }
             // Compact: drain the emitted prefix so `out` doesn't grow without bound.

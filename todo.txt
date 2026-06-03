@@ -27,21 +27,7 @@
   committed synth-* fixtures a required subset (fail, not skip, if absent) so
   CI always exercises real decoding.
 
-  C. One design follow-up
-
-  The from_columns copy-fallback restores correctness but costs an extra full
-  copy of seq+qual on multi-member/cross-boundary chunks. The zero-copy-always
-  fix is to have the demux build seq+qual directly into a DualStringPod (shared
-  metadata from the start) rather than two independent StringPods — a larger
-  change to demux_chunk/absorb/collect, worth doing if FASTQ-of-concatenated-.gz
-  is a hot path (it often is in bioinformatics).
-
-That's wrong, it's just going to make the the stitching even more complicated.
-I suppose we need 'dual offsets' to go along with the dual buffers and then 
-see if the entry_ranges are at a constant difference from each other, instead of 
-identical byte values.
-
-
- the serial read path is slower than the parallel one without any need.
+ the serial read path is slower than the parallel one without any real need, 
+ just not optimized.
 
 --

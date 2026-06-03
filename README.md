@@ -39,12 +39,6 @@ No random access, no `Read`/`Seek`, no upstream-compatible `.gzi` (for now).
 A few knobs are read from the environment. All are optional; the defaults are
 what you want in almost every case.
 
-- **`RAPIDGZIP_INFLATE`** — picks the deflate engine. `intree` (default) is the
-  perf-tuned in-tree inflater (contains `unsafe`); `safe` is a slower,
-  pure-safe puff-style inflater kept for safety/validation. Unknown values fall
-  back to `intree`. Only affects the window-known serial paths (BGZF per-member
-  decode and serial gzip); the parallel speculative path always uses `intree`.
-
 - **`RAPIDGZIP_INFLIGHT`** — caps how many decoded chunks may be outstanding
   between dispatch and the sink, which bounds peak RSS under a slow consumer.
   On by default at a factor of `2` chunks per worker (floored at 16 chunks).
