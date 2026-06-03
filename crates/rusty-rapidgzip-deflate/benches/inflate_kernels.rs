@@ -28,9 +28,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use criterion::{
-    black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 use rusty_rapidgzip_deflate::fast_inflate::{decode_member, decode_until_u16, inflate_fast};
 use rusty_rapidgzip_deflate::speculative::SpeculativeChunk;

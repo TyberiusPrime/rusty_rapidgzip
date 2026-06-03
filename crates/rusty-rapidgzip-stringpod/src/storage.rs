@@ -97,7 +97,8 @@ impl Storage {
                 front_byte,
             } => {
                 assert!(i < count as usize, "StringPod index {i} out of bounds");
-                let base = u64::from(front_byte).wrapping_add((i as u64).wrapping_mul(u64::from(stride)));
+                let base =
+                    u64::from(front_byte).wrapping_add((i as u64).wrapping_mul(u64::from(stride)));
                 let start = base.saturating_add(u64::from(head_skip));
                 let stop = start.saturating_add(u64::from(visible_len));
                 let start_u =

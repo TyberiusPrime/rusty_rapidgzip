@@ -83,9 +83,16 @@ fn parse_reference_sums(json: &str) -> Vec<RefEntry> {
     let mut sha: Option<String> = None;
     let mut size: Option<u64> = None;
 
-    let finalize = |file: &mut Option<String>, sha: &mut Option<String>, size: &mut Option<u64>, out: &mut Vec<RefEntry>| {
+    let finalize = |file: &mut Option<String>,
+                    sha: &mut Option<String>,
+                    size: &mut Option<u64>,
+                    out: &mut Vec<RefEntry>| {
         if let (Some(f), Some(s)) = (file.take(), sha.take()) {
-            out.push(RefEntry { file: f, sha256: s, gz_size: size.unwrap_or(0) });
+            out.push(RefEntry {
+                file: f,
+                sha256: s,
+                gz_size: size.unwrap_or(0),
+            });
         }
         *size = None;
     };
@@ -177,7 +184,11 @@ fn golden_hash_all_corpus() {
 
     eprintln!("golden_hash: {checked} checked, {absent} absent, {large} large-skipped");
     if !failures.is_empty() {
-        panic!("{} fixture(s) failed:\n{}", failures.len(), failures.join("\n"));
+        panic!(
+            "{} fixture(s) failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
     }
     if checked == 0 {
         eprintln!("no corpus fixtures present to check — that's fine for a fresh checkout");
@@ -192,7 +203,10 @@ fn corpus_config_self_check() {
         eprintln!("no reference_sums.json — fine for a fresh checkout");
         return;
     };
-    assert!(!entries.is_empty(), "reference_sums.json parsed to zero entries");
+    assert!(
+        !entries.is_empty(),
+        "reference_sums.json parsed to zero entries"
+    );
     for e in &entries {
         assert_eq!(e.sha256.len(), 64, "{}: bad sha256 length", e.file);
         assert!(

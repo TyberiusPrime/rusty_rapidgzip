@@ -54,7 +54,10 @@ pub fn record_match_prefix(
     for k in 0..count {
         let out_pos = (offset + written_at_match_start + k) as u32;
         let prefix_offset = (dist - written_at_match_start - k - 1) as u16;
-        ctx.markers.push(MarkerRec { out_pos, prefix_offset });
+        ctx.markers.push(MarkerRec {
+            out_pos,
+            prefix_offset,
+        });
         ctx.max_marker_pos = Some(out_pos);
     }
     true
@@ -72,11 +75,18 @@ pub fn propagate_match_cached(
     dist: usize,
     len: usize,
 ) {
-    let max = match ctx.max_marker_pos { None => return, Some(m) => m as usize };
+    let max = match ctx.max_marker_pos {
+        None => return,
+        Some(m) => m as usize,
+    };
     let dst_start = ctx.out_pos_offset as usize + written_at_match_start;
-    if dst_start < dist { return; }
+    if dst_start < dist {
+        return;
+    }
     let src_lo = dst_start - dist;
-    if src_lo > max { return; }
+    if src_lo > max {
+        return;
+    }
 
     // Retire markers that can no longer be a copy source: any marker with
     // `out_pos < dst_start - MAX_DISTANCE` is unreachable (no future back-ref
@@ -95,25 +105,32 @@ pub fn propagate_match_cached(
     }
     let live_start = ctx.live_start;
 
-    let mut cursor = live_start
-        + ctx.markers[live_start..].partition_point(|m| (m.out_pos as usize) < src_lo);
+    let mut cursor =
+        live_start + ctx.markers[live_start..].partition_point(|m| (m.out_pos as usize) < src_lo);
     let mut new_max = max;
 
     for k in 0..len {
         let src_pos = src_lo + k;
-        if src_pos > new_max { break; }
+        if src_pos > new_max {
+            break;
+        }
         let markers_len = ctx.markers.len();
         while cursor < markers_len && (ctx.markers[cursor].out_pos as usize) < src_pos {
             cursor += 1;
         }
         if cursor >= markers_len {
-            if k + 1 < len && src_lo + k + 1 <= new_max { continue; }
+            if k + 1 < len && src_lo + k + 1 <= new_max {
+                continue;
+            }
             break;
         }
         if (ctx.markers[cursor].out_pos as usize) == src_pos {
             let po = ctx.markers[cursor].prefix_offset;
             let new_pos = (dst_start + k) as u32;
-            ctx.markers.push(MarkerRec { out_pos: new_pos, prefix_offset: po });
+            ctx.markers.push(MarkerRec {
+                out_pos: new_pos,
+                prefix_offset: po,
+            });
             new_max = new_pos as usize;
             cursor += 1;
         }

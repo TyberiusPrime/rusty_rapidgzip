@@ -17,10 +17,7 @@ pub const MAX_DISTANCE: usize = 32 * 1024;
 
 /// Decode one DEFLATE block. Returns `true` if this was the final block
 /// (BFINAL set). Appends decompressed bytes to `out`.
-pub fn inflate_block(
-    br: &mut BitReader<'_>,
-    out: &mut Vec<u8>,
-) -> Result<bool, DeflateError> {
+pub fn inflate_block(br: &mut BitReader<'_>, out: &mut Vec<u8>) -> Result<bool, DeflateError> {
     let bfinal = br.read(1)? != 0;
     let btype = br.read(2)?;
     match btype {
@@ -80,7 +77,9 @@ pub fn read_dynamic_header(
     let hclen = br.read(4)? as usize + 4;
 
     if hlit > 286 || hdist > 30 {
-        return Err(DeflateError::Invalid("dynamic block: HLIT/HDIST out of range"));
+        return Err(DeflateError::Invalid(
+            "dynamic block: HLIT/HDIST out of range",
+        ));
     }
 
     let mut cl_lengths = [0u8; 19];
@@ -193,9 +192,7 @@ fn decode_block(
                 // Fast path: unaligned 8-byte LE load. `bits <= 48 < 56` so
                 // the shift is always defined. The guard makes the slice index
                 // and `try_into` fold to a bare unaligned load.
-                let chunk = u64::from_le_bytes(
-                    input[byte_pos..byte_pos + 8].try_into().unwrap(),
-                );
+                let chunk = u64::from_le_bytes(input[byte_pos..byte_pos + 8].try_into().unwrap());
                 buf |= chunk << bits;
                 let added = 64 - bits;
                 byte_pos += (added / 8) as usize;
@@ -257,7 +254,9 @@ fn decode_block(
                 cap = out.capacity();
                 out_ptr = out.as_mut_ptr();
             }
-            unsafe { *out_ptr.add(cur) = (entry >> 16) as u8; }
+            unsafe {
+                *out_ptr.add(cur) = (entry >> 16) as u8;
+            }
             cur += 1;
             continue 'outer;
         }
@@ -391,13 +390,8 @@ fn copy_back(out: &mut Vec<u8>, distance: usize, length: usize) {
                     // Overlapping tail store: re-copy the last 8 bytes from
                     // the end. Safe because length >= 8 and src is fully
                     // disjoint from dst (distance >= length).
-                    let v = std::ptr::read_unaligned(
-                        buf.add(start + length - 8) as *const u64,
-                    );
-                    std::ptr::write_unaligned(
-                        buf.add(cur + length - 8) as *mut u64,
-                        v,
-                    );
+                    let v = std::ptr::read_unaligned(buf.add(start + length - 8) as *const u64);
+                    std::ptr::write_unaligned(buf.add(cur + length - 8) as *mut u64, v);
                 }
             } else {
                 let mut i = 0;
@@ -478,23 +472,30 @@ mod tests {
         let mut out = Vec::new();
         inflate(&mut br, &mut out).expect("inflate failed");
         assert_eq!(
-            out, payload,
+            out,
+            payload,
             "roundtrip mismatch (payload {} bytes, level {level})",
             payload.len()
         );
     }
 
     #[test]
-    fn empty_payload() { check_roundtrip(b"", 6); }
+    fn empty_payload() {
+        check_roundtrip(b"", 6);
+    }
 
     #[test]
-    fn tiny_payload() { check_roundtrip(b"hello, world\n", 6); }
+    fn tiny_payload() {
+        check_roundtrip(b"hello, world\n", 6);
+    }
 
     #[test]
     fn repeating_payload() {
         // Heavy back-references — exercises copy_back.
         let mut p = Vec::new();
-        for _ in 0..1000 { p.extend_from_slice(b"abcdefghij"); }
+        for _ in 0..1000 {
+            p.extend_from_slice(b"abcdefghij");
+        }
         check_roundtrip(&p, 6);
     }
 
@@ -510,7 +511,9 @@ mod tests {
         let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
         let mut p = Vec::with_capacity(1024);
         while p.len() < 1024 {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             p.push(((s >> 56) as u8 % 95) + 32);
         }
         check_roundtrip(&p, 6);
@@ -528,7 +531,9 @@ mod tests {
         let mut s: u64 = 0xA1B2C3D4E5F60718;
         let mut p = Vec::with_capacity(8192);
         while p.len() < 8192 {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             p.extend_from_slice(&s.to_le_bytes());
         }
         check_roundtrip(&p, 1);

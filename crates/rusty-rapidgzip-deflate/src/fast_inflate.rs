@@ -33,9 +33,7 @@
 use crate::huffman::{HUFFDEC_EXCEPTIONAL, HUFFDEC_LITERAL, LUT_BITS};
 use crate::inflate::read_dynamic_header;
 use crate::speculative::SpeculativeChunk;
-use crate::tables::{
-    fixed_distance_lengths, fixed_literal_lengths, DISTANCE_BASE, DISTANCE_EXTRA,
-};
+use crate::tables::{fixed_distance_lengths, fixed_literal_lengths, DISTANCE_BASE, DISTANCE_EXTRA};
 use crate::{BitReader, DeflateError, HuffmanDecoder};
 
 use rusty_rapidgzip_inflate::speculative::{
@@ -129,10 +127,7 @@ pub fn inflate_fast(br: &mut BitReader<'_>, out: &mut Vec<u8>) -> Result<(), Def
 /// it block-by-block and periodically drain emitted bytes off the front of
 /// `out` while retaining a 32 KiB window, decoding an arbitrarily long member
 /// in bounded memory with no marker machinery.
-pub fn decode_one_block(
-    br: &mut BitReader<'_>,
-    out: &mut Vec<u8>,
-) -> Result<bool, DeflateError> {
+pub fn decode_one_block(br: &mut BitReader<'_>, out: &mut Vec<u8>) -> Result<bool, DeflateError> {
     let bfinal = br.read(1)? != 0;
     let btype = br.read(2)?;
     decode_block::<false>(br, out, btype, 0, None)?;
@@ -253,7 +248,6 @@ unsafe fn copy_chunked_unchecked<const N: usize>(src: *const u8, dst: *mut u8, l
         d = d.add(N);
     }
 }
-
 
 /// Inline back-reference copy.  Works entirely with raw pointers to avoid
 /// the `Vec::set_len` / `Vec::len` round-trip on every back-ref.
@@ -504,8 +498,8 @@ fn decode_compressed<const IS_SPECULATIVE: bool>(
 
         // ── Back-reference resolve ────────────────────────────────────────────
         if IS_SPECULATIVE {
-            let ctx = ctx.as_mut().unwrap();   // one unwrap, names the invariant
-            // Speculative path: back-refs may reach into the unknown prefix.
+            let ctx = ctx.as_mut().unwrap(); // one unwrap, names the invariant
+                                             // Speculative path: back-refs may reach into the unknown prefix.
             let emitted = cur - chunk_base;
             if distance > emitted {
                 let prefix_count = (distance - emitted).min(length);
@@ -581,7 +575,9 @@ fn decode_compressed<const IS_SPECULATIVE: bool>(
                 break 'outer if distance == 0 {
                     Err(DeflateError::Invalid("zero back-reference distance"))
                 } else {
-                    Err(DeflateError::Invalid("back-reference distance out of bounds"))
+                    Err(DeflateError::Invalid(
+                        "back-reference distance out of bounds",
+                    ))
                 };
             }
             if cap - cur < length + COPY_HEADROOM {
@@ -975,7 +971,6 @@ fn decode_compressed_u16(
     result
 }
 
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1007,14 +1002,22 @@ mod tests {
         let mut br = BitReader::new(&padded);
         let mut out = Vec::new();
         inflate_fast(&mut br, &mut out).expect("inflate_fast failed");
-        assert_eq!(out, payload, "inflate_fast mismatch (len={} level={})", payload.len(), level);
+        assert_eq!(
+            out,
+            payload,
+            "inflate_fast mismatch (len={} level={})",
+            payload.len(),
+            level
+        );
     }
 
     fn ascii_payload(n: usize) -> Vec<u8> {
         let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
         let mut p = Vec::with_capacity(n);
         while p.len() < n {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             p.push(((s >> 56) as u8 % 95) + 32);
         }
         p
@@ -1033,7 +1036,9 @@ mod tests {
     #[test]
     fn inflate_fast_repeating() {
         let mut p = Vec::new();
-        for _ in 0..1000 { p.extend_from_slice(b"abcdefghij"); }
+        for _ in 0..1000 {
+            p.extend_from_slice(b"abcdefghij");
+        }
         check_inflate_fast(&p, 6);
     }
 
@@ -1057,7 +1062,9 @@ mod tests {
         let mut s: u64 = 0xA1B2C3D4E5F60718;
         let mut p = Vec::with_capacity(8192);
         while p.len() < 8192 {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             p.extend_from_slice(&s.to_le_bytes());
         }
         check_inflate_fast(&p, 1);
@@ -1082,7 +1089,11 @@ mod tests {
         padded.extend_from_slice(&[0u8; 16]);
         let mut chunk = SpeculativeChunk::default();
         let end_bit = decode_member(&padded, 0, &mut chunk).unwrap();
-        assert!(chunk.markers.is_empty(), "{} unexpected markers", chunk.markers.len());
+        assert!(
+            chunk.markers.is_empty(),
+            "{} unexpected markers",
+            chunk.markers.len()
+        );
         assert_eq!(chunk.bytes, payload, "decode_member output mismatch");
         assert!(end_bit > 0 && end_bit <= (padded.len() as u64) * 8);
     }
@@ -1128,7 +1139,9 @@ mod tests {
             loop {
                 block_starts.push(br.tell_bit());
                 let bfinal = crate::inflate::inflate_block(&mut br, &mut dummy).unwrap();
-                if bfinal { break; }
+                if bfinal {
+                    break;
+                }
             }
         }
         assert!(block_starts.len() >= 3, "need ≥ 3 blocks for this test");
@@ -1139,7 +1152,9 @@ mod tests {
         {
             let mut br = crate::BitReader::new(&padded);
             loop {
-                if br.tell_bit() >= split_bit { break; }
+                if br.tell_bit() >= split_bit {
+                    break;
+                }
                 crate::inflate::inflate_block(&mut br, &mut chunk0.bytes).unwrap();
             }
         }
@@ -1178,7 +1193,9 @@ mod tests {
             loop {
                 block_starts.push(br.tell_bit());
                 let bfinal = crate::inflate::inflate_block(&mut br, &mut dummy).unwrap();
-                if bfinal { break; }
+                if bfinal {
+                    break;
+                }
             }
         }
         assert!(block_starts.len() >= 3);
@@ -1239,7 +1256,8 @@ mod tests {
             let end_bit_hint = boundaries.get(i + 1).copied().unwrap_or(u64::MAX);
 
             let mut chunk = SpeculativeChunk::default();
-            let (_, hit_bfinal) = decode_until(&padded, start_bit, end_bit_hint, &mut chunk).unwrap();
+            let (_, hit_bfinal) =
+                decode_until(&padded, start_bit, end_bit_hint, &mut chunk).unwrap();
 
             crate::speculative::resolve_markers(&mut chunk, &prev_tail).unwrap_or_else(|e| {
                 panic!("resolve_markers failed on chunk {i}: {e}");
@@ -1255,7 +1273,9 @@ mod tests {
 
             resolved.extend_from_slice(&chunk.bytes);
 
-            if hit_bfinal { break; }
+            if hit_bfinal {
+                break;
+            }
         }
 
         assert_eq!(resolved.len(), payload.len(), "length mismatch");
@@ -1266,5 +1286,4 @@ mod tests {
             }
         }
     }
-
 }

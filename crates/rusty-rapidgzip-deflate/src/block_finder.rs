@@ -41,9 +41,7 @@
 //! chunk's actual end and re-decodes from the correct offset on a mismatch
 //! (see `pipeline`'s anchored-chain assumption note).
 
-use crate::tables::{
-    CODE_LENGTH_ORDER, DISTANCE_BASE, DISTANCE_EXTRA, LENGTH_BASE, LENGTH_EXTRA,
-};
+use crate::tables::{CODE_LENGTH_ORDER, DISTANCE_BASE, DISTANCE_EXTRA, LENGTH_BASE, LENGTH_EXTRA};
 use crate::{BitReader, DeflateError, HuffmanDecoder};
 
 /// Number of symbols we trial-decode after a header parse succeeds. A real
@@ -108,11 +106,7 @@ const NEXT_LUT: [u8; 1 << LUT_BITS] = {
 ///
 /// Validation passes the full header parser, so a returned offset is safe
 /// to hand to the inflate decoder (caller must seek there and re-parse).
-pub fn find_next_dynamic_block(
-    data: &[u8],
-    from_bit: u64,
-    until_bit: u64,
-) -> Option<u64> {
+pub fn find_next_dynamic_block(data: &[u8], from_bit: u64, until_bit: u64) -> Option<u64> {
     let total_bits = (data.len() as u64) * 8;
     let limit = until_bit.min(total_bits);
     if from_bit >= limit {
@@ -262,7 +256,8 @@ fn read_dynamic_header_strict_into(
         return Err(DeflateError::Invalid("strict: EOB symbol has zero length"));
     }
     pool.lit.rebuild_from_lengths(&pool.lengths[..hlit], true)?;
-    pool.dist.rebuild_from_lengths(&pool.lengths[hlit..], true)?;
+    pool.dist
+        .rebuild_from_lengths(&pool.lengths[hlit..], true)?;
     Ok(())
 }
 
@@ -368,7 +363,9 @@ mod tests {
         let mut p = Vec::with_capacity(4 << 20);
         let mut s: u64 = 0xC0DE_F00D_BAAD_F00D;
         while p.len() < 4 << 20 {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             p.push(((s >> 56) as u8 % 95) + 32);
         }
         let deflate = deflate_via_gzip(&p, 6);
@@ -385,12 +382,18 @@ mod tests {
         let mut p = Vec::with_capacity(4 << 20);
         let mut s: u64 = 0xC0DE_F00D_BAAD_F00D;
         while p.len() < 4 << 20 {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             p.push(((s >> 56) as u8 % 95) + 32);
         }
         let deflate = deflate_via_gzip(&p, 6);
         let recorded = record_block_starts(&deflate);
-        assert!(recorded.len() >= 3, "need several blocks, got {}", recorded.len());
+        assert!(
+            recorded.len() >= 3,
+            "need several blocks, got {}",
+            recorded.len()
+        );
 
         // The non-final block boundaries reachable by the dynamic-only finder.
         let total_bits = deflate.len() as u64 * 8;
@@ -414,7 +417,9 @@ mod tests {
         let mut s: u64 = 0xDEAD_BEEF_CAFE_BABE;
         let mut data = Vec::with_capacity(1024);
         while data.len() < 1024 {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             data.extend_from_slice(&s.to_le_bytes());
         }
         // Don't assert None unconditionally — random data can occasionally

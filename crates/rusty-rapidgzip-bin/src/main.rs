@@ -39,7 +39,11 @@ fn main() -> Result<()> {
     let cfg = Config {
         num_threads: args.threads,
         chunk_size_bytes: args.chunk_size,
-        verbose: if args.verbose { Verbosity::On } else { Verbosity::Off },
+        verbose: if args.verbose {
+            Verbosity::On
+        } else {
+            Verbosity::Off
+        },
         recycle_rx: Some(recycle_rx),
         recycle_tx: Some(recycle_tx.clone()),
         ..Config::default()

@@ -24,8 +24,8 @@ const FIXLCODES: usize = 288;
 const MAXDIST: usize = 32 * 1024;
 
 const LENS: [u16; 29] = [
-    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115,
-    131, 163, 195, 227, 258,
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
+    163, 195, 227, 258,
 ];
 const LEXT: [u16; 29] = [
     0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
@@ -35,8 +35,8 @@ const DISTS: [u16; 30] = [
     2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
 ];
 const DEXT: [u16; 30] = [
-    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12,
-    13, 13,
+    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13,
+    13,
 ];
 const ORDER: [usize; 19] = [
     16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
@@ -105,9 +105,7 @@ impl<'a> State<'a> {
             return Ok(());
         }
         if self.pos + 8 <= self.input.len() {
-            let chunk = u64::from_le_bytes(
-                self.input[self.pos..self.pos + 8].try_into().unwrap(),
-            );
+            let chunk = u64::from_le_bytes(self.input[self.pos..self.pos + 8].try_into().unwrap());
             self.bit_buffer |= chunk << self.bit_count;
             let added = 64 - self.bit_count;
             self.pos += (added / 8) as usize;
@@ -134,9 +132,7 @@ impl<'a> State<'a> {
             return;
         }
         if self.pos + 8 <= self.input.len() {
-            let chunk = u64::from_le_bytes(
-                self.input[self.pos..self.pos + 8].try_into().unwrap(),
-            );
+            let chunk = u64::from_le_bytes(self.input[self.pos..self.pos + 8].try_into().unwrap());
             self.bit_buffer |= chunk << self.bit_count;
             let added = 64 - self.bit_count;
             self.pos += (added / 8) as usize;
@@ -170,7 +166,6 @@ impl<'a> State<'a> {
         self.bit_buffer = 0;
         self.bit_count = 0;
     }
-
 }
 
 /// Copy `length` bytes from `out[out.len() - distance ..]` to the end of
@@ -325,12 +320,7 @@ fn construct(h: &mut Huffman, length: &[u16], n: usize) -> Result<i32, DeflateEr
     Ok(left)
 }
 
-fn codes(
-    s: &mut State,
-    out: &mut Vec<u8>,
-    lc: &Huffman,
-    dc: &Huffman,
-) -> Result<(), DeflateError> {
+fn codes(s: &mut State, out: &mut Vec<u8>, lc: &Huffman, dc: &Huffman) -> Result<(), DeflateError> {
     // Worst-case symbol consumption: 15 (lit/len Huffman) + 5 (length extra)
     // + 15 (distance Huffman) + 13 (distance extra) = 48 bits. One up-front
     // refill per iteration covers the entire symbol.
@@ -359,9 +349,7 @@ fn codes(
         // Inline refill — fast path is an 8-byte LE load.
         if bits < NEEDED {
             if pos + 8 <= input.len() {
-                let chunk = u64::from_le_bytes(
-                    input[pos..pos + 8].try_into().unwrap(),
-                );
+                let chunk = u64::from_le_bytes(input[pos..pos + 8].try_into().unwrap());
                 buf |= chunk << bits;
                 let added = 64 - bits;
                 pos += (added / 8) as usize;
@@ -428,8 +416,7 @@ fn codes(
         if bits < len_extra {
             break Err(DeflateError::UnexpectedEof);
         }
-        let length = LENS[idx] as usize
-            + (buf as usize & ((1usize << len_extra) - 1));
+        let length = LENS[idx] as usize + (buf as usize & ((1usize << len_extra) - 1));
         buf >>= len_extra;
         bits -= len_extra;
 
@@ -476,8 +463,7 @@ fn codes(
         if bits < dist_extra {
             break Err(DeflateError::UnexpectedEof);
         }
-        let dist = DISTS[dsym] as usize
-            + (buf as usize & ((1usize << dist_extra) - 1));
+        let dist = DISTS[dsym] as usize + (buf as usize & ((1usize << dist_extra) - 1));
         buf >>= dist_extra;
         bits -= dist_extra;
         if dist == 0 || dist > MAXDIST || dist > out.len() {
@@ -675,7 +661,8 @@ mod tests {
         let body = deflate_via_gzip(payload, level);
         let got = inflate(&body).expect("inflate failed");
         assert_eq!(
-            got, payload,
+            got,
+            payload,
             "roundtrip mismatch ({} bytes, level {level})",
             payload.len()
         );
@@ -716,7 +703,9 @@ mod tests {
         let mut s: u64 = 0xA1B2C3D4E5F60718;
         let mut p = Vec::with_capacity(8192);
         while p.len() < 8192 {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             p.extend_from_slice(&s.to_le_bytes());
         }
         check_roundtrip(&p, 1);
@@ -735,6 +724,9 @@ mod tests {
     fn truncated_input_errors() {
         let body = deflate_via_gzip(b"hello, world\n", 6);
         let err = inflate(&body[..body.len() / 2]).unwrap_err();
-        assert!(matches!(err, DeflateError::UnexpectedEof | DeflateError::Invalid(_)));
+        assert!(matches!(
+            err,
+            DeflateError::UnexpectedEof | DeflateError::Invalid(_)
+        ));
     }
 }

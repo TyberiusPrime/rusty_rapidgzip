@@ -52,7 +52,9 @@ use std::thread;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 
-use rusty_rapidgzip_deflate::{fast_inflate, find_next_dynamic_block, resolve_markers, SpeculativeChunk};
+use rusty_rapidgzip_deflate::{
+    fast_inflate, find_next_dynamic_block, resolve_markers, SpeculativeChunk,
+};
 
 use crate::pipeline::build_prev_tail_fast;
 use crate::{Error, GzipError};
@@ -124,7 +126,13 @@ struct Source<R> {
 
 impl<R: Read> Source<R> {
     fn new(reader: R) -> Self {
-        Self { reader, buf: Vec::with_capacity(READ_CHUNK * 2), base: 0, src_eof: false, total_read: 0 }
+        Self {
+            reader,
+            buf: Vec::with_capacity(READ_CHUNK * 2),
+            base: 0,
+            src_eof: false,
+            total_read: 0,
+        }
     }
 
     /// Absolute body-byte offset one past the last resident byte.
@@ -225,8 +233,10 @@ fn decode_item(item: &Item, scratch: &mut Vec<u16>) -> Result<DecodeResult, Erro
         if trailer_byte + 8 > body.len() {
             return Err(Error::Gzip(GzipError::Truncated));
         }
-        let crc_expected = u32::from_le_bytes(body[trailer_byte..trailer_byte + 4].try_into().unwrap());
-        let isize_expected = u32::from_le_bytes(body[trailer_byte + 4..trailer_byte + 8].try_into().unwrap());
+        let crc_expected =
+            u32::from_le_bytes(body[trailer_byte..trailer_byte + 4].try_into().unwrap());
+        let isize_expected =
+            u32::from_le_bytes(body[trailer_byte + 4..trailer_byte + 8].try_into().unwrap());
         member_boundaries.push(MemberBoundary {
             byte_offset_in_chunk: chunk.bytes.len(),
             crc_expected,
@@ -251,7 +261,12 @@ fn decode_item(item: &Item, scratch: &mut Vec<u16>) -> Result<DecodeResult, Erro
         pos = ((after_trailer + header_len) as u64) * 8;
     }
 
-    Ok(DecodeResult { id: item.id, chunk, final_block, member_boundaries })
+    Ok(DecodeResult {
+        id: item.id,
+        chunk,
+        final_block,
+        member_boundaries,
+    })
 }
 
 /// Dispatcher: read the pipe, cut owned per-chunk slices at dynamic-block
@@ -286,8 +301,7 @@ fn dispatch<R: Read>(
         let boundary = if from_rel >= resident_bits {
             None
         } else {
-            find_next_dynamic_block(&src.buf, from_rel, resident_bits)
-                .map(|rel| src.base * 8 + rel)
+            find_next_dynamic_block(&src.buf, from_rel, resident_bits).map(|rel| src.base * 8 + rel)
         };
 
         match boundary {
@@ -360,7 +374,9 @@ fn emit<R>(
         is_final_region,
         base_byte: start_byte,
     };
-    work_tx.send(item).map_err(|_| Error::Io(std::io::Error::other("decode workers gone")))
+    work_tx
+        .send(item)
+        .map_err(|_| Error::Io(std::io::Error::other("decode workers gone")))
 }
 
 /// Public entry: decode a non-seekable gzip stream with the parallel pipeline,
@@ -582,9 +598,9 @@ pub(crate) fn read_gz_streaming_parallel<R: Read + Send + 'static>(
     for w in workers {
         let _ = w.join();
     }
-    let disp_res = dispatcher.join().unwrap_or_else(|_| {
-        Err(Error::Io(std::io::Error::other("dispatcher panicked")))
-    });
+    let disp_res = dispatcher
+        .join()
+        .unwrap_or_else(|_| Err(Error::Io(std::io::Error::other("dispatcher panicked"))));
 
     if let Some(e) = out_err {
         return Err(e);

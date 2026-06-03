@@ -83,15 +83,25 @@ fn main() {
     println!("iters: {iters}");
     println!();
 
-    let want = |name: &str| filter.as_deref().map_or(true, |f| f.split(',').any(|x| x == name));
+    let want = |name: &str| {
+        filter
+            .as_deref()
+            .map_or(true, |f| f.split(',').any(|x| x == name))
+    };
 
     if want("safe") {
-        time("safe", iters, body.len(), out_len, || run_safe(body, out_len));
+        time("safe", iters, body.len(), out_len, || {
+            run_safe(body, out_len)
+        });
     }
     if want("fast") {
-        time("fast", iters, body.len(), out_len, || run_fast(body, out_len));
+        time("fast", iters, body.len(), out_len, || {
+            run_fast(body, out_len)
+        });
     }
     if want("intree") {
-        time("intree", iters, body.len(), out_len, || run_intree(body, out_len));
+        time("intree", iters, body.len(), out_len, || {
+            run_intree(body, out_len)
+        });
     }
 }

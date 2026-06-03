@@ -161,10 +161,7 @@ impl HuffmanDecoder {
         )
     }
 
-    pub fn rebuild_from_lengths_litlen(
-        &mut self,
-        lengths: &[u8],
-    ) -> Result<(), DeflateError> {
+    pub fn rebuild_from_lengths_litlen(&mut self, lengths: &[u8]) -> Result<(), DeflateError> {
         Self::build_into(
             &mut self.lut.0,
             &mut self.long_codes,
@@ -463,10 +460,18 @@ mod tests {
     #[test]
     fn fixed_literal_tree_smoke() {
         let mut lengths = vec![0u8; 288];
-        for i in 0..=143 { lengths[i] = 8; }
-        for i in 144..=255 { lengths[i] = 9; }
-        for i in 256..=279 { lengths[i] = 7; }
-        for i in 280..=287 { lengths[i] = 8; }
+        for i in 0..=143 {
+            lengths[i] = 8;
+        }
+        for i in 144..=255 {
+            lengths[i] = 9;
+        }
+        for i in 256..=279 {
+            lengths[i] = 7;
+        }
+        for i in 280..=287 {
+            lengths[i] = 8;
+        }
         let dec = HuffmanDecoder::from_lengths(&lengths).unwrap();
         let bytes = [0u8; 8];
         let mut br = BitReader::new(&bytes);
@@ -476,7 +481,9 @@ mod tests {
     #[test]
     fn long_code_path() {
         let mut lengths = Vec::new();
-        for l in 1..=14u8 { lengths.push(l); }
+        for l in 1..=14u8 {
+            lengths.push(l);
+        }
         lengths.push(15);
         lengths.push(15);
         let dec = HuffmanDecoder::from_lengths(&lengths).unwrap();
@@ -487,10 +494,18 @@ mod tests {
     fn litlen_encoding_literal_byte() {
         // Fixed-Huffman litlen tree: symbol 65 ('A') has 8-bit code.
         let mut lengths = vec![0u8; 288];
-        for i in 0..=143 { lengths[i] = 8; }
-        for i in 144..=255 { lengths[i] = 9; }
-        for i in 256..=279 { lengths[i] = 7; }
-        for i in 280..=287 { lengths[i] = 8; }
+        for i in 0..=143 {
+            lengths[i] = 8;
+        }
+        for i in 144..=255 {
+            lengths[i] = 9;
+        }
+        for i in 256..=279 {
+            lengths[i] = 7;
+        }
+        for i in 280..=287 {
+            lengths[i] = 8;
+        }
         let dec = HuffmanDecoder::from_lengths_litlen(&lengths).unwrap();
         // Build a stream that decodes to literal 'A' (sym 65).
         // Fixed code for 65 (canonical MSB-first): 65+48 = 113 = 0b01110001.
@@ -506,10 +521,18 @@ mod tests {
     #[test]
     fn litlen_encoding_eob() {
         let mut lengths = vec![0u8; 288];
-        for i in 0..=143 { lengths[i] = 8; }
-        for i in 144..=255 { lengths[i] = 9; }
-        for i in 256..=279 { lengths[i] = 7; }
-        for i in 280..=287 { lengths[i] = 8; }
+        for i in 0..=143 {
+            lengths[i] = 8;
+        }
+        for i in 144..=255 {
+            lengths[i] = 9;
+        }
+        for i in 256..=279 {
+            lengths[i] = 7;
+        }
+        for i in 280..=287 {
+            lengths[i] = 8;
+        }
         let dec = HuffmanDecoder::from_lengths_litlen(&lengths).unwrap();
         // EOB (sym 256) has 7-bit code 0b0000000 → seven zero bits.
         let bytes = [0u8; 8];

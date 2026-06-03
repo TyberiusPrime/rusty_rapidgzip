@@ -27,7 +27,9 @@ fn bench_throughput(c: &mut Criterion) {
         if path.extension().and_then(|s| s.to_str()) != Some("gz") {
             continue;
         }
-        let Ok(meta) = fs::metadata(&path) else { continue };
+        let Ok(meta) = fs::metadata(&path) else {
+            continue;
+        };
         // Skip files >256 MiB unless explicitly requested via env.
         let big_ok = std::env::var_os("RAPIDGZIP_BENCH_BIG").is_some();
         if !big_ok && meta.len() > 256 * 1024 * 1024 {

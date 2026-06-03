@@ -89,7 +89,6 @@ pub fn decode_one_indexed(
     out: &mut Vec<u8>,
     member: u32,
 ) -> Result<usize, GzipError> {
-
     let header_len = parse_header(input)?;
     let body_start = header_len;
 
@@ -107,11 +106,12 @@ pub fn decode_one_indexed(
     if trailer_start + 8 > input.len() {
         return Err(GzipError::Truncated);
     }
-    let crc_expected = u32::from_le_bytes(
-        input[trailer_start..trailer_start + 4].try_into().unwrap(),
-    );
+    let crc_expected =
+        u32::from_le_bytes(input[trailer_start..trailer_start + 4].try_into().unwrap());
     let isize_expected = u32::from_le_bytes(
-        input[trailer_start + 4..trailer_start + 8].try_into().unwrap(),
+        input[trailer_start + 4..trailer_start + 8]
+            .try_into()
+            .unwrap(),
     );
 
     let decoded = &out[initial_out_len..];
@@ -153,11 +153,12 @@ pub fn decode_one_indexed_safe(
     if trailer_start + 8 > input.len() {
         return Err(GzipError::Truncated);
     }
-    let crc_expected = u32::from_le_bytes(
-        input[trailer_start..trailer_start + 4].try_into().unwrap(),
-    );
+    let crc_expected =
+        u32::from_le_bytes(input[trailer_start..trailer_start + 4].try_into().unwrap());
     let isize_expected = u32::from_le_bytes(
-        input[trailer_start + 4..trailer_start + 8].try_into().unwrap(),
+        input[trailer_start + 4..trailer_start + 8]
+            .try_into()
+            .unwrap(),
     );
     let decoded = &out[initial_out_len..];
     let crc_got = crc32fast::hash(decoded);
@@ -208,11 +209,12 @@ pub fn decode_one_indexed_fast(
     if trailer_start + 8 > input.len() {
         return Err(GzipError::Truncated);
     }
-    let crc_expected = u32::from_le_bytes(
-        input[trailer_start..trailer_start + 4].try_into().unwrap(),
-    );
+    let crc_expected =
+        u32::from_le_bytes(input[trailer_start..trailer_start + 4].try_into().unwrap());
     let isize_expected = u32::from_le_bytes(
-        input[trailer_start + 4..trailer_start + 8].try_into().unwrap(),
+        input[trailer_start + 4..trailer_start + 8]
+            .try_into()
+            .unwrap(),
     );
     let decoded = &out[initial_out_len..];
     let crc_got = crc32fast::hash(decoded);
@@ -260,8 +262,7 @@ pub fn parse_header(input: &[u8]) -> Result<usize, GzipError> {
         if pos + 2 > input.len() {
             return Err(GzipError::Truncated);
         }
-        let xlen =
-            u16::from_le_bytes(input[pos..pos + 2].try_into().unwrap()) as usize;
+        let xlen = u16::from_le_bytes(input[pos..pos + 2].try_into().unwrap()) as usize;
         pos += 2 + xlen;
         if pos > input.len() {
             return Err(GzipError::Truncated);
@@ -326,16 +327,19 @@ pub(crate) fn parse_bgzf_block_size(input: &[u8]) -> Option<u32> {
 
 fn skip_zstring(input: &[u8], from: usize) -> Result<usize, GzipError> {
     let rest = input.get(from..).ok_or(GzipError::Truncated)?;
-    let zero = rest.iter().position(|&b| b == 0).ok_or(GzipError::Truncated)?;
+    let zero = rest
+        .iter()
+        .position(|&b| b == 0)
+        .ok_or(GzipError::Truncated)?;
     Ok(from + zero + 1)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
     use std::fs;
     use std::path::PathBuf;
-    use sha2::{Digest, Sha256};
 
     fn corpus_dir() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -357,7 +361,10 @@ mod tests {
             return;
         };
         let entries = parse_reference_sums(&json);
-        assert!(!entries.is_empty(), "reference_sums.json parsed to zero entries");
+        assert!(
+            !entries.is_empty(),
+            "reference_sums.json parsed to zero entries"
+        );
 
         let full = std::env::var_os("RAPIDGZIP_FULL_CORPUS").is_some();
         let mut checked = 0;

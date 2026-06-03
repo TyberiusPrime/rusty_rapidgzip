@@ -34,7 +34,11 @@ fn split_invariant(data: &[u8]) -> Result<Cols, String> {
 }
 
 fn cols(names: &str, seqs: &str, quals: &str) -> Cols {
-    (names.as_bytes().to_vec(), seqs.as_bytes().to_vec(), quals.as_bytes().to_vec())
+    (
+        names.as_bytes().to_vec(),
+        seqs.as_bytes().to_vec(),
+        quals.as_bytes().to_vec(),
+    )
 }
 
 #[test]
@@ -78,7 +82,10 @@ fn crlf_line_endings() {
 fn variable_lengths() {
     let data = b"@a\nA\n+\nI\n@b\nACGTACGT\n+\nIIIIIIII\n@c\nACG\n+\nJJJ\n";
     let got = split_invariant(data).unwrap();
-    assert_eq!(got, cols("a\nb\nc\n", "A\nACGTACGT\nACG\n", "I\nIIIIIIII\nJJJ\n"));
+    assert_eq!(
+        got,
+        cols("a\nb\nc\n", "A\nACGTACGT\nACG\n", "I\nIIIIIIII\nJJJ\n")
+    );
 }
 
 #[test]
@@ -171,7 +178,10 @@ fn err_truncated_after_sep_newline() {
 fn err_truncated_mid_qual() {
     // Quality line shorter than sequence — caught as a length mismatch.
     let e = split_invariant(b"@r1\nACGT\n+\nII").unwrap_err();
-    assert!(e.contains("length mismatch") || e.contains("truncated"), "unexpected error: {e}");
+    assert!(
+        e.contains("length mismatch") || e.contains("truncated"),
+        "unexpected error: {e}"
+    );
 }
 
 #[test]
@@ -240,7 +250,11 @@ fn end_to_end_read_gz_into_fastq() {
     for threads in [1usize, 4] {
         for chunk_size in [64 * 1024usize, 1 << 20] {
             let (tx, rx) = bounded::<FastqChunk>(8);
-            let cfg = Config { num_threads: threads, chunk_size_bytes: chunk_size, ..Config::default() };
+            let cfg = Config {
+                num_threads: threads,
+                chunk_size_bytes: chunk_size,
+                ..Config::default()
+            };
             let p = path.clone();
             let producer = std::thread::spawn(move || read_gz_into_fastq(&p, tx, cfg));
 
@@ -250,9 +264,18 @@ fn end_to_end_read_gz_into_fastq() {
                 // share one metadata column in the DualStringPod, so their
                 // counts are structurally equal; assert names match too.
                 assert_eq!(c.names.len(), c.reads.len());
-                for x in c.names.iter() { n.extend_from_slice(x); n.push(b'\n'); }
-                for x in c.reads.iter_seq() { s.extend_from_slice(x); s.push(b'\n'); }
-                for x in c.reads.iter_qual() { q.extend_from_slice(x); q.push(b'\n'); }
+                for x in c.names.iter() {
+                    n.extend_from_slice(x);
+                    n.push(b'\n');
+                }
+                for x in c.reads.iter_seq() {
+                    s.extend_from_slice(x);
+                    s.push(b'\n');
+                }
+                for x in c.reads.iter_qual() {
+                    q.extend_from_slice(x);
+                    q.push(b'\n');
+                }
             }
             producer.join().unwrap().unwrap();
             assert_eq!(n, exp_n.as_bytes(), "names t={threads} cs={chunk_size}");
@@ -279,7 +302,9 @@ fn streaming_parallel_pipe_matches_mmap_multichunk() {
     let mut payload = Vec::new();
     for i in 0..12000u32 {
         let len = 60 + (i as usize * 7) % 90;
-        let seq: String = (0..len).map(|j| b"ACGT"[((i as usize + j) * 31) % 4] as char).collect();
+        let seq: String = (0..len)
+            .map(|j| b"ACGT"[((i as usize + j) * 31) % 4] as char)
+            .collect();
         let qual: String = std::iter::repeat('I').take(len).collect();
         payload.extend_from_slice(format!("@read{i} run:1:flow\n{seq}\n+\n{qual}\n").as_bytes());
     }
@@ -313,32 +338,49 @@ fn streaming_parallel_pipe_matches_mmap_multichunk() {
         std::fs::write(&file_path, gz).unwrap();
         let reference = decode(
             &file_path,
-            Config { num_threads: 4, chunk_size_bytes: 64 * 1024, ..Config::default() },
+            Config {
+                num_threads: 4,
+                chunk_size_bytes: 64 * 1024,
+                ..Config::default()
+            },
         );
         let _ = std::fs::remove_file(&file_path);
 
         // Streaming-parallel path: same bytes through a named pipe.
         let pipe_path = std::env::temp_dir().join(format!("rgz_stream_{label}.fifo"));
         let _ = std::fs::remove_file(&pipe_path);
-        let status = std::process::Command::new("mkfifo").arg(&pipe_path).status().expect("mkfifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&pipe_path)
+            .status()
+            .expect("mkfifo");
         assert!(status.success(), "mkfifo failed");
 
         let writer_path = pipe_path.clone();
         let gz_owned = gz.clone();
         let writer = std::thread::spawn(move || {
-            let mut f = std::fs::OpenOptions::new().write(true).open(&writer_path).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&writer_path)
+                .unwrap();
             f.write_all(&gz_owned).unwrap();
         });
 
         let got = decode(
             &pipe_path,
-            Config { num_threads: 4, chunk_size_bytes: 64 * 1024, ..Config::default() },
+            Config {
+                num_threads: 4,
+                chunk_size_bytes: 64 * 1024,
+                ..Config::default()
+            },
         );
         writer.join().expect("writer panicked");
         let _ = std::fs::remove_file(&pipe_path);
 
         assert_eq!(got, reference, "{label}: streaming-parallel pipe != mmap");
-        assert!(got.len() > 1_000_000, "{label}: expected a multi-chunk payload");
+        assert!(
+            got.len() > 1_000_000,
+            "{label}: expected a multi-chunk payload"
+        );
     }
 }
 
@@ -372,7 +414,10 @@ fn end_to_end_read_gz_into_fastq_named_pipe() {
 
     let pipe_path = std::env::temp_dir().join("rapidgzip_rs_fastq_pipe.fifo");
     let _ = std::fs::remove_file(&pipe_path);
-    let status = Command::new("mkfifo").arg(&pipe_path).status().expect("mkfifo");
+    let status = Command::new("mkfifo")
+        .arg(&pipe_path)
+        .status()
+        .expect("mkfifo");
     assert!(status.success(), "mkfifo failed");
 
     let writer_path = pipe_path.clone();
@@ -385,16 +430,28 @@ fn end_to_end_read_gz_into_fastq_named_pipe() {
     });
 
     let (tx, rx) = bounded::<FastqChunk>(8);
-    let cfg = Config { num_threads: 2, ..Config::default() };
+    let cfg = Config {
+        num_threads: 2,
+        ..Config::default()
+    };
     let p = pipe_path.clone();
     let producer = std::thread::spawn(move || read_gz_into_fastq(&p, tx, cfg));
 
     let (mut n, mut s, mut q) = (Vec::new(), Vec::new(), Vec::new());
     for c in rx {
         assert_eq!(c.names.len(), c.reads.len());
-        for x in c.names.iter() { n.extend_from_slice(x); n.push(b'\n'); }
-        for x in c.reads.iter_seq() { s.extend_from_slice(x); s.push(b'\n'); }
-        for x in c.reads.iter_qual() { q.extend_from_slice(x); q.push(b'\n'); }
+        for x in c.names.iter() {
+            n.extend_from_slice(x);
+            n.push(b'\n');
+        }
+        for x in c.reads.iter_seq() {
+            s.extend_from_slice(x);
+            s.push(b'\n');
+        }
+        for x in c.reads.iter_qual() {
+            q.extend_from_slice(x);
+            q.push(b'\n');
+        }
     }
     writer.join().expect("writer thread panicked");
     producer.join().unwrap().unwrap();

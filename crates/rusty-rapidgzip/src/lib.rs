@@ -134,7 +134,12 @@ struct StreamBuf<R> {
 
 impl<R: Read> StreamBuf<R> {
     fn new(reader: R) -> Self {
-        Self { reader, buf: Vec::with_capacity(STREAM_CHUNK * 2), bit_off: 0, src_eof: false }
+        Self {
+            reader,
+            buf: Vec::with_capacity(STREAM_CHUNK * 2),
+            bit_off: 0,
+            src_eof: false,
+        }
     }
 
     fn fill_more(&mut self) -> Result<bool, std::io::Error> {
@@ -142,13 +147,17 @@ impl<R: Read> StreamBuf<R> {
         self.buf.resize(old + STREAM_CHUNK, 0);
         let got = self.reader.read(&mut self.buf[old..])?;
         self.buf.truncate(old + got);
-        if got == 0 { self.src_eof = true; }
+        if got == 0 {
+            self.src_eof = true;
+        }
         Ok(got > 0)
     }
 
     fn fill_at_least(&mut self, n: usize) -> Result<(), Error> {
         while self.buf.len() < n {
-            if self.src_eof { return Err(Error::Gzip(GzipError::Truncated)); }
+            if self.src_eof {
+                return Err(Error::Gzip(GzipError::Truncated));
+            }
             self.fill_more().map_err(Error::Io)?;
         }
         Ok(())
@@ -176,7 +185,9 @@ impl<R: Read> StreamBuf<R> {
                 }
                 Err(DeflateError::UnexpectedEof) => {
                     out.truncate(out_check);
-                    if self.src_eof { return Err(Error::Gzip(GzipError::Truncated)); }
+                    if self.src_eof {
+                        return Err(Error::Gzip(GzipError::Truncated));
+                    }
                     self.fill_more().map_err(Error::Io)?;
                 }
                 Err(e) => return Err(Error::Deflate(e)),
@@ -213,7 +224,9 @@ impl<R: Read> StreamBuf<R> {
                     return Ok(());
                 }
                 Err(GzipError::Truncated) => {
-                    if self.src_eof { return Err(Error::Gzip(GzipError::Truncated)); }
+                    if self.src_eof {
+                        return Err(Error::Gzip(GzipError::Truncated));
+                    }
                     self.fill_more().map_err(Error::Io)?;
                 }
                 Err(e) => return Err(Error::Gzip(e)),
@@ -224,10 +237,7 @@ impl<R: Read> StreamBuf<R> {
 
 /// Decode a non-seekable gzip stream (pipe, stdin) serially, emitting
 /// decompressed bytes block by block to `sink`.
-fn read_gz_streaming<R: Read>(
-    reader: R,
-    sink: &Sender<Arc<Vec<u8>>>,
-) -> Result<(u64, u64), Error> {
+fn read_gz_streaming<R: Read>(reader: R, sink: &Sender<Arc<Vec<u8>>>) -> Result<(u64, u64), Error> {
     // DEFLATE back-references can reach up to 32 KiB behind the current output
     // position. We therefore maintain a single output Vec across all blocks in a
     // member (so that each block can reference bytes produced by earlier blocks)
@@ -261,7 +271,11 @@ fn read_gz_streaming<R: Read>(
 
             // Emit bytes produced since last emission, keeping the last WINDOW
             // bytes in `out` as the back-reference history for subsequent blocks.
-            let emit_end = if bfinal { out.len() } else { out.len().saturating_sub(WINDOW) };
+            let emit_end = if bfinal {
+                out.len()
+            } else {
+                out.len().saturating_sub(WINDOW)
+            };
             if emit_end > crc_cursor {
                 let new_bytes = &out[crc_cursor..emit_end];
                 crc_hasher.update(new_bytes);
@@ -346,7 +360,9 @@ pub fn read_gz(
     // path.
     if !meta.file_type().is_file() || meta.len() == 0 {
         let num_threads = if config.num_threads == 0 {
-            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
         } else {
             config.num_threads
         };
@@ -406,7 +422,11 @@ pub fn read_gz(
             path.display(),
             compressed_bytes,
             t_open.elapsed().as_secs_f64(),
-            if config.num_threads == 0 { "auto".to_string() } else { config.num_threads.to_string() },
+            if config.num_threads == 0 {
+                "auto".to_string()
+            } else {
+                config.num_threads.to_string()
+            },
             config.chunk_size_bytes,
         );
     }
@@ -414,25 +434,26 @@ pub fn read_gz(
     // BGZF fast-path: if the first member carries a BC FEXTRA subfield, the
     // whole file is bgzip — every member is an independent deflate stream
     // and we can decode them in parallel without speculation or markers.
-    let (total_uncompressed, chunks_sent, speculation_failures) = if gzip::parse_bgzf_block_size(input.as_slice()).is_some() {
-        if verbose {
-            eprintln!(
-                "[rapidgzip +{:.2}s] bgzf detected — using fast path",
-                elapsed_since_start(),
-            );
-        }
-        // BGZF members are independent, fully-bounded deflate streams: no block
-        // finder, no speculation, hence no false boundaries to recover from.
-        let (uc, ch) = pipeline::parallel_decode_bgzf(Arc::clone(&input), &sink, &config)?;
-        (uc, ch, 0)
-    } else {
-        // Parse only the *first* member's header here; the pipeline handles
-        // every subsequent member's header inline as it crosses BFINAL.
-        let header_len = gzip::parse_header(input.as_slice())?;
-        let (uc, _body_consumed, ch, spec) =
-            pipeline::parallel_decode_member(Arc::clone(&input), header_len, &sink, &config)?;
-        (uc, ch, spec)
-    };
+    let (total_uncompressed, chunks_sent, speculation_failures) =
+        if gzip::parse_bgzf_block_size(input.as_slice()).is_some() {
+            if verbose {
+                eprintln!(
+                    "[rapidgzip +{:.2}s] bgzf detected — using fast path",
+                    elapsed_since_start(),
+                );
+            }
+            // BGZF members are independent, fully-bounded deflate streams: no block
+            // finder, no speculation, hence no false boundaries to recover from.
+            let (uc, ch) = pipeline::parallel_decode_bgzf(Arc::clone(&input), &sink, &config)?;
+            (uc, ch, 0)
+        } else {
+            // Parse only the *first* member's header here; the pipeline handles
+            // every subsequent member's header inline as it crosses BFINAL.
+            let header_len = gzip::parse_header(input.as_slice())?;
+            let (uc, _body_consumed, ch, spec) =
+                pipeline::parallel_decode_member(Arc::clone(&input), header_len, &sink, &config)?;
+            (uc, ch, spec)
+        };
 
     drop(sink);
     if verbose {
@@ -509,7 +530,9 @@ pub fn read_gz_into_fastq(
 ) -> Result<DecodeStats, Error> {
     let path = path.as_ref().to_path_buf();
     let num_threads = if config.num_threads == 0 {
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
     } else {
         config.num_threads
     };
@@ -573,7 +596,14 @@ pub fn read_gz_into_fastq(
             Some(last_nl) => {
                 let next_carry = chunk[last_nl + 1..].to_vec();
                 let prev_tail = std::mem::take(&mut carry);
-                if job_tx.send(DemuxJob { idx, chunk, prev_tail }).is_err() {
+                if job_tx
+                    .send(DemuxJob {
+                        idx,
+                        chunk,
+                        prev_tail,
+                    })
+                    .is_err()
+                {
                     break;
                 }
                 idx += 1;
@@ -690,11 +720,17 @@ fn demux_chunk(idx: u64, data: &[u8], prev_tail: &[u8]) -> Result<DemuxResult, E
     // appends (≤3 lines completing a straddling record) land in place instead
     // of reallocating these (potentially multi-MB) buffers.
     let buckets = builders.map(|b| {
-        let mut pod = b.map(StringPodBuilder::finish).unwrap_or_else(StringPod::empty);
+        let mut pod = b
+            .map(StringPodBuilder::finish)
+            .unwrap_or_else(StringPod::empty);
         pod.reserve_for_appends(4);
         pod
     });
-    Ok(DemuxResult { idx, buckets, lines })
+    Ok(DemuxResult {
+        idx,
+        buckets,
+        lines,
+    })
 }
 
 /// Role-indexed columns for one chunk: `[name, seq, plus, qual]` (role = line
@@ -714,10 +750,14 @@ fn emit_records(cols: Cols, emit: &mut impl FnMut(FastqChunk)) -> Result<(), Err
         return Ok(()); // nothing to emit
     }
     if !names.iter().all(|name| name.first() == Some(&b'@')) {
-        return Err(Error::Fastq("header line does not start with '@'".to_string()));
+        return Err(Error::Fastq(
+            "header line does not start with '@'".to_string(),
+        ));
     }
     if !plus.is_empty() && !plus.iter().all(|p| p.first() == Some(&b'+')) {
-        return Err(Error::Fastq("separator line does not start with '+'".to_string()));
+        return Err(Error::Fastq(
+            "separator line does not start with '+'".to_string(),
+        ));
     }
     // Sequence and quality share the FASTQ per-entry length invariant, so fuse
     // them into a single DualStringPod (zero-copy — both byte buffers move in

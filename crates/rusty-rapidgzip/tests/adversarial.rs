@@ -22,7 +22,9 @@ use crossbeam_channel::bounded;
 use rusty_rapidgzip::{read_gz_into_fastq, Config, FastqChunk};
 
 fn fixture(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/adversarial").join(name)
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/adversarial")
+        .join(name)
 }
 
 /// ~65 MiB of identical 256-base reads must decode correctly across both the
@@ -39,7 +41,10 @@ fn expansion_past_speculative_reservation_decodes_correctly() {
 
     for threads in [1usize, 4] {
         let (tx, rx) = bounded::<FastqChunk>(8);
-        let cfg = Config { num_threads: threads, ..Config::default() };
+        let cfg = Config {
+            num_threads: threads,
+            ..Config::default()
+        };
         let p = path.clone();
         let producer = thread::spawn(move || read_gz_into_fastq(&p, tx, cfg));
 
@@ -60,7 +65,10 @@ fn expansion_past_speculative_reservation_decodes_correctly() {
             }
             reads += c.reads.len();
         }
-        producer.join().expect("producer panicked").expect("decode failed");
+        producer
+            .join()
+            .expect("producer panicked")
+            .expect("decode failed");
         assert_eq!(reads, EXPECTED_READS, "read count (t={threads})");
     }
 }
@@ -92,7 +100,8 @@ fn read_exceeding_u32_fails_gracefully() {
         .expect("producer panicked")
         .expect_err("expected a graceful error, not success");
     assert!(
-        err.to_string().contains("FASTQ read length exceeds the allowed maximum of 4 GiB"),
+        err.to_string()
+            .contains("FASTQ read length exceeds the allowed maximum of 4 GiB"),
         "unexpected error: {err}"
     );
 }

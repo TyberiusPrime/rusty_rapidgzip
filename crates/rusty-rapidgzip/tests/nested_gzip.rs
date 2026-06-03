@@ -90,7 +90,10 @@ fn decode_via_read_gz(path: &std::path::Path, cfg: Config) -> (Vec<u8>, DecodeSt
     for chunk in rx {
         out.extend_from_slice(&chunk);
     }
-    let stats = producer.join().expect("producer panicked").expect("read_gz");
+    let stats = producer
+        .join()
+        .expect("producer panicked")
+        .expect("read_gz");
     (out, stats)
 }
 
@@ -127,7 +130,10 @@ fn nested_gzip_decodes_correctly_and_triggers_recovery() {
             ..Config::default()
         };
         let (out, stats) = decode_via_read_gz(&path, cfg);
-        assert_eq!(&out, inner, "read_gz(outer) must equal inner (threads={threads})");
+        assert_eq!(
+            &out, inner,
+            "read_gz(outer) must equal inner (threads={threads})"
+        );
         total_recoveries += stats.speculation_failures;
     }
 
@@ -162,6 +168,9 @@ fn triple_nested_gzip_decodes_correctly() {
             ..Config::default()
         };
         let (out, _stats) = decode_via_read_gz(&path, cfg);
-        assert_eq!(&out, twice, "read_gz(thrice) must equal twice (threads={threads})");
+        assert_eq!(
+            &out, twice,
+            "read_gz(thrice) must equal twice (threads={threads})"
+        );
     }
 }

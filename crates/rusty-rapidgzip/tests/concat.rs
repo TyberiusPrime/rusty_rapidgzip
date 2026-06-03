@@ -62,7 +62,10 @@ fn decode_via_read_gz(path: &Path, cfg: Config) -> Vec<u8> {
     for chunk in rx {
         out.extend_from_slice(&chunk);
     }
-    producer.join().expect("producer panicked").expect("read_gz");
+    producer
+        .join()
+        .expect("producer panicked")
+        .expect("read_gz");
     out
 }
 
@@ -93,8 +96,15 @@ fn concat_hello_world_all_paths() {
     // File-based serial + parallel paths.
     let path = write_tmp("hello_world.gz", &gz);
     for threads in [1usize, 2, 4] {
-        let cfg = Config { num_threads: threads, ..Config::default() };
-        assert_eq!(decode_via_read_gz(&path, cfg), b"HelloWorld", "threads={threads}");
+        let cfg = Config {
+            num_threads: threads,
+            ..Config::default()
+        };
+        assert_eq!(
+            decode_via_read_gz(&path, cfg),
+            b"HelloWorld",
+            "threads={threads}"
+        );
     }
 }
 
@@ -119,8 +129,15 @@ fn concat_empty_members_interspersed() {
 
     let path = write_tmp("empty_interspersed.gz", &gz);
     for threads in [1usize, 4] {
-        let cfg = Config { num_threads: threads, ..Config::default() };
-        assert_eq!(decode_via_read_gz(&path, cfg), b"alphabeta", "threads={threads}");
+        let cfg = Config {
+            num_threads: threads,
+            ..Config::default()
+        };
+        assert_eq!(
+            decode_via_read_gz(&path, cfg),
+            b"alphabeta",
+            "threads={threads}"
+        );
     }
 }
 
@@ -160,7 +177,11 @@ fn concat_mixed_levels_and_sizes() {
             chunk_size_bytes: 64 * 1024,
             ..Config::default()
         };
-        assert_eq!(decode_via_read_gz(&path, cfg), expected, "threads={threads}");
+        assert_eq!(
+            decode_via_read_gz(&path, cfg),
+            expected,
+            "threads={threads}"
+        );
     }
 }
 
@@ -187,8 +208,15 @@ fn concat_many_small_members() {
 
     let path = write_tmp("many_small.gz", &gz);
     for threads in [1usize, 4] {
-        let cfg = Config { num_threads: threads, ..Config::default() };
-        assert_eq!(decode_via_read_gz(&path, cfg), expected, "threads={threads}");
+        let cfg = Config {
+            num_threads: threads,
+            ..Config::default()
+        };
+        assert_eq!(
+            decode_via_read_gz(&path, cfg),
+            expected,
+            "threads={threads}"
+        );
     }
 }
 
@@ -237,16 +265,29 @@ fn concat_fastq_records_straddle_members() {
     for threads in [1usize, 4] {
         for chunk_size in [64 * 1024usize, 1 << 20] {
             let (tx, rx) = bounded::<FastqChunk>(8);
-            let cfg = Config { num_threads: threads, chunk_size_bytes: chunk_size, ..Config::default() };
+            let cfg = Config {
+                num_threads: threads,
+                chunk_size_bytes: chunk_size,
+                ..Config::default()
+            };
             let p = path.clone();
             let producer = std::thread::spawn(move || read_gz_into_fastq(&p, tx, cfg));
 
             let (mut n, mut s, mut q) = (Vec::new(), Vec::new(), Vec::new());
             for c in rx {
                 assert_eq!(c.names.len(), c.reads.len());
-                for x in c.names.iter() { n.extend_from_slice(x); n.push(b'\n'); }
-                for x in c.reads.iter_seq() { s.extend_from_slice(x); s.push(b'\n'); }
-                for x in c.reads.iter_qual() { q.extend_from_slice(x); q.push(b'\n'); }
+                for x in c.names.iter() {
+                    n.extend_from_slice(x);
+                    n.push(b'\n');
+                }
+                for x in c.reads.iter_seq() {
+                    s.extend_from_slice(x);
+                    s.push(b'\n');
+                }
+                for x in c.reads.iter_qual() {
+                    q.extend_from_slice(x);
+                    q.push(b'\n');
+                }
             }
             producer.join().unwrap().unwrap();
             assert_eq!(n, exp_n.as_bytes(), "names t={threads} cs={chunk_size}");
@@ -270,7 +311,14 @@ fn corpus_concat_fixture_if_present() {
         return;
     }
     for threads in [1usize, 4] {
-        let cfg = Config { num_threads: threads, ..Config::default() };
-        assert_eq!(decode_via_read_gz(&fixture, cfg), b"HelloWorld", "threads={threads}");
+        let cfg = Config {
+            num_threads: threads,
+            ..Config::default()
+        };
+        assert_eq!(
+            decode_via_read_gz(&fixture, cfg),
+            b"HelloWorld",
+            "threads={threads}"
+        );
     }
 }

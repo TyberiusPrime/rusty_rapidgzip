@@ -34,7 +34,9 @@ fn ascii_payload(n: usize) -> Vec<u8> {
     let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
     let mut p = Vec::with_capacity(n);
     while p.len() < n {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         p.push(((s >> 56) as u8 % 95) + 32);
     }
     p
@@ -234,15 +236,22 @@ fn check_u16_matches_serial(deflate: &[u8]) {
 
     let mut chunk = SpeculativeChunk::default();
     let mut scratch: Vec<u16> = Vec::new();
-    decode_until_u16(&padded, 0, u64::MAX, &mut chunk, &mut scratch).expect("decode_until_u16 failed");
+    decode_until_u16(&padded, 0, u64::MAX, &mut chunk, &mut scratch)
+        .expect("decode_until_u16 failed");
 
-    assert!(chunk.markers.is_empty(), "no overshoot markers expected from bit 0");
+    assert!(
+        chunk.markers.is_empty(),
+        "no overshoot markers expected from bit 0"
+    );
     assert_eq!(chunk.bytes, expected, "u16 path diverged from serial path");
 
     // Side-table speculative path over the same input, for good measure.
     let mut side = SpeculativeChunk::default();
     decode_member(&padded, 0, &mut side).expect("decode_member failed");
-    assert_eq!(side.bytes, expected, "side-table path diverged from serial path");
+    assert_eq!(
+        side.bytes, expected,
+        "side-table path diverged from serial path"
+    );
 }
 
 #[test]

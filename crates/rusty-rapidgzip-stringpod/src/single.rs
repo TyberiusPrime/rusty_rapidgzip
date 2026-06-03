@@ -107,8 +107,8 @@ impl StringPod {
     /// # Panics
     /// If the buffer is shared (`Arc` strong count > 1).
     pub fn push(&mut self, bytes: &[u8]) {
-        let data = Arc::get_mut(&mut self.data)
-            .expect("StringPod::push requires a uniquely-owned buffer");
+        let data =
+            Arc::get_mut(&mut self.data).expect("StringPod::push requires a uniquely-owned buffer");
         if let Some(stride) = self.storage.current_stride() {
             if bytes.len() as u64 == u64::from(stride) {
                 data.extend_from_slice(bytes);
@@ -117,8 +117,7 @@ impl StringPod {
             }
         }
         let start = u32::try_from(data.len()).expect("byte buffer exceeds u32::MAX");
-        let stop =
-            u32::try_from(data.len() + bytes.len()).expect("byte buffer exceeds u32::MAX");
+        let stop = u32::try_from(data.len() + bytes.len()).expect("byte buffer exceeds u32::MAX");
         data.extend_from_slice(bytes);
         self.storage.builder_push_position(start, stop);
     }
@@ -408,7 +407,10 @@ mod tests {
         assert_eq!(p.used_bytes(), 9);
         assert_eq!(p.buffer_bytes(), 9);
         let collected: Vec<&BStr> = p.iter().collect();
-        assert_eq!(collected, vec![BStr::new("AAA"), BStr::new("BBB"), BStr::new("CCC")]);
+        assert_eq!(
+            collected,
+            vec![BStr::new("AAA"), BStr::new("BBB"), BStr::new("CCC")]
+        );
     }
 
     #[test]
@@ -452,7 +454,7 @@ mod tests {
         assert_eq!(p.entry_len(0), 3);
         assert_eq!(p.used_bytes(), 6);
         assert_eq!(p.buffer_bytes(), 10); // bytes still there
-        // double cut
+                                          // double cut
         p.cut_start(1);
         assert_eq!(p.get(0), BStr::new("LO"));
     }

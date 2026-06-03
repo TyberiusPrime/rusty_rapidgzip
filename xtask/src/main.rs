@@ -74,18 +74,8 @@ fn build_corpus(dir: &Path, big: bool) -> Result<()> {
     // Tier 1: small handcrafted (cheap, always built).
     write_gz(dir, "empty.gz", &[], 6)?;
     write_gz(dir, "hello.gz", b"hello, world\n", 6)?;
-    write_gz(
-        dir,
-        "ascii_1k.gz",
-        &deterministic_ascii(1024),
-        6,
-    )?;
-    write_gz(
-        dir,
-        "ascii_1m.gz",
-        &deterministic_ascii(1024 * 1024),
-        6,
-    )?;
+    write_gz(dir, "ascii_1k.gz", &deterministic_ascii(1024), 6)?;
+    write_gz(dir, "ascii_1m.gz", &deterministic_ascii(1024 * 1024), 6)?;
 
     // Multi-stream concat: same payload encoded as two concatenated gz streams.
     {
@@ -107,12 +97,7 @@ fn build_corpus(dir: &Path, big: bool) -> Result<()> {
     // Stored-block exerciser: highly random bytes defeat compression, so
     // gzip emits stored blocks even at higher levels. (system `gzip` doesn't
     // accept -0, so we can't ask for it explicitly.)
-    write_gz(
-        dir,
-        "incompressible_64k.gz",
-        &incompressible(64 * 1024),
-        1,
-    )?;
+    write_gz(dir, "incompressible_64k.gz", &incompressible(64 * 1024), 1)?;
 
     // Fixed-Huffman block — small enough that gzip picks it.
     write_gz(dir, "fixed_small.gz", b"aaaaaaaaaa", 9)?;
@@ -192,7 +177,9 @@ fn deterministic_ascii(n: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(n);
     let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
     while out.len() < n {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let b = ((s >> 56) as u8 % 95) + 32; // printable ASCII
         out.push(b);
     }
@@ -206,7 +193,9 @@ fn incompressible(n: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(n);
     let mut s: u64 = 0xA1B2_C3D4_E5F6_0718;
     while out.len() < n {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         out.extend_from_slice(&s.to_le_bytes());
     }
     out.truncate(n);
@@ -218,7 +207,9 @@ fn deterministic_base64(n: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(n as usize);
     let mut s: u64 = 0xDEAD_BEEF_CAFE_F00D;
     while (out.len() as u64) < n {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         out.push(alphabet[(s >> 58) as usize & 63]);
     }
     out.truncate(n as usize);
