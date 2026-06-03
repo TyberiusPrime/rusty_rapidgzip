@@ -488,6 +488,7 @@ dependencies = [
 name = "rusty-rapidgzip-deflate"
 version = "0.0.1"
 dependencies = [
+ "criterion",
  "rusty-rapidgzip-inflate",
  "thiserror",
 ]

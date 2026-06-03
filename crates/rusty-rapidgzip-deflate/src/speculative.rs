@@ -91,7 +91,7 @@ pub fn resolve_markers(
     prev_tail: &[u8],
 ) -> Result<(), DeflateError> {
     let ptail_len = prev_tail.len();
-    if ptail_len >= 32768 {
+    if false && ptail_len >= 32768 {
         // Fast path: all valid prefix_offsets (≤ 0x7FFF = 32767) are < ptail_len.
         unsafe {
             let ptail  = prev_tail.as_ptr();
