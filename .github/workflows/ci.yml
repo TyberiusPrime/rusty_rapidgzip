@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# All the actual work lives in the Nix flake (`nix flake check` runs the full
+# matrix locally; see flake.nix / DEV.txt). CI just fans out over the lean
+# subset exposed as `packages.test.*` and runs each in a fresh Nix build.
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        job: [stable, clippy, fmt, msrv]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
+
+      - name: ${{ matrix.job }}
+        run: nix build -L ".#test.x86_64-linux.${{ matrix.job }}"

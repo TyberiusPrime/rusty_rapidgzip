@@ -137,6 +137,28 @@ fn decode_and_hash(path: &Path) -> anyhow::Result<String> {
 /// `RAPIDGZIP_FULL_CORPUS` is set.
 const MAX_DEFAULT_GZ: u64 = 200 * 1024 * 1024;
 
+/// Fixtures that MUST be present and decode correctly. These are the committed,
+/// deterministic synthetic fixtures (`tests/corpus/synth-*.gz`, un-ignored in
+/// `.gitignore`). Unlike the large external corpus — which is fetched on demand
+/// and skipped when absent — a missing required fixture is a hard failure, so
+/// CI always exercises a real decode even on a bare checkout.
+const REQUIRED_FIXTURES: &[&str] = &[
+    "synth-empty.gz",
+    "synth-single-byte.gz",
+    "synth-concat-members.gz",
+    "synth-zeros-1m.gz",
+    "synth-spaces-1m.gz",
+    "synth-0xff-1m.gz",
+    "synth-repeated-pattern.gz",
+    "synth-level1.gz",
+    "synth-level9.gz",
+    "synth-random-1m.gz",
+];
+
+fn is_required(name: &str) -> bool {
+    REQUIRED_FIXTURES.contains(&name)
+}
+
 #[test]
 fn golden_hash_all_corpus() {
     let dir = corpus_dir();
@@ -161,10 +183,19 @@ fn golden_hash_all_corpus() {
     for e in entries {
         let path = dir.join(&e.file);
         if !path.exists() {
-            absent += 1;
+            // Required fixtures are committed: fail, don't skip.
+            if is_required(&e.file) {
+                failures.push(format!(
+                    "REQUIRED FIXTURE ABSENT: {} — it is committed under tests/corpus/ and must be present",
+                    e.file
+                ));
+            } else {
+                absent += 1;
+            }
             continue;
         }
-        if !full && e.gz_size > MAX_DEFAULT_GZ {
+        // Required fixtures are tiny; never large-skip them.
+        if !full && e.gz_size > MAX_DEFAULT_GZ && !is_required(&e.file) {
             large += 1;
             eprintln!("skip (large; set RAPIDGZIP_FULL_CORPUS=1) {}", e.file);
             continue;
@@ -214,5 +245,54 @@ fn corpus_config_self_check() {
             "{}: non-hex sha256",
             e.file
         );
+    }
+}
+
+/// Decode every member of a (possibly multi-member) gzip stream with a
+/// per-member kernel, returning the concatenated output's sha256. Mirrors
+/// `gzip::decode_all`'s member loop but lets us swap the inflate engine.
+fn decode_all_with(
+    input: &[u8],
+    mut decode_member: impl FnMut(&[u8], &mut Vec<u8>, u32) -> Result<usize, rusty_rapidgzip::GzipError>,
+) -> Result<String, rusty_rapidgzip::GzipError> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    let mut member = 0u32;
+    while pos < input.len() {
+        let consumed = decode_member(&input[pos..], &mut out, member)?;
+        pos += consumed;
+        member += 1;
+    }
+    Ok(hex::encode(Sha256::digest(&out)))
+}
+
+/// The committed synthetic fixtures must decode identically through BOTH the
+/// perf-tuned `fast_inflate` kernel and the pure-safe `safe_inflate` engine,
+/// and both must match the recorded ground truth. A standing differential
+/// check of the two engines on real data (the AFL fuzzer covers random input;
+/// this pins the engines against the committed corpus on every test run).
+#[test]
+fn both_engines_agree_on_required_fixtures() {
+    use rusty_rapidgzip::gzip::{decode_one_indexed_fast, decode_one_indexed_safe};
+
+    let dir = corpus_dir();
+    let entries = reference_entries().expect("reference_sums.json is committed and required");
+    let by_name: std::collections::HashMap<&str, &RefEntry> =
+        entries.iter().map(|e| (e.file.as_str(), e)).collect();
+
+    for &name in REQUIRED_FIXTURES {
+        let entry = by_name
+            .get(name)
+            .unwrap_or_else(|| panic!("{name} missing from reference_sums.json"));
+        let bytes = fs::read(dir.join(name))
+            .unwrap_or_else(|e| panic!("required fixture {name} unreadable: {e}"));
+
+        let fast = decode_all_with(&bytes, decode_one_indexed_fast)
+            .unwrap_or_else(|e| panic!("fast engine failed on {name}: {e:#}"));
+        let safe = decode_all_with(&bytes, decode_one_indexed_safe)
+            .unwrap_or_else(|e| panic!("safe engine failed on {name}: {e:#}"));
+
+        assert_eq!(fast, entry.sha256, "fast_inflate mismatch on {name}");
+        assert_eq!(safe, entry.sha256, "safe_inflate mismatch on {name}");
     }
 }

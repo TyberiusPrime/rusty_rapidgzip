@@ -140,14 +140,11 @@ impl StringPod {
     pub fn reserve_for_appends(&mut self, n: usize) {
         let per = match self.storage.current_stride() {
             Some(stride) => stride as usize,
-            None => {
-                let len = self.len();
-                if len == 0 {
-                    64
-                } else {
-                    (self.data.len() / len).max(1)
-                }
-            }
+            None => self
+                .data
+                .len()
+                .checked_div(self.len())
+                .map_or(64, |per| per.max(1)),
         };
         if let Some(data) = Arc::get_mut(&mut self.data) {
             data.reserve(n.saturating_mul(per.max(1)));

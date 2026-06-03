@@ -97,8 +97,8 @@ fn many_records_stress() {
     let mut expect_q = String::new();
     for i in 0..200u32 {
         let len = 1 + (i as usize % 30);
-        let seq: String = std::iter::repeat('A').take(len).collect();
-        let qual: String = std::iter::repeat('I').take(len).collect();
+        let seq: String = "A".repeat(len);
+        let qual: String = "I".repeat(len);
         data.extend_from_slice(format!("@read{i}\n{seq}\n+\n{qual}\n").as_bytes());
         expect_n.push_str(&format!("read{i}\n"));
         expect_s.push_str(&format!("{seq}\n"));
@@ -233,8 +233,8 @@ fn end_to_end_read_gz_into_fastq() {
     let mut exp_q = String::new();
     for i in 0..5000u32 {
         let len = 1 + (i as usize % 50);
-        let seq: String = std::iter::repeat('C').take(len).collect();
-        let qual: String = std::iter::repeat('F').take(len).collect();
+        let seq: String = "C".repeat(len);
+        let qual: String = "F".repeat(len);
         payload.extend_from_slice(format!("@seq.{i} x\n{seq}\n+\n{qual}\n").as_bytes());
         exp_n.push_str(&format!("seq.{i} x\n"));
         exp_s.push_str(&format!("{seq}\n"));
@@ -305,7 +305,7 @@ fn streaming_parallel_pipe_matches_mmap_multichunk() {
         let seq: String = (0..len)
             .map(|j| b"ACGT"[((i as usize + j) * 31) % 4] as char)
             .collect();
-        let qual: String = std::iter::repeat('I').take(len).collect();
+        let qual: String = "I".repeat(len);
         payload.extend_from_slice(format!("@read{i} run:1:flow\n{seq}\n+\n{qual}\n").as_bytes());
     }
 
@@ -400,8 +400,8 @@ fn end_to_end_read_gz_into_fastq_named_pipe() {
     let mut exp_q = String::new();
     for i in 0..500u32 {
         let len = 4 + (i as usize % 20);
-        let seq: String = std::iter::repeat('G').take(len).collect();
-        let qual: String = std::iter::repeat('J').take(len).collect();
+        let seq: String = "G".repeat(len);
+        let qual: String = "J".repeat(len);
         payload.extend_from_slice(format!("@r{i}\n{seq}\n+\n{qual}\n").as_bytes());
         exp_n.push_str(&format!("r{i}\n"));
         exp_s.push_str(&format!("{seq}\n"));

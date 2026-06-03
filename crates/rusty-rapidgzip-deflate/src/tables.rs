@@ -28,7 +28,7 @@ pub const DISTANCE_EXTRA: [u8; 30] = [
 /// Build the fixed Huffman literal/length code lengths (RFC 1951 §3.2.6).
 pub fn fixed_literal_lengths() -> Vec<u8> {
     let mut lens = vec![0u8; 288];
-    for v in lens.iter_mut().take(144).skip(0) {
+    for v in lens.iter_mut().take(144) {
         *v = 8;
     }
     for v in lens.iter_mut().take(256).skip(144) {

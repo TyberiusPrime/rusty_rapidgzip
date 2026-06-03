@@ -61,6 +61,10 @@ impl InputBytes {
     pub fn len(&self) -> usize {
         self.as_slice().len()
     }
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.as_slice().is_empty()
+    }
 }
 
 impl std::ops::Deref for InputBytes {
@@ -327,7 +331,7 @@ pub fn parallel_decode_member(
             c += chunk_bits;
         }
         if !targets.is_empty() {
-            let body_ref = &body[..];
+            let body_ref = body;
             let found: Vec<Option<u64>> = std::thread::scope(|s| {
                 let mut handles = Vec::with_capacity(targets.len().min(num_threads));
                 // Split targets across `num_threads` workers in round-robin.
@@ -337,7 +341,6 @@ pub fn parallel_decode_member(
                     .collect();
                 for indices in chunks {
                     let targets = &targets;
-                    let body_ref = body_ref;
                     handles.push(s.spawn(move || {
                         indices
                             .into_iter()
@@ -1155,6 +1158,10 @@ pub fn parallel_decode_bgzf(
                 // Vec growth reallocations inside the inflate hot loop.
                 let mut out: Vec<u8> = Vec::with_capacity((m_end - m_start) * 65_536);
                 let mut err: Option<Error> = None;
+                #[expect(
+                    clippy::needless_range_loop,
+                    reason = "mi is the absolute member index — used both to index members_ref and as the member id passed to decode_one_indexed_fast"
+                )]
                 for mi in m_start..m_end {
                     let (s, e) = members_ref[mi];
                     let res =

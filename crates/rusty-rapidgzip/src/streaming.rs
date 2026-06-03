@@ -229,7 +229,7 @@ fn decode_item(item: &Item, scratch: &mut Vec<u16>) -> Result<DecodeResult, Erro
         }
 
         // Final block of a member: byte-align, then read the 8-byte trailer.
-        let trailer_byte = ((pos + 7) / 8) as usize;
+        let trailer_byte = pos.div_ceil(8) as usize;
         if trailer_byte + 8 > body.len() {
             return Err(Error::Gzip(GzipError::Truncated));
         }
@@ -359,7 +359,7 @@ fn emit<R>(
         let s = src.buf[start_rel..].to_vec();
         (s, u64::MAX)
     } else {
-        let end_byte = (end_bit + 7) / 8; // ceil
+        let end_byte = end_bit.div_ceil(8); // ceil
         let take_to = ((end_byte - src.base) as usize + PAD).min(src.buf.len());
         let s = src.buf[start_rel..take_to].to_vec();
         let hint = end_bit - start_byte * 8;
@@ -388,7 +388,7 @@ pub(crate) fn read_gz_streaming_parallel<R: Read + Send + 'static>(
     num_threads: usize,
     chunk_bytes: usize,
 ) -> Result<(u64, u64, u64), Error> {
-    let resolve_threads = num_threads.min(4).max(1);
+    let resolve_threads = num_threads.clamp(1, 4);
 
     let abort = Arc::new(AtomicBool::new(false));
 

@@ -226,6 +226,10 @@ fn decode(s: &mut State, h: &Huffman) -> Result<i32, DeflateError> {
 /// than the LUT covers and for end-of-stream where the buffer can't be
 /// fully refilled.
 #[inline]
+#[expect(
+    clippy::explicit_counter_loop,
+    reason = "next_idx walks the canonical-code index table in lockstep with the bit-length loop (RFC 1951 §3.2.2 / C++ reference); a manual counter is clearer than enumerate here"
+)]
 fn decode_short(s: &mut State, h: &Huffman) -> Result<i32, DeflateError> {
     let mut bitbuf = s.bit_buffer;
     let mut available = s.bit_count;
@@ -258,6 +262,10 @@ fn decode_short(s: &mut State, h: &Huffman) -> Result<i32, DeflateError> {
 /// Build a canonical-Huffman table from per-symbol code lengths.
 /// Returns `Ok(())` on a complete or empty table. An incomplete table is OK
 /// only for the distance table with a single code (RFC 1951 §3.2.7).
+#[expect(
+    clippy::needless_range_loop,
+    reason = "canonical Huffman construction (RFC 1951 §3.2.2); the symbol/bit-length indices mirror the spec and the C++ reference"
+)]
 fn construct(h: &mut Huffman, length: &[u16], n: usize) -> Result<i32, DeflateError> {
     h.count[..=MAXBITS].fill(0);
     h.lut.fill(0);

@@ -22,10 +22,18 @@
   to errors. Run fuzzing under ASAN; run miri on the stringpod crate and the
   safe path.
 
-  - CI matrix: stable + MSRV (1.80), -D warnings, cargo clippy, both inflate
-  engines, thread counts 1 and N, and a RAPIDGZIP_FULL_CORPUS job. Make the tiny
-  committed synth-* fixtures a required subset (fail, not skip, if absent) so
-  CI always exercises real decoding.
+  - [DONE] CI matrix: nix flake + GitHub workflow (.github/workflows/ci.yml).
+  Full matrix via `nix flake check` (checks.{stable,clippy,fmt,msrv,corpus-full,
+  miri}); lean subset for GitHub via `nix build .#test.<system>.<job>`.
+    * MSRV is 1.85, not 1.80 — clap 4.6's tree uses edition 2024 (Cargo ≥1.85)
+      and we use `#[expect(...)]` (≥1.81). The msrv job documents/enforces it.
+    * -D warnings clippy: all pre-existing lints fixed; intentional index-based
+      hot loops kept via `#[expect(clippy::needless_range_loop/...)]` w/ reasons.
+    * both inflate engines: golden_hash now diffs fast vs safe against the
+      recorded sums on every run (tests/golden_hash.rs).
+    * thread counts 1 and N: already swept inside concat.rs / adversarial.rs.
+    * RAPIDGZIP_FULL_CORPUS job present (checks.corpus-full).
+    * synth-* fixtures committed (un-ignored) and REQUIRED (fail, not skip).
 
  the serial read path is slower than the parallel one without any real need, 
  just not optimized.

@@ -146,18 +146,92 @@
                 }
             '';
 
+        # ── CI matrix ───────────────────────────────────────────────────────
+        # Each job builds the workspace offline from the committed Cargo.lock
+        # (no network in the sandbox). `nix flake check` runs the FULL matrix
+        # (see `checks` below); GitHub CI fans out only over the lean subset
+        # exposed as `packages.test.*` via `nix build .#test.<name>`.
+        cargoVendor = pkgs.rustPlatform.importCargoLock { lockFile = ./Cargo.lock; };
+
+        # The declared MSRV (Cargo.toml `rust-version`). Floor drivers:
+        #   * `#[expect(...)]` lint attribute (stable since 1.81)
+        #   * the `clap` 4.6 dependency tree uses edition 2024 (needs Cargo 1.85)
+        rustMsrv = pkgs.rust-bin.stable."1.85.0".default;
+
+        # Build one check-only derivation: a fixed toolchain, the vendored
+        # deps wired up offline by cargoSetupHook, and a single cargo command.
+        mkCargoCheck =
+          {
+            name,
+            toolchain ? rustStable,
+            phase,
+          }:
+          pkgs.stdenv.mkDerivation {
+            inherit name;
+            src = ./.;
+            cargoDeps = cargoVendor;
+            nativeBuildInputs = [
+              toolchain
+              pkgs.rustPlatform.cargoSetupHook
+            ];
+            # Check-only: nothing to install, and the default fixup/strip
+            # phases have nothing useful to do.
+            dontFixup = true;
+            buildPhase = ''
+              runHook preBuild
+              export HOME=$(mktemp -d)
+              ${phase}
+              runHook postBuild
+            '';
+            installPhase = "touch $out";
+          };
+
+        # Lean subset — fast, needs no external corpus (the committed synth-*
+        # fixtures are the required real-decode subset; see golden_hash.rs).
+        ciStable = mkCargoCheck {
+          name = "rusty-rapidgzip-test-stable";
+          phase = "cargo test --workspace --offline";
+        };
+        ciClippy = mkCargoCheck {
+          name = "rusty-rapidgzip-clippy";
+          phase = "cargo clippy --workspace --all-targets --offline -- -D warnings";
+        };
+        ciFmt = mkCargoCheck {
+          name = "rusty-rapidgzip-fmt";
+          phase = "cargo fmt --all -- --check";
+        };
+        # MSRV guarantee is for library/binary consumers, so build (not test):
+        # dev-only deps like criterion needn't satisfy 1.80 themselves.
+        ciMsrv = mkCargoCheck {
+          name = "rusty-rapidgzip-msrv-1.85";
+          toolchain = rustMsrv;
+          phase = "cargo build --workspace --offline";
+        };
+
+        # Full-corpus-only extra (local): re-run the golden-hash test without
+        # the large-fixture skip. With only the committed synth fixtures present
+        # it just stops skipping nothing; on a machine with the fetched corpus
+        # it exercises the big files too.
+        ciCorpusFull = mkCargoCheck {
+          name = "rusty-rapidgzip-corpus-full";
+          phase = ''
+            export RAPIDGZIP_FULL_CORPUS=1
+            cargo test -p rusty-rapidgzip --test golden_hash --offline
+          '';
+        };
+
       in
       rec {
-        # `nix flake check` — runs tests and clippy with pinned stable Rust
+        # `nix flake check` runs the FULL local matrix: the lean subset
+        # (stable test, clippy -D warnings, rustfmt, MSRV build) plus the
+        # heavier full-corpus and Miri jobs. GitHub CI runs only the lean
+        # subset (see `packages.test` below and `.github/workflows/ci.yml`).
         checks = {
-          test = naersk-lib-ci.buildPackage {
-            src = ./.;
-            mode = "test";
-          };
-          clippy = naersk-lib-ci.buildPackage {
-            src = ./.;
-            mode = "clippy";
-          };
+          stable = ciStable;
+          clippy = ciClippy;
+          fmt = ciFmt;
+          msrv = ciMsrv;
+          corpus-full = ciCorpusFull;
 
           # `nix build .#checks.<system>.miri` — run the crates' `unsafe` under
           # Miri to catch UB (out-of-bounds, uninit reads, provenance/aliasing
@@ -206,6 +280,18 @@
               '';
               installPhase = "touch $out";
             };
+        };
+
+        # Lean CI subset under a dedicated `test` output (not `checks`, so
+        # `nix flake check` isn't forced to treat the parent as a derivation,
+        # and not `packages`, which flake-check validates leaf-by-leaf).
+        # GitHub CI runs `nix build .#test.<system>.<name>`; locally the same
+        # jobs are reachable via `nix build .#checks.<system>.<name>`.
+        test = {
+          stable = ciStable;
+          clippy = ciClippy;
+          fmt = ciFmt;
+          msrv = ciMsrv;
         };
 
         # `nix develop`

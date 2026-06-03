@@ -16,7 +16,7 @@
 //! Run: `cargo +nightly miri test -p rusty-rapidgzip-deflate --test miri_edge`
 
 use rusty_rapidgzip_deflate::fast_inflate::{decode_member, decode_until_u16, inflate_fast};
-use rusty_rapidgzip_deflate::{BitReader, SpeculativeChunk};
+use rusty_rapidgzip_deflate::{resolve_markers, BitReader, Marker, SpeculativeChunk};
 
 /// Decode a raw-deflate stream via the serial fast path. Pads the input with the
 /// over-read/over-write headroom `inflate_fast` relies on (mirrors the crate's
@@ -262,4 +262,74 @@ fn u16_overlap() {
 #[test]
 fn u16_rle() {
     check_u16_matches_serial(RLE_DEFLATE);
+}
+
+// ── speculative marker resolution (`resolve_markers`) ───────────────────────
+//
+// The serial paths above decode from bit 0 and never overshoot, so they never
+// produce markers — `resolve_markers` (the unsafe core the parallel pipeline
+// relies on to patch a speculatively-decoded chunk against the previous
+// chunk's tail) was previously UNCOVERED by Miri. These tests drive it
+// directly with hand-built markers. `Marker { out_pos, prefix_offset }` maps
+// `chunk.bytes[out_pos] = prev_tail[prev_tail.len() - 1 - prefix_offset]`
+// (prefix_offset 0 = the byte immediately before the chunk).
+
+#[test]
+fn resolve_markers_safe_path() {
+    // prev_tail shorter than 32 KiB -> the bounds-checked resolution path.
+    let prev_tail = b"ABCDEFGH"; // len 8; offset 0 -> 'H', offset 7 -> 'A'
+    let mut chunk = SpeculativeChunk::default();
+    chunk.bytes = vec![0u8; 3];
+    chunk.markers = vec![
+        Marker {
+            out_pos: 0,
+            prefix_offset: 0,
+        }, // -> 'H'
+        Marker {
+            out_pos: 1,
+            prefix_offset: 7,
+        }, // -> 'A'
+        Marker {
+            out_pos: 2,
+            prefix_offset: 3,
+        }, // -> 'E'
+    ];
+    resolve_markers(&mut chunk, prev_tail).expect("resolve_markers failed");
+    assert_eq!(&chunk.bytes, b"HAE");
+}
+
+#[test]
+fn resolve_markers_fast_path() {
+    // prev_tail >= 32 KiB -> the unchecked raw-pointer fast path (all valid
+    // 15-bit prefix_offsets are in range, so the bounds checks are elided).
+    let n = 40_000usize;
+    let prev_tail: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+    let offsets = [0u16, 1, 1000, 32767];
+    let mut chunk = SpeculativeChunk::default();
+    chunk.bytes = vec![0u8; offsets.len()];
+    chunk.markers = offsets
+        .iter()
+        .enumerate()
+        .map(|(i, &o)| Marker {
+            out_pos: i as u32,
+            prefix_offset: o,
+        })
+        .collect();
+    resolve_markers(&mut chunk, &prev_tail).expect("resolve_markers failed");
+    for (i, &o) in offsets.iter().enumerate() {
+        assert_eq!(chunk.bytes[i], prev_tail[n - 1 - o as usize], "marker {i}");
+    }
+}
+
+#[test]
+fn resolve_markers_out_of_range_errors() {
+    // prefix_offset at/after the tail length must be rejected, not read OOB.
+    let prev_tail = b"abc";
+    let mut chunk = SpeculativeChunk::default();
+    chunk.bytes = vec![0u8; 1];
+    chunk.markers = vec![Marker {
+        out_pos: 0,
+        prefix_offset: 3,
+    }];
+    assert!(resolve_markers(&mut chunk, prev_tail).is_err());
 }

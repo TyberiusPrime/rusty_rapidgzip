@@ -86,7 +86,7 @@ fn main() {
     let want = |name: &str| {
         filter
             .as_deref()
-            .map_or(true, |f| f.split(',').any(|x| x == name))
+            .is_none_or(|f| f.split(',').any(|x| x == name))
     };
 
     if want("safe") {

@@ -119,7 +119,7 @@ pub fn propagate_match_cached(
             cursor += 1;
         }
         if cursor >= markers_len {
-            if k + 1 < len && src_lo + k + 1 <= new_max {
+            if k + 1 < len && src_lo + k < new_max {
                 continue;
             }
             break;

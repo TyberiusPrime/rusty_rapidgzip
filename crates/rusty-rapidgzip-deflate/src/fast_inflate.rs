@@ -75,10 +75,12 @@ pub fn decode_until(
 
     let chunk_base = chunk.bytes.len();
 
-    let mut ctx = SpeculativeContext::default();
     // out_pos_offset = 0: this is a single-call decode; member-relative
     // positions start at 0 (already the default; set explicitly for clarity).
-    ctx.out_pos_offset = 0;
+    let mut ctx = SpeculativeContext {
+        out_pos_offset: 0,
+        ..SpeculativeContext::default()
+    };
     let end_bit;
     let hit_bfinal;
     {
@@ -453,7 +455,7 @@ fn decode_compressed<const IS_SPECULATIVE: bool>(
 
         // ── Length code ──────────────────────────────────────────────────────
         let length_base = ((entry >> 16) & 0x1ff) as usize;
-        let len_extra = ((entry >> 8) & 0x1f) as u32;
+        let len_extra = (entry >> 8) & 0x1f;
         let mut length = length_base;
         if len_extra > 0 {
             length += (buf & ((1u64 << len_extra) - 1)) as usize;
@@ -683,7 +685,7 @@ pub fn decode_until_u16(
 /// Caller guarantees `*cur > U16_WINDOW`.
 #[inline]
 fn flush_u16(
-    scratch: &mut Vec<u16>,
+    scratch: &mut [u16],
     chunk: &mut SpeculativeChunk,
     cur: &mut usize,
     window_base: &mut u64,
@@ -720,7 +722,7 @@ fn decode_block_u16(
 
 fn decode_stored_u16(
     br: &mut BitReader<'_>,
-    scratch: &mut Vec<u16>,
+    scratch: &mut [u16],
     chunk: &mut SpeculativeChunk,
     cur: &mut usize,
     window_base: &mut u64,
@@ -898,7 +900,7 @@ fn decode_compressed_u16(
 
         // ── Length code ──────────────────────────────────────────────────────
         let length_base = ((entry >> 16) & 0x1ff) as usize;
-        let len_extra = ((entry >> 8) & 0x1f) as u32;
+        let len_extra = (entry >> 8) & 0x1f;
         let mut length = length_base;
         if len_extra > 0 {
             length += (buf & ((1u64 << len_extra) - 1)) as usize;

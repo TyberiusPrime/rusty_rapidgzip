@@ -232,8 +232,8 @@ fn concat_fastq_records_straddle_members() {
     let mut exp_q = String::new();
     for i in 0..2000u32 {
         let len = 1 + (i as usize % 40);
-        let seq: String = std::iter::repeat('A').take(len).collect();
-        let qual: String = std::iter::repeat('I').take(len).collect();
+        let seq: String = "A".repeat(len);
+        let qual: String = "I".repeat(len);
         payload.extend_from_slice(format!("@read.{i} d\n{seq}\n+\n{qual}\n").as_bytes());
         exp_n.push_str(&format!("read.{i} d\n"));
         exp_s.push_str(&format!("{seq}\n"));

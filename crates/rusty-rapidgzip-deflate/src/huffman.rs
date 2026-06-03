@@ -171,6 +171,10 @@ impl HuffmanDecoder {
         )
     }
 
+    #[expect(
+        clippy::needless_range_loop,
+        reason = "bit-length-indexed loops mirror the canonical Huffman construction (RFC 1951 §3.2.2) and the C++ reference; index access is clearer here than zipping parallel slices"
+    )]
     fn build_into(
         lut: &mut [u32; LUT_SIZE],
         long_codes: &mut Vec<LongCode>,
@@ -388,6 +392,10 @@ fn bit_reverse(mut v: u32, len: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::needless_range_loop,
+        reason = "tests fill expected-code arrays by literal-value index (0..=143 etc.); index access reads as the spec table"
+    )]
     use super::*;
 
     fn tiny_tree() -> HuffmanDecoder {

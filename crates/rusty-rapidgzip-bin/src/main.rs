@@ -46,7 +46,6 @@ fn main() -> Result<()> {
         },
         recycle_rx: Some(recycle_rx),
         recycle_tx: Some(recycle_tx.clone()),
-        ..Config::default()
     };
 
     let (tx, rx) = bounded::<Arc<Vec<u8>>>(16);

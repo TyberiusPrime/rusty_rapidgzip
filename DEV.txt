@@ -46,12 +46,35 @@ deflate streams. That's fine under `cargo test`, but NOT under Miri (§3).
  2. `nix flake check` — the CI gate
 ------------------------------------------------------------------------------
 
-  nix flake check                          # test + clippy (pinned stable)
-  nix build .#checks.x86_64-linux.test
-  nix build .#checks.x86_64-linux.clippy
-  nix build .#checks.x86_64-linux.miri     # UB checks, see §3
+`nix flake check` runs the FULL matrix locally; GitHub CI
+(`.github/workflows/ci.yml`) runs only the lean subset. Every job builds the
+workspace OFFLINE from the committed Cargo.lock (deps vendored via
+`importCargoLock`); there is no network in the sandbox.
 
-`test` and `clippy` build with the lock-pinned stable toolchain via naersk.
+  nix flake check                              # full matrix (all of the below)
+
+Full matrix (`checks.*`):
+  nix build .#checks.x86_64-linux.stable       # cargo test --workspace
+  nix build .#checks.x86_64-linux.clippy       # clippy --all-targets -D warnings
+  nix build .#checks.x86_64-linux.fmt          # cargo fmt --all -- --check
+  nix build .#checks.x86_64-linux.msrv         # cargo build on Rust 1.85 (MSRV)
+  nix build .#checks.x86_64-linux.corpus-full  # golden_hash, RAPIDGZIP_FULL_CORPUS=1
+  nix build .#checks.x86_64-linux.miri         # UB checks, see §3
+
+Lean CI subset (`test.*`) — what `.github/workflows/ci.yml` fans out over:
+  nix build .#test.x86_64-linux.{stable,clippy,fmt,msrv}
+
+Notes:
+  * All cargo jobs use a custom `mkCargoCheck` derivation (a fixed toolchain +
+    a single cargo command), NOT naersk — so we control `-D warnings`, env
+    vars, and the toolchain per job.
+  * MSRV is 1.85: the floor is set by `#[expect(...)]` (≥1.81) and the `clap`
+    4.6 dependency tree (edition 2024 → Cargo ≥1.85). Clippy is MSRV-aware
+    (reads `rust-version`), so raising it can surface new lints.
+  * Real-decode coverage is guaranteed by the committed `tests/corpus/synth-*.gz`
+    fixtures: `tests/golden_hash.rs` REQUIRES them (fails, not skips, if absent)
+    and also diffs the fast vs safe inflate engines against the recorded sums.
+    The large external corpus stays git-ignored and skip-if-absent.
 
 
 ------------------------------------------------------------------------------
@@ -65,11 +88,27 @@ it to validate the remaining `unsafe` after the unsafe-reduction campaign.
 WHAT IS COVERED
   * rusty-rapidgzip-deflate — the back-reference copy kernels in
     `fast_inflate.rs` (copy_back_raw / copy_chunked_unchecked / copy_back_u16 /
-    load_le_u64 refill / set_len), via the self-contained
+    load_le_u64 refill / set_len) AND `speculative::resolve_markers` (the unsafe
+    marker-patch the parallel pipeline relies on), via the self-contained
     `crates/rusty-rapidgzip-deflate/tests/miri_edge.rs`.
   * fastqrab-stringpod — its columnar storage and the `bstr` unsafe it drives,
     via the crate's own unit tests (currently no first-party `unsafe`).
   Each runs under BOTH aliasing models: Stacked Borrows and Tree Borrows.
+
+WHAT IS NOT COVERED (and why)
+  * The full parallel pipeline (`rusty-rapidgzip` crate: pipeline.rs /
+    streaming.rs / read_gz) does NOT run under Miri: it mmaps the input
+    (`memmap2::Mmap::map`, lib.rs) and mmap is an unsupported foreign call in
+    Miri. So we cover the pipeline's *algorithmic* unsafe (resolve_markers)
+    directly with hand-built markers rather than by running the pipeline. New
+    speculative-decode unsafe should get the same direct treatment.
+  * Reminder: `resolve_markers` is only reached when a chunk OVERSHOOTS (a
+    midstream back-ref into the unknown prefix). Decoding from bit 0 produces no
+    markers, so a from-bit-0 test does NOT exercise it — drive it directly.
+  * Gotcha that bit us: `let _ = *p;` is NOT a memory access (the `_` wildcard
+    discards the place unread), so it is not UB and Miri won't flag it. To
+    actually load through a pointer use `let x = *p;` / `ptr::read(p)` /
+    `black_box(*p)`.
 
 RUN IT (hermetic, no network, reproducible) — preferred:
 

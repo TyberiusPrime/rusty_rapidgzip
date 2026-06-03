@@ -277,7 +277,7 @@ fn decode_block(
 
         // Length code: base + extra (extra ≤ 5 bits, already buffered).
         let length_base = ((entry >> 16) & 0x1ff) as usize;
-        let len_extra = ((entry >> 8) & 0x1f) as u32;
+        let len_extra = (entry >> 8) & 0x1f;
         let mut length = length_base;
         if len_extra > 0 {
             length += (buf & ((1u64 << len_extra) - 1)) as usize;

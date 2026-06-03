@@ -103,6 +103,16 @@ impl SpeculativeChunk {
 /// - **Safe** (shorter tail, first chunk only): full bounds-checked loop.
 #[allow(unsafe_code)]
 pub fn resolve_markers(chunk: &mut SpeculativeChunk, prev_tail: &[u8]) -> Result<(), DeflateError> {
+    // uncomment this to verify Miri triggers.
+    // let mut v = vec![1, 2, 3];
+    // let p = v.as_ptr();
+    //
+    // drop(v);
+    //
+    // unsafe {
+    //     let val = *p;
+    // }
+
     let ptail_len = prev_tail.len();
     // if false && ptail_len >= 32768 {
     //     // Fast path: all valid prefix_offsets (≤ 0x7FFF = 32767) are < ptail_len.

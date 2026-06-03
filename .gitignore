@@ -1,5 +1,8 @@
 /target
 **/target_claude
+# nix build output symlinks
+/result
+/result-*
 profile.json.gz
 *.perf
 flamechart.png
@@ -9,5 +12,10 @@ Cargo.lock.bak
 tests/corpus/*.gz
 tests/corpus/*.sha256
 !tests/corpus/.gitkeep
+# The tiny, deterministic synthetic fixtures are committed so CI always has
+# real data to decode (see tests/golden_hash.rs `REQUIRED_FIXTURES`). The
+# large external corpus (canterbury/silesia/enwik8/genomics) stays ignored
+# and is fetched on demand via tests/corpus/download_corpus.py.
+!tests/corpus/synth-*.gz
 fuzz/
 .bacon-locations

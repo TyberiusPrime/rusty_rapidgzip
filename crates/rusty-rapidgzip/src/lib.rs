@@ -900,13 +900,18 @@ fn collect(
     finish_eof(held, &carry, global_lines, &mut emit)
 }
 
+/// Concatenated `(names, seqs, quals)` FASTQ columns, each entry
+/// newline-terminated. Produced by [`fastq_split_for_test`].
+#[doc(hidden)]
+pub type FastqColumns = (Vec<u8>, Vec<u8>, Vec<u8>);
+
 /// Test hook: run the full demux + record-alignment over an explicit sequence
 /// of decode chunks (no gzip, no threads) and return the concatenated
 /// `(names, seqs, quals)` columns, each entry newline-terminated. Lets
 /// `tests/fastq.rs` assert chunk-boundary independence and the complete-records
 /// invariant directly against the real `absorb` / `finish_eof` logic.
 #[doc(hidden)]
-pub fn fastq_split_for_test(chunks: &[&[u8]]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), Error> {
+pub fn fastq_split_for_test(chunks: &[&[u8]]) -> Result<FastqColumns, Error> {
     let (mut names, mut seqs, mut quals) = (Vec::new(), Vec::new(), Vec::new());
     let mut emit = |c: FastqChunk| {
         for x in c.names.iter() {

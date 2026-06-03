@@ -23,9 +23,9 @@
 //!    - bits 1-2: BTYPE  = 0b10 (dynamic)
 //!    - bits 3-7: HLIT   ≤ 29  (so `257+HLIT ≤ 286`)
 //!    - bits 8-12: HDIST ≤ 29  (so `1+HDIST ≤ 30`)
-//!    The LUT also encodes the next-bit-offset to try so we can skip more
-//!    than one bit when no candidate begins at the current position.
-//!    See `rapidgzip_cpp/src/rapidgzip/blockfinder/DynamicHuffman.hpp`.
+//!      The LUT also encodes the next-bit-offset to try so we can skip more
+//!      than one bit when no candidate begins at the current position.
+//!      See `rapidgzip_cpp/src/rapidgzip/blockfinder/DynamicHuffman.hpp`.
 //!
 //! 2. **Full header parse** via [`crate::inflate::read_dynamic_header`]. This
 //!    rebuilds the precode, decodes HLIT+HDIST code lengths, and constructs
@@ -342,6 +342,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::unusual_byte_groupings,
+        reason = "literals are grouped by deflate header bitfields (BFINAL_HDIST_HLIT_BTYPE), not nibbles"
+    )]
     fn lut_basic_properties() {
         // BFINAL=0, BTYPE=0b10 (LSB-first → bit1=0, bit2=1), HLIT=0, HDIST=0
         // → low 13 bits = 0b0_00000_00000_100 = 4.
