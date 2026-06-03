@@ -319,8 +319,8 @@ fn decode_compressed<const IS_SPECULATIVE: bool>(
     let mut byte_pos = br.byte_pos;
     let input_ptr = br.input.as_ptr();
     let input_len = br.input.len();
-    let lit_lut = lit.lut_ptr();
-    let dist_lut = dist.lut_ptr();
+    let lit_lut = lit.lut();
+    let dist_lut = dist.lut();
 
     macro_rules! sync_br {
         () => {
@@ -379,7 +379,7 @@ fn decode_compressed<const IS_SPECULATIVE: bool>(
         // ── Decode literal/length symbol ─────────────────────────────────────
         let entry = {
             let idx = (buf & LUT_MASK) as usize;
-            let e = unsafe { *lit_lut.add(idx) };
+            let e = lit_lut[idx];
             let len = e & 0xff;
             if len == 0 {
                 // Long-code fallback (cold).
@@ -435,7 +435,7 @@ fn decode_compressed<const IS_SPECULATIVE: bool>(
         // ── Distance symbol ──────────────────────────────────────────────────
         let dsym = {
             let idx = (buf & LUT_MASK) as usize;
-            let e = unsafe { *dist_lut.add(idx) };
+            let e = dist_lut[idx];
             let len = e & 0xff;
             if len == 0 {
                 unsafe { out.set_len(cur) };
@@ -779,8 +779,8 @@ fn decode_compressed_u16(
     let mut byte_pos = br.byte_pos;
     let input_ptr = br.input.as_ptr();
     let input_len = br.input.len();
-    let lit_lut = lit.lut_ptr();
-    let dist_lut = dist.lut_ptr();
+    let lit_lut = lit.lut();
+    let dist_lut = dist.lut();
 
     macro_rules! sync_br {
         () => {
@@ -831,7 +831,7 @@ fn decode_compressed_u16(
         // ── Literal/length symbol ────────────────────────────────────────────
         let entry = {
             let idx = (buf & LUT_MASK) as usize;
-            let e = unsafe { *lit_lut.add(idx) };
+            let e = lit_lut[idx];
             let len = e & 0xff;
             if len == 0 {
                 sync_br!();
@@ -880,7 +880,7 @@ fn decode_compressed_u16(
         // ── Distance symbol ──────────────────────────────────────────────────
         let dsym = {
             let idx = (buf & LUT_MASK) as usize;
-            let e = unsafe { *dist_lut.add(idx) };
+            let e = dist_lut[idx];
             let len = e & 0xff;
             if len == 0 {
                 sync_br!();
