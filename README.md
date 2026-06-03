@@ -57,6 +57,11 @@ what you want in almost every case.
 [1]: https://github.com/mxmlnkn/rapidgzip
 [2]: https://github.com/Piezoid/pugz
 
+## Development
+
+See [DEV.txt](DEV.txt) for how to build, test, fuzz, benchmark, and run the
+Miri undefined-behavior checks (`nix build .#checks.x86_64-linux.miri`).
+
 ## Alternatives
 
 Besides just running rapidgzip in an external process,

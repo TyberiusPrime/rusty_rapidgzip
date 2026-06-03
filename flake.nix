@@ -159,13 +159,16 @@
             mode = "clippy";
           };
 
-          # `nix build .#checks.<system>.miri` — run the remaining `unsafe`
-          # blocks in rusty-rapidgzip-deflate under Miri to catch UB
-          # (out-of-bounds, uninit reads, provenance/aliasing violations) in
-          # the back-reference copy kernels. Runs the self-contained
-          # `tests/miri_edge.rs` (no `gzip` subprocess — Miri can't exec) under
-          # both the default Stacked Borrows and the stricter Tree Borrows
-          # aliasing models.
+          # `nix build .#checks.<system>.miri` — run the crates' `unsafe` under
+          # Miri to catch UB (out-of-bounds, uninit reads, provenance/aliasing
+          # violations). Two targets, sharing one std-sysroot build:
+          #   * rusty-rapidgzip-deflate: the back-reference copy kernels, via the
+          #     self-contained `tests/miri_edge.rs` (no `gzip` subprocess — Miri
+          #     can't exec).
+          #   * fastqrab-stringpod: its (currently safe) columnar storage and the
+          #     `bstr` unsafe it drives, via the crate's own unit tests.
+          # Each runs under the default Stacked Borrows and the stricter Tree
+          # Borrows aliasing models.
           miri =
             pkgs.stdenv.mkDerivation {
               name = "rusty-rapidgzip-miri";
@@ -185,14 +188,20 @@
                 # in the toolchain; cargoSetupHook vendored all crate deps).
                 cargo miri setup --offline
 
-                target="-p rusty-rapidgzip-deflate --test miri_edge --offline"
                 base="-Zmiri-strict-provenance -Zmiri-symbolic-alignment-check"
 
-                echo "── Miri: Stacked Borrows ──"
-                MIRIFLAGS="$base" cargo miri test $target
+                # Run one cargo-test selection under both aliasing models.
+                run_miri() {
+                  local label="$1"; shift
+                  echo "── Miri [$label]: Stacked Borrows ──"
+                  MIRIFLAGS="$base" cargo miri test --offline "$@"
+                  echo "── Miri [$label]: Tree Borrows ──"
+                  MIRIFLAGS="$base -Zmiri-tree-borrows" cargo miri test --offline "$@"
+                }
 
-                echo "── Miri: Tree Borrows ──"
-                MIRIFLAGS="$base -Zmiri-tree-borrows" cargo miri test $target
+                run_miri deflate   -p rusty-rapidgzip-deflate --test miri_edge
+                run_miri stringpod -p fastqrab-stringpod
+
                 runHook postBuild
               '';
               installPhase = "touch $out";

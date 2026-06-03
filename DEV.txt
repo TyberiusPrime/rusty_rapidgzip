@@ -1,0 +1,141 @@
+==============================================================================
+ rapidgzip_rs — developer notes
+==============================================================================
+
+How to build, test, fuzz, benchmark and run the Miri UB checks. Everything here
+assumes you are at the workspace root.
+
+The real CLI binary is `rusty-rapidgzip-rs` (a stale `rapidgzip-rs` name may
+linger in some scripts — ignore it).
+
+
+------------------------------------------------------------------------------
+ 0. Dev environment (Nix)
+------------------------------------------------------------------------------
+
+  nix develop          # drops you in a shell with the pinned stable toolchain
+                       # plus bacon, nextest, flamegraph, samply, cargo-* tools,
+                       # afl, cmake/gcc (for the rapidgzip_cpp comparison), etc.
+
+Non-Nix users: a recent stable Rust works for build/test; the Miri check needs
+a specific nightly (see §3).
+
+
+------------------------------------------------------------------------------
+ 1. Build & test
+------------------------------------------------------------------------------
+
+  cargo build --release
+  cargo test                       # all crates
+  cargo test -p rusty-rapidgzip-deflate
+  cargo nextest run                # faster, nicer output (in the dev shell)
+
+Test corpus: the integration tests in `crates/rusty-rapidgzip/tests/` compare
+our decoder's output hash against recorded sha256 sidecars. Generate fixtures:
+
+  cargo run -p xtask -- build-corpus        # idempotent; skips multi-GiB ones
+  cargo run -p xtask -- build-corpus --big  # include the huge fixtures
+  cargo run -p xtask -- rehash-corpus
+  cargo run -p xtask -- clean-corpus
+
+Note: many `*_inflate.rs` unit tests shell out to the system `gzip` to produce
+deflate streams. That's fine under `cargo test`, but NOT under Miri (§3).
+
+
+------------------------------------------------------------------------------
+ 2. `nix flake check` — the CI gate
+------------------------------------------------------------------------------
+
+  nix flake check                          # test + clippy (pinned stable)
+  nix build .#checks.x86_64-linux.test
+  nix build .#checks.x86_64-linux.clippy
+  nix build .#checks.x86_64-linux.miri     # UB checks, see §3
+
+`test` and `clippy` build with the lock-pinned stable toolchain via naersk.
+
+
+------------------------------------------------------------------------------
+ 3. Miri — undefined-behavior checks for the `unsafe` code
+------------------------------------------------------------------------------
+
+Miri interprets MIR and aborts on UB: out-of-bounds, use-after-free, reads of
+uninitialised memory, misalignment, and aliasing/provenance violations. We use
+it to validate the remaining `unsafe` after the unsafe-reduction campaign.
+
+WHAT IS COVERED
+  * rusty-rapidgzip-deflate — the back-reference copy kernels in
+    `fast_inflate.rs` (copy_back_raw / copy_chunked_unchecked / copy_back_u16 /
+    load_le_u64 refill / set_len), via the self-contained
+    `crates/rusty-rapidgzip-deflate/tests/miri_edge.rs`.
+  * fastqrab-stringpod — its columnar storage and the `bstr` unsafe it drives,
+    via the crate's own unit tests (currently no first-party `unsafe`).
+  Each runs under BOTH aliasing models: Stacked Borrows and Tree Borrows.
+
+RUN IT (hermetic, no network, reproducible) — preferred:
+
+  nix build .#checks.x86_64-linux.miri -L
+
+RUN IT (fast local iteration) — needs rustup nightly + components, and network
+for the first sysroot build:
+
+  rustup toolchain install nightly --component miri rust-src
+  export MIRIFLAGS="-Zmiri-strict-provenance -Zmiri-symbolic-alignment-check"
+  cargo +nightly miri test -p rusty-rapidgzip-deflate --test miri_edge
+  cargo +nightly miri test -p fastqrab-stringpod
+  # second pass under the stricter model:
+  MIRIFLAGS="$MIRIFLAGS -Zmiri-tree-borrows" cargo +nightly miri test ...
+
+GOTCHAS (learned the hard way — keep these in mind when extending coverage)
+  * Miri CANNOT exec subprocesses. Any test that spawns `gzip` aborts. New Miri
+    tests must embed their input (see how miri_edge.rs embeds raw-deflate
+    streams as `const` byte arrays: `gzip -6 -c -n | bytes[10:-8]`).
+  * SIMD intrinsics are gated `#[cfg(not(miri))]` in `copy_one_chunk` so Miri
+    takes the scalar fallback (same pointer-bounds contract, no unsupported
+    intrinsics). Keep new SIMD behind the same gate.
+  * The nightly is pinned in flake.nix (`rustMiri`, currently 2026-05-25). It
+    must be a date the LOCKED rust-overlay knows; to move it forward run
+    `nix flake update rust-overlay` first (that also floats stable, so expect
+    the `test`/`clippy` toolchain to move too).
+  * Hermetic sysroot: `cargo miri setup` rebuilds std from source, so std's own
+    deps must be vendored alongside ours. flake.nix merges `./Cargo.lock` and
+    the toolchain's `library/Cargo.lock` into one `cargo-vendor-dir`.
+  * The flake source is a git tree — `git add` new test files or Nix won't see
+    them ("no test target named ...").
+
+Runtime: ~90s per crate per borrow model on top of a ~2min one-time sysroot
+build. Keep Miri inputs SMALL; it is ~100x slower than native.
+
+
+------------------------------------------------------------------------------
+ 4. Benchmarks
+------------------------------------------------------------------------------
+
+Criterion micro-benchmarks:
+
+  cargo bench -p rusty-rapidgzip-deflate --bench inflate_kernels
+  cargo bench -p rusty-rapidgzip        --bench throughput
+  # criterion HTML reports land under target/criterion/
+
+End-to-end throughput vs rapidgzip (cpp), pinned to N cores. These scripts use
+a hard-coded sample file (ERR2432917_1.fastq.gz) and the release binary path —
+edit CMD / the filename for your machine:
+
+  ./bench.sh                       # P = 1, 2, 16
+  ./bench_all_the_cores.sh         # P = 1 .. nproc, gz path
+  ./bench_all_the_cores_bgzf.sh    # same, bgzf path
+
+Profiling (in the dev shell): `samply record <cmd>` or `cargo flamegraph`.
+The decode hot path is `fast_inflate`; `decode_block` is the cold reference
+implementation. See docs/ for the kernel port plan and perf findings.
+
+
+------------------------------------------------------------------------------
+ 5. Fuzzing
+------------------------------------------------------------------------------
+
+AFL-based differential fuzzing (fast vs safe inflate oracle):
+
+  python3 dev/fuzz.py           # see the script for seed/primer options
+
+`cargo-afl` is provided by the Nix dev shell (built from crates.io, wired to
+pkgs.aflplusplus).
