@@ -91,17 +91,19 @@ pub fn resolve_markers(
     prev_tail: &[u8],
 ) -> Result<(), DeflateError> {
     let ptail_len = prev_tail.len();
-    if false && ptail_len >= 32768 {
-        // Fast path: all valid prefix_offsets (≤ 0x7FFF = 32767) are < ptail_len.
-        unsafe {
-            let ptail  = prev_tail.as_ptr();
-            let pbytes = chunk.bytes.as_mut_ptr();
-            for m in &chunk.markers {
-                *pbytes.add(m.out_pos as usize) =
-                    *ptail.add(ptail_len - 1 - m.prefix_offset as usize);
-            }
-        }
-    } else {
+    // if false && ptail_len >= 32768 {
+    //     // Fast path: all valid prefix_offsets (≤ 0x7FFF = 32767) are < ptail_len.
+    //     unsaf {
+    //         let ptail  = prev_tail.as_ptr();
+    //         let pbytes = chunk.bytes.as_mut_ptr();
+    //         for m in &chunk.markers {
+    //             *pbytes.add(m.out_pos as usize) =
+    //                 *ptail.add(ptail_len - 1 - m.prefix_offset as usize);
+    //         }
+    //     }
+    // } else {
+    // cargo bench -p rusty-rapidgzip-deflate --bench inflate_kernels -- --baseline before
+    // says this within sthe noise threshold.
         for m in &chunk.markers {
             let off = m.prefix_offset as usize;
             if off >= ptail_len {
@@ -111,7 +113,7 @@ pub fn resolve_markers(
             }
             chunk.bytes[m.out_pos as usize] = prev_tail[ptail_len - 1 - off];
         }
-    }
+    // }
     chunk.markers.clear();
     chunk.max_marker_pos = None;
     Ok(())

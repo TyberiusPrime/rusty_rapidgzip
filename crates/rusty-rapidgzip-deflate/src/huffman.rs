@@ -335,6 +335,15 @@ impl HuffmanDecoder {
         self.lut.0.as_ptr()
     }
 
+    /// LUT as a fixed-size array reference. Hot-path callers index this with a
+    /// value masked to `LUT_BITS` bits; because the length is a compile-time
+    /// constant, the bounds check folds away — same codegen as `lut_ptr`, no
+    /// `unsafe` at the call site.
+    #[inline]
+    pub(crate) fn lut(&self) -> &[u32; LUT_SIZE] {
+        &self.lut.0
+    }
+
     #[cold]
     pub(crate) fn lookup_long(&self, br: &mut BitReader<'_>) -> Result<u32, DeflateError> {
         let bits = br.peek(MAX_CODE_LEN)?;

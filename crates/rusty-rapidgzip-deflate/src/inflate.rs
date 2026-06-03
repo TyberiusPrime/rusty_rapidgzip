@@ -167,20 +167,23 @@ fn decode_block(
     let mut buf = br.buf;
     let mut bits = br.bits;
     let mut byte_pos = br.byte_pos;
-    let input_ptr = br.input.as_ptr();
-    let input_len = br.input.len();
-    let lit_lut = lit.lut_ptr();
-    let dist_lut = dist.lut_ptr();
+    // Copy the slice handle (ptr+len) into a local — releases the borrow on
+    // `br` so we can still sync `br.*` inside the loop, while letting the
+    // refill use bounds-checked indexing that the explicit guards elide.
+    let input: &[u8] = br.input;
+    let lit_lut = lit.lut();
+    let dist_lut = dist.lut();
 
     let result: Result<(), DeflateError> = 'outer: loop {
         // ---- Local refill to >= NEEDED bits. ----
         if bits < NEEDED {
-            if byte_pos + 8 <= input_len {
+            if byte_pos + 8 <= input.len() {
                 // Fast path: unaligned 8-byte LE load. `bits <= 48 < 56` so
-                // the shift is always defined.
-                let chunk = unsafe {
-                    std::ptr::read_unaligned(input_ptr.add(byte_pos) as *const u64)
-                };
+                // the shift is always defined. The guard makes the slice index
+                // and `try_into` fold to a bare unaligned load.
+                let chunk = u64::from_le_bytes(
+                    input[byte_pos..byte_pos + 8].try_into().unwrap(),
+                );
                 buf |= chunk << bits;
                 let added = 64 - bits;
                 byte_pos += (added / 8) as usize;
@@ -188,7 +191,7 @@ fn decode_block(
             } else {
                 // Slow byte-by-byte until either enough bits or EOF.
                 while bits < NEEDED {
-                    if byte_pos >= input_len {
+                    if byte_pos >= input.len() {
                         // Sync, mark exhausted, return.
                         br.buf = buf;
                         br.bits = bits;
@@ -197,7 +200,7 @@ fn decode_block(
                         unsafe { out.set_len(cur); }
                         break 'outer Err(DeflateError::UnexpectedEof);
                     }
-                    buf |= (unsafe { *input_ptr.add(byte_pos) } as u64) << bits;
+                    buf |= (input[byte_pos] as u64) << bits;
                     byte_pos += 1;
                     bits += 8;
                 }
@@ -207,7 +210,7 @@ fn decode_block(
         // ---- Decode lit/length symbol via direct LUT lookup. ----
         let entry = {
             let idx = (buf & LUT_MASK) as usize;
-            let e = unsafe { *lit_lut.add(idx) };
+            let e = lit_lut[idx];
             let len = e & 0xff;
             if len == 0 {
                 // Cold: long-code chain. Sync state, call, reload.
@@ -274,7 +277,7 @@ fn decode_block(
         // Distance symbol — same LUT pattern.
         let dsym = {
             let idx = (buf & LUT_MASK) as usize;
-            let e = unsafe { *dist_lut.add(idx) };
+            let e = dist_lut[idx];
             let len = e & 0xff;
             if len == 0 {
                 br.buf = buf;
