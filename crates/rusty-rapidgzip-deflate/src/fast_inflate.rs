@@ -200,6 +200,12 @@ const COPY_HEADROOM: usize = COPY_N;
 /// `read_unaligned::<[u8; N]>()` because LLVM materialises the `[u8; N]` array
 /// on the stack — the round-trip showed up as a 32-byte `vmovdqu %ymm,(%rsp)`
 /// burning ~16% of decode cycles. The intrinsic keeps the chunk register-resident.
+///
+/// # Safety
+///
+/// - `src` readable for `N` bytes, `dst` writable for `N` bytes.
+/// - `N` is one of `{16, 32}` (the only widths with a SIMD path; other widths
+///   fall back to a plain unaligned `[u8; N]` copy, which has the same contract).
 #[inline(always)]
 #[allow(unsafe_code)]
 unsafe fn copy_one_chunk<const N: usize>(src: *const u8, dst: *mut u8) {
@@ -285,6 +291,22 @@ unsafe fn copy_back_raw(out_ptr: *mut u8, cur: usize, distance: usize, length: u
     }
 }
 
+/// Unaligned little-endian 8-byte load from `ptr[pos..pos+8]`. This is the hot
+/// refill primitive; we keep the raw load (rather than `from_le_bytes` over a
+/// slice) because the bounds-provable slice form leaves a never-taken `pos + 8`
+/// overflow branch in the loop. Endianness is normalised so callers get the
+/// bytes in stream order on any target.
+///
+/// # Safety
+///
+/// `ptr` must be valid for reads of `pos + 8` bytes (callers guard with
+/// `pos + 8 <= len`).
+#[inline(always)]
+#[allow(unsafe_code)]
+unsafe fn load_le_u64(ptr: *const u8, pos: usize) -> u64 {
+    u64::from_le(std::ptr::read_unaligned(ptr.add(pos) as *const u64))
+}
+
 /// Decode one compressed deflate block (fixed or dynamic Huffman).
 ///
 /// `IS_SPECULATIVE = false`: serial path — all speculative marker code dead.
@@ -336,6 +358,17 @@ fn decode_compressed<const IS_SPECULATIVE: bool>(
             byte_pos = br.byte_pos;
         };
     }
+    // Publish the locally-tracked output length back to `out`.
+    //
+    // SAFETY: every byte in `out[..cur]` has been initialised — each literal
+    // and back-reference writes through `out_ptr` *before* advancing `cur`, and
+    // `cur` only ever grows past bytes we just wrote. So `out`'s first `cur`
+    // bytes are always valid, and publishing that length is sound at any point.
+    macro_rules! publish_len {
+        () => {
+            unsafe { out.set_len(cur) }
+        };
+    }
 
     let result: Result<(), DeflateError> = 'outer: loop {
         // ── Refill: unconditional fast path, byte-by-byte slow path ─────────
@@ -354,9 +387,7 @@ fn decode_compressed<const IS_SPECULATIVE: bool>(
         //
         // SAFETY: `byte_pos + 8 <= input_len` is checked before the load.
         if byte_pos + 8 <= input_len {
-            let chunk =
-                unsafe { std::ptr::read_unaligned(input_ptr.add(byte_pos) as *const u64) };
-            buf |= u64::from_le(chunk) << bits;
+            buf |= unsafe { load_le_u64(input_ptr, byte_pos) } << bits;
             let advance = (63u32 ^ bits) >> 3;
             byte_pos += advance as usize;
             bits |= 56;
@@ -365,7 +396,7 @@ fn decode_compressed<const IS_SPECULATIVE: bool>(
             // current symbol.
             while bits < NEEDED {
                 if byte_pos >= input_len {
-                    unsafe { out.set_len(cur) };
+                    publish_len!();
                     sync_br!();
                     br.exhausted = true;
                     break 'outer Err(DeflateError::UnexpectedEof);
@@ -383,7 +414,7 @@ fn decode_compressed<const IS_SPECULATIVE: bool>(
             let len = e & 0xff;
             if len == 0 {
                 // Long-code fallback (cold).
-                unsafe { out.set_len(cur) };
+                publish_len!();
                 sync_br!();
                 match lit.lookup_long(br) {
                     Ok(e) => {
@@ -402,7 +433,7 @@ fn decode_compressed<const IS_SPECULATIVE: bool>(
         // ── Literal ──────────────────────────────────────────────────────────
         if entry & HUFFDEC_LITERAL != 0 {
             if cur == cap {
-                unsafe { out.set_len(cur) };
+                publish_len!();
                 out.reserve(HEADROOM);
                 cap = out.capacity();
                 out_ptr = out.as_mut_ptr();
@@ -414,7 +445,7 @@ fn decode_compressed<const IS_SPECULATIVE: bool>(
 
         // ── EOB / reserved ───────────────────────────────────────────────────
         if entry & HUFFDEC_EXCEPTIONAL != 0 {
-            unsafe { out.set_len(cur) };
+            publish_len!();
             sync_br!();
             if entry >> 16 == 0 {
                 break 'outer Ok(()); // EOB
@@ -438,7 +469,7 @@ fn decode_compressed<const IS_SPECULATIVE: bool>(
             let e = dist_lut[idx];
             let len = e & 0xff;
             if len == 0 {
-                unsafe { out.set_len(cur) };
+                publish_len!();
                 sync_br!();
                 match dist.lookup_long(br) {
                     Ok(e) => {
@@ -454,7 +485,7 @@ fn decode_compressed<const IS_SPECULATIVE: bool>(
             }
         };
         if dsym >= 30 {
-            unsafe { out.set_len(cur) };
+            publish_len!();
             sync_br!();
             break 'outer Err(DeflateError::Invalid("distance symbol out of range"));
         }
@@ -475,7 +506,7 @@ fn decode_compressed<const IS_SPECULATIVE: bool>(
             if distance > emitted {
                 let prefix_count = (distance - emitted).min(length);
 
-                unsafe { out.set_len(cur) };
+                publish_len!();
                 if out.capacity() - cur < length {
                     out.reserve(length);
                     cap = out.capacity();
@@ -497,7 +528,7 @@ fn decode_compressed<const IS_SPECULATIVE: bool>(
                     // chunk_base + distance`, so the copy distance is
                     // exactly `distance` (not `distance - prefix_count`).
                     if cap - cur < in_buffer_count + COPY_HEADROOM {
-                        unsafe { out.set_len(cur) };
+                        publish_len!();
                         out.reserve(in_buffer_count + HEADROOM);
                         cap = out.capacity();
                         out_ptr = out.as_mut_ptr();
@@ -506,7 +537,7 @@ fn decode_compressed<const IS_SPECULATIVE: bool>(
                     propagate_match_cached(ctx, emitted + prefix_count, distance, in_buffer_count);
                     cur += in_buffer_count;
                     if cap - cur < HEADROOM {
-                        unsafe { out.set_len(cur) };
+                        publish_len!();
                         out.reserve(HEADROOM);
                         cap = out.capacity();
                         out_ptr = out.as_mut_ptr();
@@ -517,12 +548,12 @@ fn decode_compressed<const IS_SPECULATIVE: bool>(
             // distance <= emitted: falls through to in-buffer path below.
             // Propagate markers from source bytes to newly written bytes.
             if distance == 0 {
-                unsafe { out.set_len(cur) };
+                publish_len!();
                 sync_br!();
                 break 'outer Err(DeflateError::Invalid("zero back-reference distance"));
             }
             if cap - cur < length + COPY_HEADROOM {
-                unsafe { out.set_len(cur) };
+                publish_len!();
                 out.reserve(length + HEADROOM);
                 cap = out.capacity();
                 out_ptr = out.as_mut_ptr();
@@ -531,7 +562,7 @@ fn decode_compressed<const IS_SPECULATIVE: bool>(
             propagate_match_cached(ctx, emitted, distance, length);
             cur += length;
             if cap - cur < HEADROOM {
-                unsafe { out.set_len(cur) };
+                publish_len!();
                 out.reserve(HEADROOM);
                 cap = out.capacity();
                 out_ptr = out.as_mut_ptr();
@@ -541,7 +572,7 @@ fn decode_compressed<const IS_SPECULATIVE: bool>(
             // distance > cur is always false in valid streams (after the first
             // 32 KB), so all speculative code is dead-eliminated.
             if distance == 0 || distance > cur {
-                unsafe { out.set_len(cur) };
+                publish_len!();
                 sync_br!();
                 break 'outer if distance == 0 {
                     Err(DeflateError::Invalid("zero back-reference distance"))
@@ -550,7 +581,7 @@ fn decode_compressed<const IS_SPECULATIVE: bool>(
                 };
             }
             if cap - cur < length + COPY_HEADROOM {
-                unsafe { out.set_len(cur) };
+                publish_len!();
                 out.reserve(length + HEADROOM);
                 cap = out.capacity();
                 out_ptr = out.as_mut_ptr();
@@ -558,7 +589,7 @@ fn decode_compressed<const IS_SPECULATIVE: bool>(
             unsafe { copy_back_raw(out_ptr, cur, distance, length) };
             cur += length;
             if cap - cur < HEADROOM {
-                unsafe { out.set_len(cur) };
+                publish_len!();
                 out.reserve(HEADROOM);
                 cap = out.capacity();
                 out_ptr = out.as_mut_ptr();
@@ -799,9 +830,7 @@ fn decode_compressed_u16(
 
     let result: Result<(), DeflateError> = 'outer: loop {
         if byte_pos + 8 <= input_len {
-            let chunk_in =
-                unsafe { std::ptr::read_unaligned(input_ptr.add(byte_pos) as *const u64) };
-            buf |= u64::from_le(chunk_in) << bits;
+            buf |= unsafe { load_le_u64(input_ptr, byte_pos) } << bits;
             let advance = (63u32 ^ bits) >> 3;
             byte_pos += advance as usize;
             bits |= 56;

@@ -174,6 +174,18 @@ fn decode_block(
     let lit_lut = lit.lut();
     let dist_lut = dist.lut();
 
+    // Publish the locally-tracked output length back to `out`.
+    //
+    // SAFETY: every byte in `out[..cur]` has been initialised — each literal
+    // and back-reference writes through `out_ptr` *before* advancing `cur`, and
+    // `cur` only ever grows past bytes we just wrote. So `out`'s first `cur`
+    // bytes are always valid, and publishing that length is sound at any point.
+    macro_rules! publish_len {
+        () => {
+            unsafe { out.set_len(cur) }
+        };
+    }
+
     let result: Result<(), DeflateError> = 'outer: loop {
         // ---- Local refill to >= NEEDED bits. ----
         if bits < NEEDED {
@@ -197,7 +209,7 @@ fn decode_block(
                         br.bits = bits;
                         br.byte_pos = byte_pos;
                         br.exhausted = true;
-                        unsafe { out.set_len(cur); }
+                        publish_len!();
                         break 'outer Err(DeflateError::UnexpectedEof);
                     }
                     buf |= (input[byte_pos] as u64) << bits;
@@ -227,7 +239,7 @@ fn decode_block(
                     Err(e) => {
                         // `br` already holds the latest state — we synced
                         // before the call. Don't reload locals; we're done.
-                        unsafe { out.set_len(cur); }
+                        publish_len!();
                         break 'outer Err(e);
                     }
                 }
@@ -240,7 +252,7 @@ fn decode_block(
 
         if entry & HUFFDEC_LITERAL != 0 {
             if cur == cap {
-                unsafe { out.set_len(cur); }
+                publish_len!();
                 out.reserve(HEADROOM);
                 cap = out.capacity();
                 out_ptr = out.as_mut_ptr();
@@ -254,13 +266,13 @@ fn decode_block(
                 br.buf = buf;
                 br.bits = bits;
                 br.byte_pos = byte_pos;
-                unsafe { out.set_len(cur); }
+                publish_len!();
                 break 'outer Ok(()); // EOB
             }
             br.buf = buf;
             br.bits = bits;
             br.byte_pos = byte_pos;
-            unsafe { out.set_len(cur); }
+            publish_len!();
             break 'outer Err(DeflateError::Invalid("literal/length symbol out of range"));
         }
 
@@ -293,7 +305,7 @@ fn decode_block(
                     Err(e) => {
                         // `br` already holds the latest state — we synced
                         // before the call. Don't reload locals; we're done.
-                        unsafe { out.set_len(cur); }
+                        publish_len!();
                         break 'outer Err(e);
                     }
                 }
@@ -308,7 +320,7 @@ fn decode_block(
             br.buf = buf;
             br.bits = bits;
             br.byte_pos = byte_pos;
-            unsafe { out.set_len(cur); }
+            publish_len!();
             break 'outer Err(DeflateError::Invalid("distance symbol out of range"));
         }
         let di = dsym as usize;
@@ -323,7 +335,7 @@ fn decode_block(
             br.buf = buf;
             br.bits = bits;
             br.byte_pos = byte_pos;
-            unsafe { out.set_len(cur); }
+            publish_len!();
             break 'outer Err(DeflateError::Invalid(
                 "back-reference distance out of bounds",
             ));
@@ -332,10 +344,10 @@ fn decode_block(
             br.buf = buf;
             br.bits = bits;
             br.byte_pos = byte_pos;
-            unsafe { out.set_len(cur); }
+            publish_len!();
             break 'outer Err(DeflateError::Invalid("distance > 32 KiB"));
         }
-        unsafe { out.set_len(cur); }
+        publish_len!();
         copy_back(out, distance, length);
         cur = out.len();
         if cap - cur < HEADROOM {

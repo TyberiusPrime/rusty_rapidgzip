@@ -328,17 +328,10 @@ impl HuffmanDecoder {
         Ok(entry)
     }
 
-    /// Raw LUT pointer for hot-path callers that want to do the LUT lookup
-    /// inline with a manual bit buffer (no `&mut BitReader` round-trip).
-    #[inline]
-    pub(crate) fn lut_ptr(&self) -> *const u32 {
-        self.lut.0.as_ptr()
-    }
-
     /// LUT as a fixed-size array reference. Hot-path callers index this with a
     /// value masked to `LUT_BITS` bits; because the length is a compile-time
-    /// constant, the bounds check folds away — same codegen as `lut_ptr`, no
-    /// `unsafe` at the call site.
+    /// constant, the bounds check folds away — a bare load, no `unsafe` at the
+    /// call site.
     #[inline]
     pub(crate) fn lut(&self) -> &[u32; LUT_SIZE] {
         &self.lut.0
