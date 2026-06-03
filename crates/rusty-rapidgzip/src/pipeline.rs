@@ -24,9 +24,17 @@
 //! - If the block finder fails to locate enough internal boundaries, we
 //!   silently degrade to fewer (or one) chunks. A degenerate decode is
 //!   serial-equivalent.
-//! - On any worker error, the whole pipeline returns that error. We don't
-//!   attempt false-boundary recovery; the block finder's full-header
-//!   verification keeps false positives extremely rare in practice.
+//! - Correctness does **not** rest on the block finder never producing a false
+//!   boundary. The serializer (stage A) runs an *anchored, self-verifying
+//!   chain*: chunk 0 starts at the true first block, and every later chunk's
+//!   speculative `start_bit` is checked against the previous chunk's
+//!   `actual_end_bit`. A mismatch — or a speculative decode that errored —
+//!   means the guessed start was false, so that chunk is re-decoded from the
+//!   known-correct offset (counted as a `speculation_failure`). The block
+//!   finder's full-header verification keeps such re-decodes rare, so this is a
+//!   performance cost, not a correctness risk. (This mirrors rapidgzip-cpp's
+//!   `ChunkData::matchesEncodedOffset` + re-decode fallback.) The per-member
+//!   CRC32 remains as an independent integrity check on top.
 
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -212,6 +220,26 @@ struct WorkResult {
     /// records where (in `chunk.bytes`) one member ends and the next begins,
     /// plus the trailer (CRC32 / ISIZE) for the just-ended member.
     member_boundaries: Vec<MemberBoundary>,
+    /// Absolute bit offset in `body` where decoding stopped — i.e. the start of
+    /// the next real deflate block (or EOF for the final chunk). Used by the
+    /// serializer to verify that the *next* chunk's speculative `start_bit`
+    /// really is a block boundary (see [`parallel_decode_member`]).
+    actual_end_bit: u64,
+}
+
+/// A worker's output for one [`WorkItem`], carrying the item's offsets even on
+/// the error path. The serializer consumes these in `id` order and verifies
+/// each chunk's speculative `start_bit` against the previous chunk's
+/// `actual_end_bit`. A `start_bit` that doesn't line up — or a speculative
+/// decode that *errored* — means the block finder produced a false boundary;
+/// the serializer re-decodes that chunk from the known-correct offset. This is
+/// what makes correctness independent of the block finder never false-positiving
+/// (the CRC32 in each trailer is then only a redundant integrity check).
+struct WorkOutcome {
+    id: u64,
+    start_bit: u64,
+    end_bit_hint: u64,
+    result: Result<WorkResult, Error>,
 }
 
 #[derive(Debug, Clone)]
@@ -252,14 +280,16 @@ struct ResolveDone {
 /// header, and validates CRC32 + ISIZE for each member as it streams.
 ///
 /// On success, returns `(total_uncompressed_bytes, body_bytes_consumed,
-/// chunks_sent)` where `chunks_sent` is the number of `Vec<u8>` chunks
-/// pushed onto `sink`.
+/// chunks_sent, speculation_failures)` where `chunks_sent` is the number of
+/// `Vec<u8>` chunks pushed onto `sink` and `speculation_failures` counts chunks
+/// the serializer had to re-decode because the block finder's guessed start was
+/// a false boundary (normally 0).
 pub fn parallel_decode_member(
     input: Arc<InputBytes>,
     body_offset: usize,
     sink: &Sender<Arc<Vec<u8>>>,
     config: &Config,
-) -> Result<(u64, usize, u64), Error> {
+) -> Result<(u64, usize, u64, u64), Error> {
     // Inside this function `body` is the deflate body — the slice of `input`
     // starting at `body_offset`. Workers receive the full Arc + the offset
     // so they don't need to know about the gzip header layer.
@@ -271,7 +301,9 @@ pub fn parallel_decode_member(
     // the boundary scan / marker machinery entirely and decode serially with a
     // real 32 KiB window (plain u8 output, no marker-window overhead).
     if num_threads == 1 {
-        return serial_decode_member(input, body_offset, sink, config);
+        // Serial path has no speculation, hence no false-boundary recovery.
+        let (uc, bc, ch) = serial_decode_member(input, body_offset, sink, config)?;
+        return Ok((uc, bc, ch, 0));
     }
 
     let recycle_rx = config.recycle_rx.clone();
@@ -363,7 +395,7 @@ pub fn parallel_decode_member(
 
     // Channels.
     let (work_tx, work_rx) = bounded::<WorkItem>(num_threads * 2);
-    let (result_tx, result_rx) = bounded::<Result<WorkResult, Error>>(num_threads * 2);
+    let (result_tx, result_rx) = bounded::<WorkOutcome>(num_threads * 2);
 
     // Spawn the decode pool. All `num_threads` workers are spawned up front and
     // stay alive for the whole decode, pulling from the work channel until it
@@ -388,8 +420,14 @@ pub fn parallel_decode_member(
                 let recycled = recycle_rx
                     .as_ref()
                     .and_then(|r| r.try_recv().ok());
-                let res = decode_one_chunk(body, &item, &mut wk, recycled);
-                if result_tx.send(res).is_err() {
+                let result = decode_one_chunk(body, &item, &mut wk, recycled);
+                let outcome = WorkOutcome {
+                    id: item.id,
+                    start_bit: item.start_bit,
+                    end_bit_hint: item.end_bit_hint,
+                    result,
+                };
+                if result_tx.send(outcome).is_err() {
                     return;
                 }
             }
@@ -544,13 +582,57 @@ pub fn parallel_decode_member(
     drop(done_tx);
     let stage_a = {
         let num_chunks = num_chunks as u64;
-        thread::spawn(move || {
-            let mut reorder: std::collections::BTreeMap<u64, WorkResult> =
+        let input_a = Arc::clone(&input);
+        // Returns the number of chunks that had to be re-decoded because the
+        // block finder's guessed start was a false boundary.
+        thread::spawn(move || -> u64 {
+            let body = &input_a.as_slice()[body_offset..];
+            let mut redecode_kernel = WorkerKernel::new();
+            let mut reorder: std::collections::BTreeMap<u64, WorkOutcome> =
                 std::collections::BTreeMap::new();
             let mut next_id: u64 = 0;
             let mut prev_tail: Vec<u8> = Vec::new();
+            // Anchored, self-verifying chain: chunk 0 always starts at the true
+            // first block (bit 0, immediately after the stripped gzip header).
+            // Every later chunk's speculative `start_bit` must equal the previous
+            // chunk's `actual_end_bit`; otherwise the guessed boundary was false
+            // and we re-decode from the real offset. This removes the dependence
+            // on the finder never false-positiving — see [`block_finder`] and the
+            // gzip-of-gzip test in `tests/nested_gzip.rs`.
+            let mut expected_start: u64 = 0;
+            let mut spec_failures: u64 = 0;
             while next_id < num_chunks {
-                while let Some(res) = reorder.remove(&next_id) {
+                while let Some(outcome) = reorder.remove(&next_id) {
+                    let WorkOutcome { id, start_bit, end_bit_hint, result } = outcome;
+                    debug_assert_eq!(id, next_id);
+                    // Accept the speculative result only if it decoded cleanly
+                    // *and* started exactly where the chain expects. Otherwise
+                    // re-decode from the known-correct offset (`expected_start`,
+                    // a true boundary). A genuine error at the correct offset
+                    // reproduces here and aborts the decode.
+                    let res = match result {
+                        Ok(r) if start_bit == expected_start => r,
+                        wrong => {
+                            // `wrong` is either a clean decode from a false start
+                            // (discard its bytes) or a decode error; both recover
+                            // the same way.
+                            drop(wrong);
+                            spec_failures += 1;
+                            let corrected = WorkItem {
+                                id,
+                                start_bit: expected_start,
+                                end_bit_hint,
+                            };
+                            match decode_one_chunk(body, &corrected, &mut redecode_kernel, None) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    let _ = done_tx_err.send(Err(e));
+                                    return spec_failures;
+                                }
+                            }
+                        }
+                    };
+                    expected_start = res.actual_end_bit;
                     // Resolve only this chunk's tail to feed the next chunk; the
                     // bulk resolve happens in the pool against `prev_arc`.
                     let new_tail = build_prev_tail_fast(&res.chunk, &prev_tail);
@@ -564,29 +646,26 @@ pub fn parallel_decode_member(
                         member_boundaries: res.member_boundaries,
                     };
                     if resolve_tx.send(job).is_err() {
-                        return;
+                        return spec_failures;
                     }
                     next_id += 1;
                     if saw_final {
-                        return;
+                        return spec_failures;
                     }
                 }
                 match result_rx.recv() {
-                    Ok(Ok(r)) => {
-                        reorder.insert(r.id, r);
-                    }
-                    Ok(Err(e)) => {
-                        let _ = done_tx_err.send(Err(e));
-                        return;
+                    Ok(outcome) => {
+                        reorder.insert(outcome.id, outcome);
                     }
                     Err(_) => {
                         let _ = done_tx_err.send(Err(Error::Io(std::io::Error::other(
                             "worker channel closed",
                         ))));
-                        return;
+                        return spec_failures;
                     }
                 }
             }
+            spec_failures
         })
     };
 
@@ -665,7 +744,7 @@ pub fn parallel_decode_member(
     if let Some(cap) = &inflight {
         cap.shutdown();
     }
-    let _ = stage_a.join();
+    let spec_failures = stage_a.join().unwrap_or(0);
     for h in resolve_handles {
         let _ = h.join();
     }
@@ -673,9 +752,15 @@ pub fn parallel_decode_member(
     for h in worker_handles {
         let _ = h.join();
     }
+    if verbose && spec_failures > 0 {
+        eprintln!(
+            "[rapidgzip +{:.2}s] block-finder false boundaries: {spec_failures} chunk(s) re-decoded from the correct offset",
+            crate::elapsed_since_start(),
+        );
+    }
 
     if sink_closed {
-        return Ok((total_uc, body_len, sent));
+        return Ok((total_uc, body_len, sent, spec_failures));
     }
     if let Some(e) = last_err {
         return Err(e);
@@ -688,7 +773,7 @@ pub fn parallel_decode_member(
     let bc = final_byte.ok_or_else(|| {
         Error::Io(std::io::Error::other("parallel decode produced no final block"))
     })?;
-    Ok((total_uc, bc, sent))
+    Ok((total_uc, bc, sent, spec_failures))
 }
 
 /// Build the next chunk's prev_tail by applying only the markers that land in
@@ -707,6 +792,19 @@ pub(crate) fn build_prev_tail_fast(chunk: &SpeculativeChunk, prev_tail: &[u8]) -
         if off < prev_tail.len() {
             new_tail[dst] = prev_tail[prev_tail.len() - 1 - off];
         }
+    }
+    // A chunk shorter than the window (e.g. an empty chunk produced when a
+    // false-boundary re-decode is absorbed by the previous chunk, or a tiny
+    // final chunk) does not by itself hold a full 32 KiB window. Carry the
+    // missing prefix from the previous tail so the next chunk's back-references
+    // still resolve. For the common case (len >= WINDOW) this is a no-op.
+    if len < WINDOW && !prev_tail.is_empty() {
+        let need = WINDOW - len;
+        let carry = &prev_tail[prev_tail.len().saturating_sub(need)..];
+        let mut combined = Vec::with_capacity(carry.len() + new_tail.len());
+        combined.extend_from_slice(carry);
+        combined.extend_from_slice(&new_tail);
+        return combined;
     }
     new_tail
 }
@@ -790,11 +888,18 @@ fn decode_one_chunk(
         // Loop: next iteration will inflate the first block of the new member.
     }
 
+    // `br` is now parked at the start of the next real block (the non-final
+    // break / top-of-loop break left it on a block boundary) or at EOF (the
+    // final-block break sought past the last trailer). Either way this is the
+    // exact offset the *next* chunk's speculative start must match.
+    let actual_end_bit = br.tell_bit();
+
     Ok(WorkResult {
         id: item.id,
         chunk,
         final_block,
         member_boundaries,
+        actual_end_bit,
     })
 }
 
@@ -1163,7 +1268,7 @@ pub fn parallel_decode_bgzf(
     if remainder_offset < file.len() {
         let header_len = crate::gzip::parse_header(&file[remainder_offset..])
             .map_err(Error::Gzip)?;
-        let (uc, _body_consumed, ch) = parallel_decode_member(
+        let (uc, _body_consumed, ch, _spec_failures) = parallel_decode_member(
             Arc::clone(&file),
             remainder_offset + header_len,
             sink,

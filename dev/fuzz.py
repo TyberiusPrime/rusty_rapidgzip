@@ -23,6 +23,12 @@ The fast `fast_inflate` kernel is the default decode path now — there is no
                               member decodes through (the "fast path")
   * decode_one_indexed_safe — pure-safe reference inflater, used as a
                               differential oracle against the fast kernel
+  * parallel_decode_member  — the speculative multi-threaded pipeline, run
+                              in-memory and diffed against serial decode_all.
+                              This is the ONLY target that drives block-finder
+                              boundary speculation + the false-boundary recovery
+                              (e.g. nested gzip, where the outer stored blocks
+                              carry the inner stream's real headers)
 
 The only remaining engine env var is RAPIDGZIP_INFLATE (intree|safe), which the
 harness does NOT set — it calls each kernel explicitly so a single run exercises
@@ -81,6 +87,7 @@ path = "src/fastq.rs"
 [dependencies]
 afl = "*"
 rusty-rapidgzip = { path = "../crates/rusty-rapidgzip" }
+crossbeam-channel = "*"
 """
 
 FASTQ_RS = """\
@@ -133,13 +140,13 @@ fn main() {
 """
 
 MAIN_RS = """\
-use rusty_rapidgzip::gzip;
+use rusty_rapidgzip::{gzip, pipeline, Config};
 
 fn main() {
     afl::fuzz!(|data: &[u8]| {
         // 1. Whole-file, multi-member serial decode (in-tree inflate).
         let mut whole = Vec::new();
-        let _ = gzip::decode_all(data, &mut whole);
+        let rser = gzip::decode_all(data, &mut whole);
 
         // 2 & 3. Single-member decode through the two kernels that matter.
         //   * decode_one_indexed_fast: the perf-tuned `fast_inflate` kernel
@@ -159,6 +166,44 @@ fn main() {
         if let (Ok(cf), Ok(cs)) = (rf, rs) {
             assert_eq!(cf, cs, "fast/safe disagree on bytes consumed");
             assert_eq!(fast, safe, "fast/safe disagree on decoded output");
+        }
+
+        // 4. Parallel-pipeline differential. The speculative multi-threaded
+        //    decoder must agree byte-for-byte with the serial whole-file decode
+        //    on any valid gzip. This is the only target that drives the block
+        //    finder's boundary speculation and stage A's false-boundary recovery
+        //    (verify each chunk's guessed start against the previous chunk's real
+        //    end; re-decode on mismatch). Gated on size + a small chunk so the
+        //    input actually splits into several speculative chunks — otherwise
+        //    the path degrades to a serial-equivalent single chunk.
+        if data.len() >= 96 * 1024 {
+            if let Ok(header_len) = gzip::parse_header(data) {
+                let (tx, rx) =
+                    crossbeam_channel::bounded::<std::sync::Arc<Vec<u8>>>(64);
+                let collector = std::thread::spawn(move || {
+                    let mut v = Vec::new();
+                    for c in rx {
+                        v.extend_from_slice(&c);
+                    }
+                    v
+                });
+                let input =
+                    std::sync::Arc::new(pipeline::InputBytes::Owned(data.to_vec()));
+                let cfg = Config {
+                    num_threads: 4,
+                    chunk_size_bytes: 64 * 1024,
+                    ..Default::default()
+                };
+                let rpar = pipeline::parallel_decode_member(input, header_len, &tx, &cfg);
+                drop(tx);
+                let par = collector.join().unwrap();
+                // Compare only when both decoders fully succeeded on the same
+                // single contiguous stream; mismatched Ok/Err can stem from
+                // benign trailing-garbage differences, not a speculation bug.
+                if rser.is_ok() && rpar.is_ok() {
+                    assert_eq!(par, whole, "parallel/serial disagree on decoded output");
+                }
+            }
         }
     });
 }
@@ -191,6 +236,29 @@ def _seed_from(glob_dirs, pattern, limit=200_000):
     return copied
 
 
+def seed_nested_gzip():
+    """Write gzip-of-gzip (and -of-gzip-of-gzip) seeds into the corpus, sized to
+    span several 64 KiB speculative chunks so the parallel differential exercises
+    real boundary speculation over stored-block payloads. Returns count written.
+    """
+    import gzip as _gz
+    import random as _random
+
+    rng = _random.Random(0xC0FFEE)
+    # Incompressible-once base so the *outer* layers are all stored blocks.
+    base = rng.randbytes(256 * 1024)
+    once = _gz.compress(base, 6)
+    twice = _gz.compress(once, 6)
+    thrice = _gz.compress(twice, 6)
+    copied = 0
+    for name, blob in (("nested-double.gz", twice), ("nested-triple.gz", thrice)):
+        dst = CORPUS_DIR / name
+        if not dst.exists():
+            dst.write_bytes(blob)
+            copied += 1
+    return copied
+
+
 def seed_corpus():
     CORPUS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -205,7 +273,14 @@ def seed_corpus():
     bgz_dir = PROJECT_ROOT / "rapidgzip_cpp" / "librapidarchive" / "src" / "tests" / "data"
     bgz = _seed_from([bgz_dir], "*.bgz")
 
-    print(f"[*] Seeded corpus: {gz} gzip + {bgz} bgzf fixtures -> {CORPUS_DIR}")
+    # Nested gzip (gzip-of-gzip): the inner stream is incompressible, so the
+    # outer deflate stores it in uncompressed blocks whose payload carries the
+    # inner stream's real dynamic-Huffman headers. The block finder will latch
+    # onto those while scanning the outer stream, so this primes the parallel
+    # differential's false-boundary recovery — a case raw mutation rarely builds.
+    nested = seed_nested_gzip()
+
+    print(f"[*] Seeded corpus: {gz} gzip + {bgz} bgzf + {nested} nested fixtures -> {CORPUS_DIR}")
     if gz + bgz == 0:
         print("[!] No seeds found — the fuzzer will start from an empty corpus.")
 

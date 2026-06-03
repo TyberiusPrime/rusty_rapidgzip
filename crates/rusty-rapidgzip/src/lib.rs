@@ -414,21 +414,24 @@ pub fn read_gz(
     // BGZF fast-path: if the first member carries a BC FEXTRA subfield, the
     // whole file is bgzip — every member is an independent deflate stream
     // and we can decode them in parallel without speculation or markers.
-    let (total_uncompressed, chunks_sent) = if gzip::parse_bgzf_block_size(input.as_slice()).is_some() {
+    let (total_uncompressed, chunks_sent, speculation_failures) = if gzip::parse_bgzf_block_size(input.as_slice()).is_some() {
         if verbose {
             eprintln!(
                 "[rapidgzip +{:.2}s] bgzf detected — using fast path",
                 elapsed_since_start(),
             );
         }
-        pipeline::parallel_decode_bgzf(Arc::clone(&input), &sink, &config)?
+        // BGZF members are independent, fully-bounded deflate streams: no block
+        // finder, no speculation, hence no false boundaries to recover from.
+        let (uc, ch) = pipeline::parallel_decode_bgzf(Arc::clone(&input), &sink, &config)?;
+        (uc, ch, 0)
     } else {
         // Parse only the *first* member's header here; the pipeline handles
         // every subsequent member's header inline as it crosses BFINAL.
         let header_len = gzip::parse_header(input.as_slice())?;
-        let (uc, _body_consumed, ch) =
+        let (uc, _body_consumed, ch, spec) =
             pipeline::parallel_decode_member(Arc::clone(&input), header_len, &sink, &config)?;
-        (uc, ch)
+        (uc, ch, spec)
     };
 
     drop(sink);
@@ -442,7 +445,7 @@ pub fn read_gz(
         compressed_bytes,
         uncompressed_bytes: total_uncompressed,
         chunks_decoded: chunks_sent,
-        speculation_failures: 0,
+        speculation_failures,
     })
 }
 

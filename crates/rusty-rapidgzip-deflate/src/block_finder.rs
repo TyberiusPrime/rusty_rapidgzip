@@ -34,8 +34,12 @@
 //!
 //! False positives at the second stage are still possible (the first ~150
 //! bytes of any random data have a tiny but nonzero chance of validating as
-//! a block header). The pipeline absorbs these via a "did the chunk decode
-//! cleanly?" check.
+//! a block header; an outer gzip's *stored* blocks wrapping an inner gzip
+//! stream are a reliable adversarial source — the inner stream's real headers
+//! sit inside the outer payload). The pipeline does not rely on this never
+//! happening: its serializer verifies every chunk's start against the previous
+//! chunk's actual end and re-decodes from the correct offset on a mismatch
+//! (see `pipeline`'s anchored-chain assumption note).
 
 use crate::tables::{
     CODE_LENGTH_ORDER, DISTANCE_BASE, DISTANCE_EXTRA, LENGTH_BASE, LENGTH_EXTRA,
