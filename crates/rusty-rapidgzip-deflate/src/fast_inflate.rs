@@ -81,7 +81,6 @@ pub fn decode_until(
     // out_pos_offset = 0: this is a single-call decode; member-relative
     // positions start at 0 (already the default; set explicitly for clarity).
     ctx.out_pos_offset = 0;
-    let ctx_ptr: *mut SpeculativeContext = &mut ctx;
     let end_bit;
     let hit_bfinal;
     {
@@ -89,7 +88,7 @@ pub fn decode_until(
         loop {
             let bfinal = br.read(1)? != 0;
             let btype = br.read(2)?;
-            decode_block::<true>(&mut br, &mut chunk.bytes, btype, chunk_base, ctx_ptr)?;
+            decode_block::<true>(&mut br, &mut chunk.bytes, btype, chunk_base, Some(&mut ctx))?;
             if bfinal {
                 final_block = true;
                 break;
@@ -136,7 +135,7 @@ pub fn decode_one_block(
 ) -> Result<bool, DeflateError> {
     let bfinal = br.read(1)? != 0;
     let btype = br.read(2)?;
-    decode_block::<false>(br, out, btype, 0, core::ptr::null_mut())?;
+    decode_block::<false>(br, out, btype, 0, None)?;
     Ok(bfinal)
 }
 
@@ -147,18 +146,18 @@ fn decode_block<const IS_SPECULATIVE: bool>(
     out: &mut Vec<u8>,
     btype: u32,
     chunk_base: usize,
-    ctx_ptr: *mut SpeculativeContext,
+    ctx: Option<&mut SpeculativeContext>,
 ) -> Result<(), DeflateError> {
     match btype {
         0 => decode_stored(br, out),
         1 => {
             let lit = HuffmanDecoder::from_lengths_litlen(&fixed_literal_lengths())?;
             let dist = HuffmanDecoder::from_lengths(&fixed_distance_lengths())?;
-            decode_compressed::<IS_SPECULATIVE>(br, out, &lit, &dist, chunk_base, ctx_ptr)
+            decode_compressed::<IS_SPECULATIVE>(br, out, &lit, &dist, chunk_base, ctx)
         }
         2 => {
             let (lit, dist) = read_dynamic_header(br)?;
-            decode_compressed::<IS_SPECULATIVE>(br, out, &lit, &dist, chunk_base, ctx_ptr)
+            decode_compressed::<IS_SPECULATIVE>(br, out, &lit, &dist, chunk_base, ctx)
         }
         _ => Err(DeflateError::Invalid("reserved block type")),
     }
@@ -297,7 +296,7 @@ fn decode_compressed<const IS_SPECULATIVE: bool>(
     lit: &HuffmanDecoder,
     dist: &HuffmanDecoder,
     chunk_base: usize,
-    ctx_ptr: *mut SpeculativeContext,
+    mut ctx: Option<&mut SpeculativeContext>,
 ) -> Result<(), DeflateError> {
     // Worst-case bits needed for a full L/D pair: 15+5+15+13 = 48.
     // We only need this for the near-EOF slow path. The fast path uses the
@@ -470,6 +469,7 @@ fn decode_compressed<const IS_SPECULATIVE: bool>(
 
         // ── Back-reference resolve ────────────────────────────────────────────
         if IS_SPECULATIVE {
+            let ctx = ctx.as_mut().unwrap();   // one unwrap, names the invariant
             // Speculative path: back-refs may reach into the unknown prefix.
             let emitted = cur - chunk_base;
             if distance > emitted {
@@ -484,7 +484,7 @@ fn decode_compressed<const IS_SPECULATIVE: bool>(
                 unsafe {
                     std::ptr::write_bytes(out_ptr.add(cur), 0, prefix_count);
                 }
-                record_match_prefix(ctx_ptr, emitted, distance, prefix_count);
+                record_match_prefix(ctx, emitted, distance, prefix_count);
                 cur += prefix_count;
 
                 let in_buffer_count = length - prefix_count;
@@ -503,7 +503,7 @@ fn decode_compressed<const IS_SPECULATIVE: bool>(
                         out_ptr = out.as_mut_ptr();
                     }
                     unsafe { copy_back_raw(out_ptr, cur, distance, in_buffer_count) };
-                    propagate_match_cached(ctx_ptr, emitted + prefix_count, distance, in_buffer_count);
+                    propagate_match_cached(ctx, emitted + prefix_count, distance, in_buffer_count);
                     cur += in_buffer_count;
                     if cap - cur < HEADROOM {
                         unsafe { out.set_len(cur) };
@@ -528,7 +528,7 @@ fn decode_compressed<const IS_SPECULATIVE: bool>(
                 out_ptr = out.as_mut_ptr();
             }
             unsafe { copy_back_raw(out_ptr, cur, distance, length) };
-            propagate_match_cached(ctx_ptr, emitted, distance, length);
+            propagate_match_cached(ctx, emitted, distance, length);
             cur += length;
             if cap - cur < HEADROOM {
                 unsafe { out.set_len(cur) };

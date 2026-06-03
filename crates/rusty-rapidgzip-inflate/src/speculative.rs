@@ -44,13 +44,11 @@ const MAX_DISTANCE: usize = 32768;
 /// decode) is a no-op returning `false`.
 #[inline]
 pub fn record_match_prefix(
-    ctx_ptr: *mut SpeculativeContext,
+    ctx: &mut SpeculativeContext,
     written_at_match_start: usize,
     dist: usize,
     count: usize,
 ) -> bool {
-    if ctx_ptr.is_null() { return false; }
-    let ctx = unsafe { &mut *ctx_ptr };
     ctx.markers.reserve(count);
     let offset = ctx.out_pos_offset as usize;
     for k in 0..count {
@@ -69,13 +67,11 @@ pub fn record_match_prefix(
 /// (RLE-tiling) copies.
 #[inline(always)]
 pub fn propagate_match_cached(
-    ctx_ptr: *mut SpeculativeContext,
+    ctx: &mut SpeculativeContext,
     written_at_match_start: usize,
     dist: usize,
     len: usize,
 ) {
-    if ctx_ptr.is_null() { return; }
-    let ctx = unsafe { &mut *ctx_ptr };
     let max = match ctx.max_marker_pos { None => return, Some(m) => m as usize };
     let dst_start = ctx.out_pos_offset as usize + written_at_match_start;
     if dst_start < dist { return; }
