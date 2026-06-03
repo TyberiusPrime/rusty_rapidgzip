@@ -39,8 +39,7 @@ use crate::tables::{
 use crate::{BitReader, DeflateError, HuffmanDecoder};
 
 use rusty_rapidgzip_inflate::speculative::{
-    cache_active_ptr, propagate_match_cached, record_match_prefix, set_out_pos_offset,
-    ContextGuard, SpeculativeContext,
+    propagate_match_cached, record_match_prefix, SpeculativeContext,
 };
 
 // ── Public entry points ──────────────────────────────────────────────────────
@@ -79,15 +78,13 @@ pub fn decode_until(
     let chunk_base = chunk.bytes.len();
 
     let mut ctx = SpeculativeContext::default();
+    // out_pos_offset = 0: this is a single-call decode; member-relative
+    // positions start at 0 (already the default; set explicitly for clarity).
+    ctx.out_pos_offset = 0;
+    let ctx_ptr: *mut SpeculativeContext = &mut ctx;
     let end_bit;
     let hit_bfinal;
     {
-        let _guard = ContextGuard::new(&mut ctx);
-        // out_pos_offset = 0: this is a single-call decode; member-relative
-        // positions start at 0.
-        set_out_pos_offset(0);
-        let ctx_ptr = cache_active_ptr();
-
         let mut final_block = false;
         loop {
             let bfinal = br.read(1)? != 0;
@@ -487,7 +484,7 @@ fn decode_compressed<const IS_SPECULATIVE: bool>(
                 unsafe {
                     std::ptr::write_bytes(out_ptr.add(cur), 0, prefix_count);
                 }
-                record_match_prefix(emitted, distance, prefix_count);
+                record_match_prefix(ctx_ptr, emitted, distance, prefix_count);
                 cur += prefix_count;
 
                 let in_buffer_count = length - prefix_count;

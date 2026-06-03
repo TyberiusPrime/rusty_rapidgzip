@@ -6,8 +6,6 @@
 //! `(out_pos, prefix_offset)` marker.  Downstream code resolves the marker once
 //! the preceding chunk's tail window is known.
 
-use core::cell::Cell;
-
 pub const RUN_FLAG: u16 = 0x8000; // reserved; unused by this crate
 
 /// One unresolved back-reference byte.
@@ -40,51 +38,19 @@ pub struct SpeculativeContext {
 /// can only be a copy source while the write head is in `(p, p + MAX_DISTANCE]`.
 const MAX_DISTANCE: usize = 32768;
 
-thread_local! {
-    static ACTIVE: Cell<*mut SpeculativeContext> = const { Cell::new(core::ptr::null_mut()) };
-}
-
-pub struct ContextGuard<'a> {
-    _ctx: &'a mut SpeculativeContext,
-    prev: *mut SpeculativeContext,
-}
-
-impl<'a> ContextGuard<'a> {
-    pub fn new(ctx: &'a mut SpeculativeContext) -> Self {
-        let raw = ctx as *mut SpeculativeContext;
-        let prev = ACTIVE.with(|c| { let p = c.get(); c.set(raw); p });
-        Self { _ctx: ctx, prev }
-    }
-}
-
-impl Drop for ContextGuard<'_> {
-    fn drop(&mut self) { ACTIVE.with(|c| c.set(self.prev)); }
-}
-
-pub fn current_out_pos_offset() -> u32 {
-    let ptr = ACTIVE.with(|c| c.get());
-    if ptr.is_null() { return 0; }
-    unsafe { (*ptr).out_pos_offset }
-}
-
-#[inline(always)]
-pub fn is_active() -> bool { ACTIVE.with(|c| !c.get().is_null()) }
-
-#[inline(always)]
-pub fn cache_active_ptr() -> *mut SpeculativeContext { ACTIVE.with(|c| c.get()) }
-
-pub fn set_out_pos_offset(offset: u32) {
-    let ptr = ACTIVE.with(|c| c.get());
-    if ptr.is_null() { return; }
-    unsafe { (*ptr).out_pos_offset = offset; }
-}
-
 /// Push one per-byte marker for each byte of the prefix-overshoot match.
+///
+/// `ctx_ptr` is the live [`SpeculativeContext`]; a null pointer (non-speculative
+/// decode) is a no-op returning `false`.
 #[inline]
-pub fn record_match_prefix(written_at_match_start: usize, dist: usize, count: usize) -> bool {
-    let ptr = ACTIVE.with(|c| c.get());
-    if ptr.is_null() { return false; }
-    let ctx = unsafe { &mut *ptr };
+pub fn record_match_prefix(
+    ctx_ptr: *mut SpeculativeContext,
+    written_at_match_start: usize,
+    dist: usize,
+    count: usize,
+) -> bool {
+    if ctx_ptr.is_null() { return false; }
+    let ctx = unsafe { &mut *ctx_ptr };
     ctx.markers.reserve(count);
     let offset = ctx.out_pos_offset as usize;
     for k in 0..count {
@@ -94,11 +60,6 @@ pub fn record_match_prefix(written_at_match_start: usize, dist: usize, count: us
         ctx.max_marker_pos = Some(out_pos);
     }
     true
-}
-
-#[inline(always)]
-pub fn propagate_match(written_at_match_start: usize, dist: usize, len: usize) {
-    propagate_match_cached(cache_active_ptr(), written_at_match_start, dist, len);
 }
 
 /// Propagate markers from a just-executed in-buffer copy.

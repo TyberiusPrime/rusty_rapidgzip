@@ -2,7 +2,7 @@
 
 A streaming, parallel gzip decoder for Rust, inspired by [rapidgzip][1] / [pugz][2].
 
-Absolutely vibed up with Claude - but hey, gzip inflate is well understood 
+Absolutely vibed up with Claude - but hey, gzip inflate is well understood
 problem, right?
 
 ## Status
@@ -34,6 +34,9 @@ for chunk in rx { /* process bytes in stream order */ }
 
 No random access, no `Read`/`Seek`, no upstream-compatible `.gzi` (for now).
 
+This has the advantage of applying back-pressure easily, so 
+no strict need to fine tune thread counts.
+
 ## Environment variables
 
 A few knobs are read from the environment. All are optional; the defaults are
@@ -58,3 +61,6 @@ what you want in almost every case.
 
 Besides just running rapidgzip in an external process,
 there's also a set of [rust bindings](https://github.com/alekseizarubin/rapidgzip-rs/)!
+
+
+
