@@ -147,7 +147,7 @@ impl InflightCap {
     /// Block until a slot is free, then claim it. Returns `false` if the cap was
     /// shut down while waiting (teardown) — the caller should stop dispatching.
     fn acquire(&self) -> bool {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().expect("inflight-cap mutex poisoned");
         loop {
             if g.shutdown {
                 return false;
@@ -156,13 +156,13 @@ impl InflightCap {
                 g.in_flight += 1;
                 return true;
             }
-            g = self.cv.wait(g).unwrap();
+            g = self.cv.wait(g).expect("inflight-cap mutex poisoned");
         }
     }
 
     /// Return one slot and wake a waiting dispatcher.
     fn release(&self) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().expect("inflight-cap mutex poisoned");
         g.in_flight = g.in_flight.saturating_sub(1);
         drop(g);
         self.cv.notify_one();
@@ -170,7 +170,7 @@ impl InflightCap {
 
     /// Release a dispatcher blocked in [`acquire`] during teardown.
     fn shutdown(&self) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().expect("inflight-cap mutex poisoned");
         g.shutdown = true;
         drop(g);
         self.cv.notify_all();
@@ -353,14 +353,17 @@ pub fn parallel_decode_member(
                 }
                 let mut out: Vec<Option<u64>> = vec![None; targets.len()];
                 for h in handles {
-                    for (i, b) in h.join().unwrap() {
+                    for (i, b) in h.join().expect("block-finder worker thread panicked") {
                         out[i] = b;
                     }
                 }
                 out
             });
             for b in found.into_iter().flatten() {
-                if b > *boundaries.last().unwrap() {
+                if b > *boundaries
+                    .last()
+                    .expect("boundaries seeded with [0], never empty")
+                {
                     boundaries.push(b);
                 }
             }
@@ -871,10 +874,16 @@ fn decode_one_chunk(
         if trailer_byte + 8 > body.len() {
             return Err(Error::Gzip(crate::GzipError::Truncated));
         }
-        let crc_expected =
-            u32::from_le_bytes(body[trailer_byte..trailer_byte + 4].try_into().unwrap());
-        let isize_expected =
-            u32::from_le_bytes(body[trailer_byte + 4..trailer_byte + 8].try_into().unwrap());
+        let crc_expected = u32::from_le_bytes(
+            body[trailer_byte..trailer_byte + 4]
+                .try_into()
+                .expect("4-byte slice (trailer_byte + 8 bounds-checked above)"),
+        );
+        let isize_expected = u32::from_le_bytes(
+            body[trailer_byte + 4..trailer_byte + 8]
+                .try_into()
+                .expect("4-byte slice (trailer_byte + 8 bounds-checked above)"),
+        );
         member_boundaries.push(MemberBoundary {
             byte_offset_in_chunk: chunk.bytes.len(),
             crc_expected,
@@ -1027,10 +1036,16 @@ fn serial_decode_member(
         if trailer_byte + 8 > body.len() {
             return Err(Error::Gzip(crate::GzipError::Truncated));
         }
-        let crc_expected =
-            u32::from_le_bytes(body[trailer_byte..trailer_byte + 4].try_into().unwrap());
-        let isize_expected =
-            u32::from_le_bytes(body[trailer_byte + 4..trailer_byte + 8].try_into().unwrap());
+        let crc_expected = u32::from_le_bytes(
+            body[trailer_byte..trailer_byte + 4]
+                .try_into()
+                .expect("4-byte slice (trailer_byte + 8 bounds-checked above)"),
+        );
+        let isize_expected = u32::from_le_bytes(
+            body[trailer_byte + 4..trailer_byte + 8]
+                .try_into()
+                .expect("4-byte slice (trailer_byte + 8 bounds-checked above)"),
+        );
 
         let crc_got = std::mem::replace(&mut member_crc, crc32fast::Hasher::new()).finalize();
         if crc_got != crc_expected {

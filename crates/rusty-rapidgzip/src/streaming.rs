@@ -233,10 +233,16 @@ fn decode_item(item: &Item, scratch: &mut Vec<u16>) -> Result<DecodeResult, Erro
         if trailer_byte + 8 > body.len() {
             return Err(Error::Gzip(GzipError::Truncated));
         }
-        let crc_expected =
-            u32::from_le_bytes(body[trailer_byte..trailer_byte + 4].try_into().unwrap());
-        let isize_expected =
-            u32::from_le_bytes(body[trailer_byte + 4..trailer_byte + 8].try_into().unwrap());
+        let crc_expected = u32::from_le_bytes(
+            body[trailer_byte..trailer_byte + 4]
+                .try_into()
+                .expect("4-byte slice (trailer_byte + 8 bounds-checked above)"),
+        );
+        let isize_expected = u32::from_le_bytes(
+            body[trailer_byte + 4..trailer_byte + 8]
+                .try_into()
+                .expect("4-byte slice (trailer_byte + 8 bounds-checked above)"),
+        );
         member_boundaries.push(MemberBoundary {
             byte_offset_in_chunk: chunk.bytes.len(),
             crc_expected,

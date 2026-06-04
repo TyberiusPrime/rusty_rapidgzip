@@ -106,12 +106,15 @@ pub fn decode_one_indexed(
     if trailer_start + 8 > input.len() {
         return Err(GzipError::Truncated);
     }
-    let crc_expected =
-        u32::from_le_bytes(input[trailer_start..trailer_start + 4].try_into().unwrap());
+    let crc_expected = u32::from_le_bytes(
+        input[trailer_start..trailer_start + 4]
+            .try_into()
+            .expect("4-byte slice (trailer_start + 8 bounds-checked above)"),
+    );
     let isize_expected = u32::from_le_bytes(
         input[trailer_start + 4..trailer_start + 8]
             .try_into()
-            .unwrap(),
+            .expect("4-byte slice (trailer_start + 8 bounds-checked above)"),
     );
 
     let decoded = &out[initial_out_len..];
@@ -153,12 +156,15 @@ pub fn decode_one_indexed_safe(
     if trailer_start + 8 > input.len() {
         return Err(GzipError::Truncated);
     }
-    let crc_expected =
-        u32::from_le_bytes(input[trailer_start..trailer_start + 4].try_into().unwrap());
+    let crc_expected = u32::from_le_bytes(
+        input[trailer_start..trailer_start + 4]
+            .try_into()
+            .expect("4-byte slice (trailer_start + 8 bounds-checked above)"),
+    );
     let isize_expected = u32::from_le_bytes(
         input[trailer_start + 4..trailer_start + 8]
             .try_into()
-            .unwrap(),
+            .expect("4-byte slice (trailer_start + 8 bounds-checked above)"),
     );
     let decoded = &out[initial_out_len..];
     let crc_got = crc32fast::hash(decoded);
@@ -209,12 +215,15 @@ pub fn decode_one_indexed_fast(
     if trailer_start + 8 > input.len() {
         return Err(GzipError::Truncated);
     }
-    let crc_expected =
-        u32::from_le_bytes(input[trailer_start..trailer_start + 4].try_into().unwrap());
+    let crc_expected = u32::from_le_bytes(
+        input[trailer_start..trailer_start + 4]
+            .try_into()
+            .expect("4-byte slice (trailer_start + 8 bounds-checked above)"),
+    );
     let isize_expected = u32::from_le_bytes(
         input[trailer_start + 4..trailer_start + 8]
             .try_into()
-            .unwrap(),
+            .expect("4-byte slice (trailer_start + 8 bounds-checked above)"),
     );
     let decoded = &out[initial_out_len..];
     let crc_got = crc32fast::hash(decoded);
@@ -262,7 +271,11 @@ pub fn parse_header(input: &[u8]) -> Result<usize, GzipError> {
         if pos + 2 > input.len() {
             return Err(GzipError::Truncated);
         }
-        let xlen = u16::from_le_bytes(input[pos..pos + 2].try_into().unwrap()) as usize;
+        let xlen = u16::from_le_bytes(
+            input[pos..pos + 2]
+                .try_into()
+                .expect("2-byte slice (pos + 2 bounds-checked above)"),
+        ) as usize;
         pos += 2 + xlen;
         if pos > input.len() {
             return Err(GzipError::Truncated);
@@ -303,7 +316,11 @@ pub(crate) fn parse_bgzf_block_size(input: &[u8]) -> Option<u32> {
     if flg & FEXTRA == 0 {
         return None;
     }
-    let xlen = u16::from_le_bytes(input[10..12].try_into().unwrap()) as usize;
+    let xlen = u16::from_le_bytes(
+        input[10..12]
+            .try_into()
+            .expect("2-byte slice (input.len() >= 12 checked above)"),
+    ) as usize;
     if 12 + xlen > input.len() {
         return None;
     }
@@ -312,12 +329,20 @@ pub(crate) fn parse_bgzf_block_size(input: &[u8]) -> Option<u32> {
     while p + 4 <= end {
         let si1 = input[p];
         let si2 = input[p + 1];
-        let slen = u16::from_le_bytes(input[p + 2..p + 4].try_into().unwrap()) as usize;
+        let slen = u16::from_le_bytes(
+            input[p + 2..p + 4]
+                .try_into()
+                .expect("2-byte slice (p + 4 <= end <= input.len())"),
+        ) as usize;
         if p + 4 + slen > end {
             return None;
         }
         if si1 == b'B' && si2 == b'C' && slen == 2 {
-            let bsize = u16::from_le_bytes(input[p + 4..p + 6].try_into().unwrap());
+            let bsize = u16::from_le_bytes(
+                input[p + 4..p + 6]
+                    .try_into()
+                    .expect("2-byte slice (p + 4 + slen <= end, slen == 2)"),
+            );
             return Some(bsize as u32 + 1);
         }
         p += 4 + slen;

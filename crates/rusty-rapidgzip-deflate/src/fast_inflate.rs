@@ -500,8 +500,10 @@ fn decode_compressed<const IS_SPECULATIVE: bool>(
 
         // ── Back-reference resolve ────────────────────────────────────────────
         if IS_SPECULATIVE {
-            let ctx = ctx.as_mut().unwrap(); // one unwrap, names the invariant
-                                             // Speculative path: back-refs may reach into the unknown prefix.
+            let ctx = ctx
+                .as_mut()
+                .expect("IS_SPECULATIVE == true guarantees ctx is Some (caller invariant)");
+            // Speculative path: back-refs may reach into the unknown prefix.
             let emitted = cur - chunk_base;
             if distance > emitted {
                 let prefix_count = (distance - emitted).min(length);

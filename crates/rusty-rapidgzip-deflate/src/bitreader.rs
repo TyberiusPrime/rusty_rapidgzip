@@ -105,10 +105,10 @@ impl<'a> BitReader<'a> {
         // Fast path: ≥8 bytes ahead → one unaligned LE load fills 64 bits.
         if self.byte_pos + REFILL_FAST_AHEAD <= self.input.len() && self.bits <= 56 {
             let chunk = u64::from_le_bytes(
-                // SAFETY-equivalent: bounds checked above. Use a copy.
+                // Bounds checked above (byte_pos + REFILL_FAST_AHEAD <= len).
                 self.input[self.byte_pos..self.byte_pos + 8]
                     .try_into()
-                    .unwrap(),
+                    .expect("8-byte slice (byte_pos + 8 guarded above)"),
             );
             self.buf |= chunk << self.bits;
             let added = 64 - self.bits;

@@ -192,7 +192,11 @@ fn decode_block(
                 // Fast path: unaligned 8-byte LE load. `bits <= 48 < 56` so
                 // the shift is always defined. The guard makes the slice index
                 // and `try_into` fold to a bare unaligned load.
-                let chunk = u64::from_le_bytes(input[byte_pos..byte_pos + 8].try_into().unwrap());
+                let chunk = u64::from_le_bytes(
+                    input[byte_pos..byte_pos + 8]
+                        .try_into()
+                        .expect("8-byte slice (byte_pos + 8 <= input.len() guarded above)"),
+                );
                 buf |= chunk << bits;
                 let added = 64 - bits;
                 byte_pos += (added / 8) as usize;

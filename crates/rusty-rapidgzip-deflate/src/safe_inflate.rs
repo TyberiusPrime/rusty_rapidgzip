@@ -105,7 +105,11 @@ impl<'a> State<'a> {
             return Ok(());
         }
         if self.pos + 8 <= self.input.len() {
-            let chunk = u64::from_le_bytes(self.input[self.pos..self.pos + 8].try_into().unwrap());
+            let chunk = u64::from_le_bytes(
+                self.input[self.pos..self.pos + 8]
+                    .try_into()
+                    .expect("8-byte slice (pos + 8 <= input.len() guarded above)"),
+            );
             self.bit_buffer |= chunk << self.bit_count;
             let added = 64 - self.bit_count;
             self.pos += (added / 8) as usize;
@@ -132,7 +136,11 @@ impl<'a> State<'a> {
             return;
         }
         if self.pos + 8 <= self.input.len() {
-            let chunk = u64::from_le_bytes(self.input[self.pos..self.pos + 8].try_into().unwrap());
+            let chunk = u64::from_le_bytes(
+                self.input[self.pos..self.pos + 8]
+                    .try_into()
+                    .expect("8-byte slice (pos + 8 <= input.len() guarded above)"),
+            );
             self.bit_buffer |= chunk << self.bit_count;
             let added = 64 - self.bit_count;
             self.pos += (added / 8) as usize;
@@ -357,7 +365,11 @@ fn codes(s: &mut State, out: &mut Vec<u8>, lc: &Huffman, dc: &Huffman) -> Result
         // Inline refill — fast path is an 8-byte LE load.
         if bits < NEEDED {
             if pos + 8 <= input.len() {
-                let chunk = u64::from_le_bytes(input[pos..pos + 8].try_into().unwrap());
+                let chunk = u64::from_le_bytes(
+                    input[pos..pos + 8]
+                        .try_into()
+                        .expect("8-byte slice (pos + 8 <= input.len() guarded above)"),
+                );
                 buf |= chunk << bits;
                 let added = 64 - bits;
                 pos += (added / 8) as usize;

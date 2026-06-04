@@ -300,8 +300,16 @@ fn read_gz_streaming<R: Read>(reader: R, sink: &Sender<Arc<Vec<u8>>>) -> Result<
         // Read and validate the 8-byte gzip trailer.
         sb.byte_align();
         let trailer = sb.read_bytes::<8>()?;
-        let crc_expected = u32::from_le_bytes(trailer[..4].try_into().unwrap());
-        let isize_expected = u32::from_le_bytes(trailer[4..].try_into().unwrap());
+        let crc_expected = u32::from_le_bytes(
+            trailer[..4]
+                .try_into()
+                .expect("4-byte slice of the 8-byte trailer array"),
+        );
+        let isize_expected = u32::from_le_bytes(
+            trailer[4..]
+                .try_into()
+                .expect("4-byte slice of the 8-byte trailer array"),
+        );
         let crc_got = crc_hasher.finalize();
         if crc_got != crc_expected {
             return Err(Error::Gzip(GzipError::CrcMismatch {
