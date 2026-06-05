@@ -2,12 +2,12 @@
 """AFL fuzzing driver for rusty-rapidgzip.
 
 Usage:
-    python dev/fuzz.py          # build + run the decode fuzzer
-    python dev/fuzz.py build    # build fuzz targets only
-    python dev/fuzz.py run      # run the decode fuzzer (builds first if needed)
-    python dev/fuzz.py fastq    # run the FASTQ columnar-split fuzzer
-    python dev/fuzz.py minimize # minimize corpus
-    python dev/fuzz.py crash    # replay crashes
+    python dev/fuzz.py              # build + run the decode fuzzer (1 core)
+    python dev/fuzz.py build        # build fuzz targets only
+    python dev/fuzz.py run [N]      # run the decode fuzzer on N cores (default 1)
+    python dev/fuzz.py fastq [N]    # run the FASTQ columnar-split fuzzer on N cores
+    python dev/fuzz.py minimize     # minimize corpus
+    python dev/fuzz.py crash        # replay crashes
 
 Two targets:
   * fuzz_rapidgzip (run) — gzip/BGZF decode kernels, fast/safe differential.
@@ -15,24 +15,25 @@ Two targets:
                            invariance oracle (same stream split differently must
                            yield identical columns; exercises the carry-stitch).
 
-The fast `fast_inflate` kernel is the default decode path now — there is no
-`RAPIDGZIP_KERNEL` knob anymore. The harness drives it directly (see MAIN_RS):
+The harness drives three decode paths (see MAIN_RS):
 
-  * decode_all              — serial, multi-member, in-tree inflate
-  * decode_one_indexed_fast — the perf-tuned `fast_inflate` kernel every BGZF
-                              member decodes through (the "fast path")
-  * decode_one_indexed_safe — pure-safe reference inflater, used as a
-                              differential oracle against the fast kernel
-  * parallel_decode_member  — the speculative multi-threaded pipeline, run
-                              in-memory and diffed against serial decode_all.
-                              This is the ONLY target that drives block-finder
-                              boundary speculation + the false-boundary recovery
-                              (e.g. nested gzip, where the outer stored blocks
-                              carry the inner stream's real headers)
+  * decode_all              — serial, multi-member inflate (the regular gzip path)
+  * decode_one_indexed_fast — the perf-tuned `fast_inflate` kernel used by the
+                              BGZF pipeline for each independent member (unsafe)
+  * decode_one_indexed_safe — pure-safe reference inflater
 
-The only remaining engine env var is RAPIDGZIP_INFLATE (intree|safe), which the
-harness does NOT set — it calls each kernel explicitly so a single run exercises
-all of them regardless of the environment.
+  fast vs safe form a differential oracle: on any input both accept they must
+  produce byte-identical output and agree on bytes consumed.  A divergence here
+  is a real bug in the unsafe fast kernel.
+
+  The parallel pipeline is NOT exercised by this harness — AFL thread-spawn
+  overhead per trial kills throughput, and concurrency bugs are better caught by
+  integration tests + loom/TSAN.  Use `python dev/fuzz.py run N` to get N-core
+  coverage instead.
+
+Multi-core: run N > 1 to launch one AFL master + (N-1) secondary instances, all
+sharing the findings directory.  The master runs in the foreground; secondaries
+are background subprocesses killed on Ctrl-C.
 """
 
 import json
@@ -65,6 +66,7 @@ def binary_path(name="fuzz_rapidgzip"):
         pass
     return target_dir / "release" / name
 
+
 CARGO_TOML = """\
 # Detached from the parent /project workspace: this crate lives inside the
 # workspace directory but is not a member, so it needs its own (empty) root.
@@ -87,7 +89,6 @@ path = "src/fastq.rs"
 [dependencies]
 afl = "*"
 rusty-rapidgzip = { path = "../crates/rusty-rapidgzip" }
-crossbeam-channel = "*"
 """
 
 FASTQ_RS = """\
@@ -140,25 +141,23 @@ fn main() {
 """
 
 MAIN_RS = """\
-use rusty_rapidgzip::{gzip, pipeline, Config};
+use rusty_rapidgzip::gzip;
 
 fn main() {
     afl::fuzz!(|data: &[u8]| {
-        // 1. Whole-file, multi-member serial decode (in-tree inflate).
+        // 1. Whole-file, multi-member serial decode (regular gzip path).
         let mut whole = Vec::new();
-        let rser = gzip::decode_all(data, &mut whole);
+        let _ = gzip::decode_all(data, &mut whole);
 
-        // 2 & 3. Single-member decode through the two kernels that matter.
+        // 2 & 3. Single-member decode through both kernels.
         //   * decode_one_indexed_fast: the perf-tuned `fast_inflate` kernel
-        //     (contains `unsafe`) that the BGZF fast-path drives every member
-        //     through. This IS the default/fast path — any valid gzip or BGZF
-        //     member header takes the input straight into the kernel.
+        //     (contains `unsafe`) used by the BGZF pipeline for each independent
+        //     member.
         //   * decode_one_indexed_safe: the pure-safe puff-style reference.
         //
         // Both share header parsing and trailer (CRC + ISIZE) validation, so on
-        // success they MUST agree byte-for-byte and on bytes-consumed. That is a
-        // differential oracle over the `unsafe` fast kernel: a divergence here is
-        // a real bug, not just a panic.
+        // success they MUST agree byte-for-byte and on bytes-consumed.  A
+        // divergence is a real bug in the unsafe fast kernel, not just a panic.
         let mut fast = Vec::new();
         let mut safe = Vec::new();
         let rf = gzip::decode_one_indexed_fast(data, &mut fast, 0);
@@ -166,44 +165,6 @@ fn main() {
         if let (Ok(cf), Ok(cs)) = (rf, rs) {
             assert_eq!(cf, cs, "fast/safe disagree on bytes consumed");
             assert_eq!(fast, safe, "fast/safe disagree on decoded output");
-        }
-
-        // 4. Parallel-pipeline differential. The speculative multi-threaded
-        //    decoder must agree byte-for-byte with the serial whole-file decode
-        //    on any valid gzip. This is the only target that drives the block
-        //    finder's boundary speculation and stage A's false-boundary recovery
-        //    (verify each chunk's guessed start against the previous chunk's real
-        //    end; re-decode on mismatch). Gated on size + a small chunk so the
-        //    input actually splits into several speculative chunks — otherwise
-        //    the path degrades to a serial-equivalent single chunk.
-        if data.len() >= 96 * 1024 {
-            if let Ok(header_len) = gzip::parse_header(data) {
-                let (tx, rx) =
-                    crossbeam_channel::bounded::<std::sync::Arc<Vec<u8>>>(64);
-                let collector = std::thread::spawn(move || {
-                    let mut v = Vec::new();
-                    for c in rx {
-                        v.extend_from_slice(&c);
-                    }
-                    v
-                });
-                let input =
-                    std::sync::Arc::new(pipeline::InputBytes::Owned(data.to_vec()));
-                let cfg = Config {
-                    num_threads: 4,
-                    chunk_size_bytes: 64 * 1024,
-                    ..Default::default()
-                };
-                let rpar = pipeline::parallel_decode_member(input, header_len, &tx, &cfg);
-                drop(tx);
-                let par = collector.join().unwrap();
-                // Compare only when both decoders fully succeeded on the same
-                // single contiguous stream; mismatched Ok/Err can stem from
-                // benign trailing-garbage differences, not a speculation bug.
-                if rser.is_ok() && rpar.is_ok() {
-                    assert_eq!(par, whole, "parallel/serial disagree on decoded output");
-                }
-            }
         }
     });
 }
@@ -220,7 +181,7 @@ def ensure_crate():
     (src / "fastq.rs").write_text(FASTQ_RS)
 
 
-def _seed_from(glob_dirs, pattern, limit=200_000):
+def _seed_from(glob_dirs, pattern, limit=16_384):
     """Copy fixtures matching `pattern` from each dir into the corpus."""
     copied = 0
     for seed_dir in glob_dirs:
@@ -236,29 +197,6 @@ def _seed_from(glob_dirs, pattern, limit=200_000):
     return copied
 
 
-def seed_nested_gzip():
-    """Write gzip-of-gzip (and -of-gzip-of-gzip) seeds into the corpus, sized to
-    span several 64 KiB speculative chunks so the parallel differential exercises
-    real boundary speculation over stored-block payloads. Returns count written.
-    """
-    import gzip as _gz
-    import random as _random
-
-    rng = _random.Random(0xC0FFEE)
-    # Incompressible-once base so the *outer* layers are all stored blocks.
-    base = rng.randbytes(256 * 1024)
-    once = _gz.compress(base, 6)
-    twice = _gz.compress(once, 6)
-    thrice = _gz.compress(twice, 6)
-    copied = 0
-    for name, blob in (("nested-double.gz", twice), ("nested-triple.gz", thrice)):
-        dst = CORPUS_DIR / name
-        if not dst.exists():
-            dst.write_bytes(blob)
-            copied += 1
-    return copied
-
-
 def seed_corpus():
     CORPUS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -270,17 +208,12 @@ def seed_corpus():
     # the primer that keeps the fast/BGZF kernel under coverage — without a real
     # BGZF seed, raw AFL mutations almost never reconstruct a valid member header
     # and the fast path is never reached.
-    bgz_dir = PROJECT_ROOT / "rapidgzip_cpp" / "librapidarchive" / "src" / "tests" / "data"
+    bgz_dir = (
+        PROJECT_ROOT / "rapidgzip_cpp" / "librapidarchive" / "src" / "tests" / "data"
+    )
     bgz = _seed_from([bgz_dir], "*.bgz")
 
-    # Nested gzip (gzip-of-gzip): the inner stream is incompressible, so the
-    # outer deflate stores it in uncompressed blocks whose payload carries the
-    # inner stream's real dynamic-Huffman headers. The block finder will latch
-    # onto those while scanning the outer stream, so this primes the parallel
-    # differential's false-boundary recovery — a case raw mutation rarely builds.
-    nested = seed_nested_gzip()
-
-    print(f"[*] Seeded corpus: {gz} gzip + {bgz} bgzf + {nested} nested fixtures -> {CORPUS_DIR}")
+    print(f"[*] Seeded corpus: {gz} gzip + {bgz} bgzf -> {CORPUS_DIR}")
     if gz + bgz == 0:
         print("[!] No seeds found — the fuzzer will start from an empty corpus.")
 
@@ -295,9 +228,25 @@ def build():
     print(f"[+] Binary: {binary_path()}")
 
 
-def run():
-    if not binary_path().exists():
-        build()
+def _afl_cmd(binary, corpus, output, instance_name):
+    return [
+        "cargo",
+        "afl",
+        "fuzz",
+        "-i",
+        str(corpus),
+        "-o",
+        str(output),
+        "-m",
+        "none",
+        "-M" if instance_name == "fuzzer00" else "-S",
+        instance_name,
+        str(binary),
+    ]
+
+
+def run(jobs=1):
+    build()  # always rewrite sources + incremental compile; fast no-op if unchanged
 
     seed_corpus()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -306,17 +255,39 @@ def run():
     print(f"[*] Corpus : {CORPUS_DIR}")
     print(f"[*] Output : {OUTPUT_DIR}")
     print(f"[*] Binary : {binary}")
+    if jobs > 1:
+        print(f"[*] Cores  : {jobs} (1 master + {jobs - 1} secondary)")
     print()
 
-    subprocess.check_call(
-        [
-            "cargo", "afl", "fuzz",
-            "-i", str(CORPUS_DIR),
-            "-o", str(OUTPUT_DIR),
-            "-m", "none",
-            str(binary),
-        ],
-    )
+    secondaries = []
+    try:
+        for i in range(1, jobs):
+            name = f"fuzzer{i:02d}"
+            print(f"[*] Starting secondary {name} in background …")
+            secondaries.append(
+                subprocess.Popen(_afl_cmd(binary, CORPUS_DIR, OUTPUT_DIR, name))
+            )
+        master_name = "fuzzer00" if jobs > 1 else "default"
+        master_cmd = (
+            _afl_cmd(binary, CORPUS_DIR, OUTPUT_DIR, master_name)
+            if jobs > 1
+            else [
+                "cargo",
+                "afl",
+                "fuzz",
+                "-i",
+                str(CORPUS_DIR),
+                "-o",
+                str(OUTPUT_DIR),
+                "-m",
+                "none",
+                str(binary),
+            ]
+        )
+        subprocess.check_call(master_cmd)
+    finally:
+        for p in secondaries:
+            p.terminate()
 
 
 def seed_fastq_corpus():
@@ -341,30 +312,60 @@ def seed_fastq_corpus():
     print(f"[*] Seeded FASTQ corpus: {copied} new seed(s) -> {FASTQ_CORPUS_DIR}")
 
 
-def run_fastq():
+def run_fastq(jobs=1):
+    build()  # always rewrite sources + incremental compile; fast no-op if unchanged
     binary = binary_path("fuzz_fastq")
-    if not binary.exists():
-        build()
     seed_fastq_corpus()
     FASTQ_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     print(f"[*] Corpus : {FASTQ_CORPUS_DIR}")
     print(f"[*] Output : {FASTQ_OUTPUT_DIR}")
     print(f"[*] Binary : {binary}")
+    if jobs > 1:
+        print(f"[*] Cores  : {jobs} (1 master + {jobs - 1} secondary)")
     print()
-    subprocess.check_call(
-        [
-            "cargo", "afl", "fuzz",
-            "-i", str(FASTQ_CORPUS_DIR),
-            "-o", str(FASTQ_OUTPUT_DIR),
-            "-m", "none",
-            str(binary),
-        ],
-    )
+    secondaries = []
+    try:
+        for i in range(1, jobs):
+            name = f"fuzzer{i:02d}"
+            print(f"[*] Starting secondary {name} in background …")
+            secondaries.append(
+                subprocess.Popen(
+                    _afl_cmd(binary, FASTQ_CORPUS_DIR, FASTQ_OUTPUT_DIR, name)
+                )
+            )
+        master_cmd = (
+            _afl_cmd(binary, FASTQ_CORPUS_DIR, FASTQ_OUTPUT_DIR, "fuzzer00")
+            if jobs > 1
+            else [
+                "cargo",
+                "afl",
+                "fuzz",
+                "-i",
+                str(FASTQ_CORPUS_DIR),
+                "-o",
+                str(FASTQ_OUTPUT_DIR),
+                "-m",
+                "none",
+                str(binary),
+            ]
+        )
+        subprocess.check_call(master_cmd)
+    finally:
+        for p in secondaries:
+            p.terminate()
 
 
 def minimize():
-    queue = OUTPUT_DIR / "default" / "queue"
-    if not queue.exists():
+    # Single-instance AFL writes to output/default/; multi-instance to output/fuzzernn/.
+    queue = next(
+        (
+            OUTPUT_DIR / d / "queue"
+            for d in ("default", "fuzzer00")
+            if (OUTPUT_DIR / d / "queue").exists()
+        ),
+        None,
+    )
+    if queue is None:
         print("[!] No findings to minimize — run the fuzzer first.")
         sys.exit(1)
     mini = OUTPUT_DIR / "minimized"
@@ -372,9 +373,13 @@ def minimize():
     print("[*] Minimizing corpus …")
     subprocess.check_call(
         [
-            "cargo", "afl", "cmin",
-            "-i", str(queue),
-            "-o", str(mini),
+            "cargo",
+            "afl",
+            "cmin",
+            "-i",
+            str(queue),
+            "-o",
+            str(mini),
             "--",
             str(binary_path()),
         ],
@@ -383,15 +388,24 @@ def minimize():
 
 
 def replay_crashes():
-    crashes_dir = OUTPUT_DIR / "default" / "crashes"
-    if not crashes_dir.exists():
+    crashes_dirs = [
+        OUTPUT_DIR / d / "crashes"
+        for d in [
+            "default",
+        ]
+        + [f"fuzzer{i:02}" for i in range(0, 65)]
+        if (OUTPUT_DIR / d / "crashes").exists()
+    ]
+    if len(crashes_dirs) == 0:
         print("[!] No crashes directory — run the fuzzer first.")
         sys.exit(1)
 
-    crashes = sorted(
-        p for p in crashes_dir.iterdir()
-        if p.is_file() and p.name != "README.txt"
-    )
+    crashes = []
+    for dir in crashes_dirs:
+        crashes.extend(
+            [p for p in dir.iterdir() if p.is_file() and p.name != "README.txt"]
+        )
+    crashes = sorted(crashes, key=lambda path: path.stat().st_size)
     if not crashes:
         print("[*] No crashes found.")
         return
@@ -401,6 +415,7 @@ def replay_crashes():
     for crash in crashes:
         label = crash.name
         print(f"--- {label} ({crash.stat().st_size} bytes) ---")
+        print(f"{crash.relative_to(PROJECT_ROOT)}")
         with open(crash, "rb") as fh:
             result = subprocess.run(
                 [str(binary)],
@@ -416,22 +431,30 @@ def replay_crashes():
 
 
 def main():
-    if len(sys.argv) > 1:
-        cmd = sys.argv[1]
-    else:
-        cmd = "run"
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
+
+    # Optional jobs argument for run/fastq: `python dev/fuzz.py run 4`
+    jobs = 1
+    if len(sys.argv) > 2 and cmd in ("run", "fastq"):
+        try:
+            jobs = int(sys.argv[2])
+            if jobs < 1:
+                raise ValueError
+        except ValueError:
+            print(f"[!] Jobs must be a positive integer, got {sys.argv[2]!r}")
+            sys.exit(1)
 
     commands = {
         "build": build,
-        "run": run,
-        "fastq": run_fastq,
+        "run": lambda: run(jobs),
+        "fastq": lambda: run_fastq(jobs),
         "minimize": minimize,
         "crash": replay_crashes,
     }
 
     fn = commands.get(cmd)
     if fn is None:
-        print(f"Usage: {sys.argv[0]} [{'|'.join(commands)}]")
+        print(f"Usage: {sys.argv[0]} [{'|'.join(commands)}] [jobs]")
         sys.exit(1)
     fn()
 

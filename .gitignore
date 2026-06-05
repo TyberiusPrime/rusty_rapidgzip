@@ -20,3 +20,4 @@ tests/corpus/*.sha256
 fuzz/
 .bacon-locations
 tests/corpus/synth-random-1m.gz
+core.*
