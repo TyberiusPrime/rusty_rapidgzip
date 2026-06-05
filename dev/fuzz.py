@@ -162,6 +162,15 @@ fn main() {
         let mut safe = Vec::new();
         let rf = gzip::decode_one_indexed_fast(data, &mut fast, 0);
         let rs = gzip::decode_one_indexed_safe(data, &mut safe, 0);
+        // Fast and safe share header + trailer handling, so they must agree on
+        // whether the stream is valid at all.  A one-Ok/one-Err split is a real
+        // divergence in the unsafe fast kernel (one path accepting bytes the
+        // other rejects), not merely a different error point.
+        assert_eq!(
+            rf.is_ok(),
+            rs.is_ok(),
+            "fast/safe disagree on accept/reject: fast={rf:?}, safe={rs:?}"
+        );
         if let (Ok(cf), Ok(cs)) = (rf, rs) {
             assert_eq!(cf, cs, "fast/safe disagree on bytes consumed");
             assert_eq!(fast, safe, "fast/safe disagree on decoded output");

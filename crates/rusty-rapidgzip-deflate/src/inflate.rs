@@ -353,6 +353,12 @@ fn decode_block(
         publish_len!();
         copy_back(out, distance, length);
         cur = out.len();
+        // `copy_back` calls `out.reserve(length)`, which may have reallocated
+        // and grown the real capacity past the cached `cap`. Refresh from the
+        // authoritative `out.capacity()` first — otherwise `cap - cur` can
+        // underflow when a back-reference follows a literal run that left
+        // `cur == cap` (zero spare).
+        cap = out.capacity();
         if cap - cur < HEADROOM {
             out.reserve(HEADROOM);
             cap = out.capacity();
