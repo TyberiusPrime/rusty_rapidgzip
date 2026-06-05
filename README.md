@@ -37,7 +37,7 @@ use crossbeam_channel::bounded;
 use rapidgzip::{read_gz, Config};
 
 let (tx, rx) = bounded::<Vec<u8>>(16);
-std::thread::spawn(move || read_gz("huge.fastq.gz", tx, Config::default()));
+std::thread::spawn(move || read_gz("huge.gz", tx, Config::default()));
 for chunk in rx { /* process bytes in stream order */ }
 ```
 
@@ -45,27 +45,6 @@ No random access, no `Read`/`Seek`, no upstream-compatible `.gzi` (for now).
 
 This has the advantage of applying back-pressure easily, so 
 no strict need to fine tune thread counts.
-
-## FASTQ support
-
-This library's primary purpose is to power (fastqrab)[https://github.com/tyberiusprime/fastqrab].
-
-Hence it contains an integrated FASTQ parser that yields columnar 
-data for names/sequences/qualities/plus_lines.
-
-```rust
-use crossbeam_channel::bounded;
-use rapidgzip::{read_gz, Config};
-
-let (tx, rx) = bounded::<Vec<u8>>(16);
-std::thread::spawn(move || read_gz_into_fastq("huge.fastq.gz", tx, Config::default()));
-for chunk: FastqChunk in rx { 
-    for name in chunk.names.iter() {
-        println!("{}", name);
-    }
-}
-```
-
 
 ## Environment variables
 
@@ -77,12 +56,6 @@ what you want in almost every case.
   On by default at a factor of `2` chunks per worker (floored at 16 chunks).
   Set to `0` to disable the cap entirely; any other integer overrides the
   factor; unparsable values fall back to the default.
-
-- **`RAPIDGZIP_FASTQ_DEMUX_THREADS`** — number of workers in the FASTQ demux
-  pool used by `read_gz_into_fastq` (the stage that splits decoded bytes into
-  name/seq/`+`/qual columns). Defaults to `min(num_threads, 4)`, minimum 1.
-  Keep it small: the decode pipeline already saturates the cores, so extra
-  demux workers just oversubscribe and contend in the allocator.
 
 [1]: https://github.com/mxmlnkn/rapidgzip
 [2]: https://github.com/Piezoid/pugz

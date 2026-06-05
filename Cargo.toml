@@ -20,7 +20,6 @@ authors = ["Florian Finkernagel <finkernagel@imt.uni-marburg.de>"]
 rusty-rapidgzip-deflate = { path = "crates/rusty-rapidgzip-deflate" }
 rusty-rapidgzip = { path = "crates/rusty-rapidgzip" }
 rusty-rapidgzip-inflate = { path = "crates/rusty-rapidgzip-inflate" }
-stringpod = { path = "../stringpod" }
 
 bstr = "1"
 crc32fast = "1.4"

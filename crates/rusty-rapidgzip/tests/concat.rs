@@ -7,9 +7,7 @@
 //!   * both serial (`-P1`) and parallel decode paths of [`read_gz`],
 //!   * the byte-slice serial path [`decode_all`],
 //!   * member sizes/levels chosen so member boundaries fall in the *middle* of
-//!     speculative chunks (the historically bug-prone case), and
-//!   * the columnar FASTQ path [`read_gz_into_fastq`], where records and even
-//!     single record-lines straddle member boundaries.
+//!     speculative chunks (the historically bug-prone case).
 //!
 //! All tests that need the system `gzip` skip cleanly when it is unavailable.
 
@@ -17,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crossbeam_channel::bounded;
-use rusty_rapidgzip::{decode_all, read_gz, read_gz_into_fastq, Config, FastqChunk};
+use rusty_rapidgzip::{decode_all, read_gz, Config};
 
 /// Compress `payload` into a single gzip member via the system `gzip`.
 /// Returns `None` if `gzip` is not available, so callers can skip.
@@ -217,83 +215,6 @@ fn concat_many_small_members() {
             expected,
             "threads={threads}"
         );
-    }
-}
-
-#[test]
-fn concat_fastq_records_straddle_members() {
-    // Split a FASTQ stream across several gzip members at byte offsets that fall
-    // *inside* records (and inside individual record lines), so the columnar
-    // splitter must stitch records across both decode-chunk and member
-    // boundaries. Exercises the DualStringPod fusion in `FastqChunk`.
-    let mut payload = Vec::new();
-    let mut exp_n = String::new();
-    let mut exp_s = String::new();
-    let mut exp_q = String::new();
-    for i in 0..2000u32 {
-        let len = 1 + (i as usize % 40);
-        let seq: String = "A".repeat(len);
-        let qual: String = "I".repeat(len);
-        payload.extend_from_slice(format!("@read.{i} d\n{seq}\n+\n{qual}\n").as_bytes());
-        exp_n.push_str(&format!("read.{i} d\n"));
-        exp_s.push_str(&format!("{seq}\n"));
-        exp_q.push_str(&format!("{qual}\n"));
-    }
-    // Cut the payload into members at deliberately awkward offsets.
-    let cuts = [0usize, 1, 5000, 5001, 20_000, payload.len()];
-    let mut gz = Vec::new();
-    let mut ok = true;
-    for w in cuts.windows(2) {
-        let (a, b) = (w[0].min(payload.len()), w[1].min(payload.len()));
-        if a >= b {
-            continue;
-        }
-        match gzip_member(&payload[a..b], 6) {
-            Some(m) => gz.extend_from_slice(&m),
-            None => {
-                ok = false;
-                break;
-            }
-        }
-    }
-    if !ok {
-        eprintln!("system gzip unavailable — skipping");
-        return;
-    }
-    let path = write_tmp("fastq_multimember.gz", &gz);
-
-    for threads in [1usize, 4] {
-        for chunk_size in [64 * 1024usize, 1 << 20] {
-            let (tx, rx) = bounded::<FastqChunk>(8);
-            let cfg = Config {
-                num_threads: threads,
-                chunk_size_bytes: chunk_size,
-                ..Config::default()
-            };
-            let p = path.clone();
-            let producer = std::thread::spawn(move || read_gz_into_fastq(&p, tx, cfg));
-
-            let (mut n, mut s, mut q) = (Vec::new(), Vec::new(), Vec::new());
-            for c in rx {
-                assert_eq!(c.names.len(), c.reads.len());
-                for x in c.names.iter() {
-                    n.extend_from_slice(x);
-                    n.push(b'\n');
-                }
-                for x in c.reads.iter_seq() {
-                    s.extend_from_slice(x);
-                    s.push(b'\n');
-                }
-                for x in c.reads.iter_qual() {
-                    q.extend_from_slice(x);
-                    q.push(b'\n');
-                }
-            }
-            producer.join().unwrap().unwrap();
-            assert_eq!(n, exp_n.as_bytes(), "names t={threads} cs={chunk_size}");
-            assert_eq!(s, exp_s.as_bytes(), "seqs t={threads} cs={chunk_size}");
-            assert_eq!(q, exp_q.as_bytes(), "quals t={threads} cs={chunk_size}");
-        }
     }
 }
 
