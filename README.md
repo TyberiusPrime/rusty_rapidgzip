@@ -98,4 +98,7 @@ Besides just running rapidgzip in an external process,
 there's also a set of [rust bindings](https://github.com/alekseizarubin/rapidgzip-rs/)!
 
 
+## Minimum supported rust version
+
+1.85
 

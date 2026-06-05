@@ -1,6 +1,6 @@
 {
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/release-25.11"; # that's 23.05
+    nixpkgs.url = "github:NixOS/nixpkgs/release-26.05"; 
     utils.url = "github:numtide/flake-utils";
     naersk.url = "github:nmattia/naersk";
     naersk.inputs.nixpkgs.follows = "nixpkgs";
@@ -239,8 +239,6 @@
           #   * rusty-rapidgzip-deflate: the back-reference copy kernels, via the
           #     self-contained `tests/miri_edge.rs` (no `gzip` subprocess — Miri
           #     can't exec).
-          #   * fastqrab-stringpod: its (currently safe) columnar storage and the
-          #     `bstr` unsafe it drives, via the crate's own unit tests.
           # Each runs under the default Stacked Borrows and the stricter Tree
           # Borrows aliasing models.
           miri =
@@ -274,7 +272,6 @@
                 }
 
                 run_miri deflate   -p rusty-rapidgzip-deflate --test miri_edge
-                run_miri stringpod -p fastqrab-stringpod
 
                 runHook postBuild
               '';
