@@ -28,7 +28,7 @@ use thiserror::Error;
 use pipeline::InputBytes;
 use rusty_rapidgzip_deflate::{inflate_block, BitReader, DeflateError};
 
-use fastqrab_stringpod::{DualStringPod, StringPod, StringPodBuilder};
+use stringpod::{DualStringPod, StringPod, StringPodBuilder};
 
 #[derive(Debug, Clone)]
 pub struct Config {

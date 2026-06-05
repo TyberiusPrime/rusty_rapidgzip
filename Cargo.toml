@@ -5,7 +5,6 @@ members = [
     "crates/rusty-rapidgzip",
     "crates/rusty-rapidgzip-bin",
     "crates/rusty-rapidgzip-inflate",
-    "crates/rusty-rapidgzip-stringpod",
     "xtask",
 ]
 
@@ -21,7 +20,7 @@ authors = ["Florian Finkernagel <finkernagel@imt.uni-marburg.de>"]
 rusty-rapidgzip-deflate = { path = "crates/rusty-rapidgzip-deflate" }
 rusty-rapidgzip = { path = "crates/rusty-rapidgzip" }
 rusty-rapidgzip-inflate = { path = "crates/rusty-rapidgzip-inflate" }
-fastqrab-stringpod = { path = "crates/rusty-rapidgzip-stringpod" }
+stringpod = { path = "stringpod" }
 
 bstr = "1"
 crc32fast = "1.4"

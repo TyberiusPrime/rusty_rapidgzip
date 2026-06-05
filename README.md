@@ -7,10 +7,19 @@ problem, right?
 
 ## Status
 
-Performance is getting to be even with rapidgzip (cpp).
+Performance is about even with rapidgzip (cpp).
 
-Robustness needs a thorough test setup and fuzzying, even though
-gzip decoding is self-validating thanks to CRC32.
+The crate passes a limited size test corpus. 
+
+Miri has been applied to the limited (but unavoidable) use of unsafe.
+Unsafe is used to write to allocated but uninitialized data,
+and to optimize one unaligned read.
+
+The library has been fuzzed using afl, exercising our
+'no panic on invalid input data' policy and verifying
+identical output between our fast (unsafe) deflate implementation
+and a safe unoptimized 'text book' implementation.
+
 
 ## Requirements
 
@@ -36,6 +45,27 @@ No random access, no `Read`/`Seek`, no upstream-compatible `.gzi` (for now).
 
 This has the advantage of applying back-pressure easily, so 
 no strict need to fine tune thread counts.
+
+## FASTQ support
+
+This library's primary purpose is to power (fastqrab)[https://github.com/tyberiusprime/fastqrab].
+
+Hence it contains an integrated FASTQ parser that yields columnar 
+data for names/sequences/qualities/plus_lines.
+
+```rust
+use crossbeam_channel::bounded;
+use rapidgzip::{read_gz, Config};
+
+let (tx, rx) = bounded::<Vec<u8>>(16);
+std::thread::spawn(move || read_gz_into_fastq("huge.fastq.gz", tx, Config::default()));
+for chunk: FastqChunk in rx { 
+    for name in chunk.names.iter() {
+        println!("{}", name);
+    }
+}
+```
+
 
 ## Environment variables
 
