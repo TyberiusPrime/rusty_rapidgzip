@@ -7,7 +7,7 @@ on:
 
 # All the actual work lives in the Nix flake (`nix flake check` runs the full
 # matrix locally; see flake.nix / DEV.txt). CI just fans out over the lean
-# subset exposed as `packages.test.*` and runs each in a fresh Nix build.
+# subset of `checks.*` and runs each in a fresh Nix build.
 jobs:
   checks:
     runs-on: ubuntu-latest
@@ -26,4 +26,4 @@ jobs:
         uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
 
       - name: ${{ matrix.job }}
-        run: nix build -L ".#test.x86_64-linux.${{ matrix.job }}"
+        run: nix build -L ".#checks.x86_64-linux.${{ matrix.job }}"

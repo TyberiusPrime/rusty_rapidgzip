@@ -150,7 +150,7 @@
         # Each job builds the workspace offline from the committed Cargo.lock
         # (no network in the sandbox). `nix flake check` runs the FULL matrix
         # (see `checks` below); GitHub CI fans out only over the lean subset
-        # exposed as `packages.test.*` via `nix build .#test.<name>`.
+        # via `nix build .#checks.<system>.<name>`.
         cargoVendor = pkgs.rustPlatform.importCargoLock { lockFile = ./Cargo.lock; };
 
         # The declared MSRV (Cargo.toml `rust-version`). Floor drivers:
@@ -225,7 +225,8 @@
         # `nix flake check` runs the FULL local matrix: the lean subset
         # (stable test, clippy -D warnings, rustfmt, MSRV build) plus the
         # heavier full-corpus and Miri jobs. GitHub CI runs only the lean
-        # subset (see `packages.test` below and `.github/workflows/ci.yml`).
+        # subset directly via `nix build .#checks.<system>.<name>`
+        # (see `.github/workflows/ci.yml`).
         checks = {
           stable = ciStable;
           clippy = ciClippy;
@@ -279,20 +280,8 @@
             };
         };
 
-        # Lean CI subset under a dedicated `test` output (not `checks`, so
-        # `nix flake check` isn't forced to treat the parent as a derivation,
-        # and not `packages`, which flake-check validates leaf-by-leaf).
-        # GitHub CI runs `nix build .#test.<system>.<name>`; locally the same
-        # jobs are reachable via `nix build .#checks.<system>.<name>`.
-        test = {
-          stable = ciStable;
-          clippy = ciClippy;
-          fmt = ciFmt;
-          msrv = ciMsrv;
-        };
-
         # `nix develop`
-        devShell = pkgs.mkShell {
+        devShells.default = pkgs.mkShell {
           COMMIT_HASH = self.rev or (pkgs.lib.removeSuffix "-dirty" self.dirtyRev or "unknown-not-in-git");
           # we only link with mold in our dev environment for build speed. CI can use the old school rust linker
           shellHook = ''
