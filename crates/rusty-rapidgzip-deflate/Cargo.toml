@@ -9,7 +9,6 @@ description = "DEFLATE decoder primitives (bit reader, Huffman, inflate, specula
 
 [dependencies]
 thiserror.workspace = true
-rusty-rapidgzip-inflate.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

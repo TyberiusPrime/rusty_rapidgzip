@@ -440,7 +440,7 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "rusty-rapidgzip"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "crc32fast",
@@ -455,7 +455,7 @@ dependencies = [
 
 [[package]]
 name = "rusty-rapidgzip-bin"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -467,16 +467,11 @@ dependencies = [
 
 [[package]]
 name = "rusty-rapidgzip-deflate"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "criterion",
- "rusty-rapidgzip-inflate",
  "thiserror",
 ]
-
-[[package]]
-name = "rusty-rapidgzip-inflate"
-version = "0.0.1"
 
 [[package]]
 name = "same-file"
@@ -648,7 +643,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",

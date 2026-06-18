@@ -6,8 +6,6 @@
 //! `(out_pos, prefix_offset)` marker.  Downstream code resolves the marker once
 //! the preceding chunk's tail window is known.
 
-pub const RUN_FLAG: u16 = 0x8000; // reserved; unused by this crate
-
 /// One unresolved back-reference byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MarkerRec {

@@ -12,6 +12,8 @@ use crate::huffman::{HUFFDEC_EXCEPTIONAL, HUFFDEC_LITERAL, LUT_BITS};
 use crate::tables::*;
 use crate::{BitReader, DeflateError, HuffmanDecoder};
 
+pub (crate) mod speculative;
+
 /// Maximum back-reference distance permitted by DEFLATE.
 pub const MAX_DISTANCE: usize = 32 * 1024;
 

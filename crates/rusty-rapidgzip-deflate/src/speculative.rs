@@ -73,7 +73,7 @@ impl SpeculativeChunk {
 
     pub fn bytes_offset_markers(
         &mut self,
-        src: &[rusty_rapidgzip_inflate::speculative::MarkerRec],
+        src: &[crate::inflate::speculative::MarkerRec],
         base: u32,
     ) {
         if src.is_empty() {

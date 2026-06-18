@@ -4,7 +4,6 @@ members = [
     "crates/rusty-rapidgzip-deflate",
     "crates/rusty-rapidgzip",
     "crates/rusty-rapidgzip-bin",
-    "crates/rusty-rapidgzip-inflate",
     "xtask",
 ]
 
@@ -19,7 +18,6 @@ authors = ["Florian Finkernagel <finkernagel@imt.uni-marburg.de>"]
 [workspace.dependencies]
 rusty-rapidgzip-deflate = { path = "crates/rusty-rapidgzip-deflate", version="0.1.0" }
 rusty-rapidgzip = { path = "crates/rusty-rapidgzip" , version="0.1.0" }
-rusty-rapidgzip-inflate = { path = "crates/rusty-rapidgzip-inflate" , version="0.1.0" }
 
 bstr = "1"
 crc32fast = "1.4"

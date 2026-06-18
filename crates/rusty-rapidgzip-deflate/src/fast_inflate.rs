@@ -36,7 +36,7 @@ use crate::speculative::SpeculativeChunk;
 use crate::tables::{fixed_distance_lengths, fixed_literal_lengths, DISTANCE_BASE, DISTANCE_EXTRA};
 use crate::{BitReader, DeflateError, HuffmanDecoder};
 
-use rusty_rapidgzip_inflate::speculative::{
+use crate::inflate::speculative::{
     propagate_match_cached, record_match_prefix, SpeculativeContext,
 };
 
