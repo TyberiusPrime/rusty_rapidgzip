@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -17,9 +17,9 @@ repository = "https://github.com/TyberiusPrime/rusty-rapidgzip"
 authors = ["Florian Finkernagel <finkernagel@imt.uni-marburg.de>"]
 
 [workspace.dependencies]
-rusty-rapidgzip-deflate = { path = "crates/rusty-rapidgzip-deflate" }
-rusty-rapidgzip = { path = "crates/rusty-rapidgzip" }
-rusty-rapidgzip-inflate = { path = "crates/rusty-rapidgzip-inflate" }
+rusty-rapidgzip-deflate = { path = "crates/rusty-rapidgzip-deflate", version="0.1.0" }
+rusty-rapidgzip = { path = "crates/rusty-rapidgzip" , version="0.1.0" }
+rusty-rapidgzip-inflate = { path = "crates/rusty-rapidgzip-inflate" , version="0.1.0" }
 
 bstr = "1"
 crc32fast = "1.4"
