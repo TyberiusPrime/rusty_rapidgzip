@@ -3,6 +3,7 @@
 pub mod gzip;
 pub mod pipeline;
 mod streaming;
+pub mod deflate;
 
 pub use gzip::{decode_all, decode_one, GzipError};
 
@@ -26,7 +27,7 @@ use crossbeam_channel::{Receiver, Sender};
 use thiserror::Error;
 
 use pipeline::InputBytes;
-use rusty_rapidgzip_deflate::{inflate_block, BitReader, DeflateError};
+use crate::deflate::{inflate_block, BitReader, DeflateError};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -96,7 +97,7 @@ pub enum Error {
     #[error("gzip: {0}")]
     Gzip(#[from] GzipError),
     #[error("deflate: {0}")]
-    Deflate(#[from] rusty_rapidgzip_deflate::DeflateError),
+    Deflate(#[from] crate::deflate::DeflateError),
 }
 
 // ── Streaming serial decode path ─────────────────────────────────────────────

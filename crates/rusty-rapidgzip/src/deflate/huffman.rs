@@ -55,8 +55,8 @@
 //! linear scan. libdeflate uses a chained subtable here — a follow-on phase
 //! can swap that in if profiles ever show it mattering (currently ~0.1%).
 
-use crate::tables::{LENGTH_BASE, LENGTH_EXTRA};
-use crate::{BitReader, DeflateError};
+use super::tables::{LENGTH_BASE, LENGTH_EXTRA};
+use super::{BitReader, DeflateError};
 
 /// LUT prefix length. 10 bits → 1024-entry × 4 B = 4 KiB LUT. Comfortable in
 /// L1d and the rebuild cost stays modest. 11 was tried and regressed because

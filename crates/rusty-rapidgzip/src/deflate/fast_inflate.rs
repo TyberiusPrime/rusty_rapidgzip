@@ -30,13 +30,13 @@
 //! - `speculative_zlib.rs` remains the parallel path until Phase 5.
 //! - `decode_until` is a drop-in for `SpeculativeZlibDecoder::decode_until`.
 
-use crate::huffman::{HUFFDEC_EXCEPTIONAL, HUFFDEC_LITERAL, LUT_BITS};
-use crate::inflate::read_dynamic_header;
-use crate::speculative::SpeculativeChunk;
-use crate::tables::{fixed_distance_lengths, fixed_literal_lengths, DISTANCE_BASE, DISTANCE_EXTRA};
-use crate::{BitReader, DeflateError, HuffmanDecoder};
+use super::huffman::{HUFFDEC_EXCEPTIONAL, HUFFDEC_LITERAL, LUT_BITS};
+use super::inflate::read_dynamic_header;
+use super::speculative::SpeculativeChunk;
+use super::tables::{fixed_distance_lengths, fixed_literal_lengths, DISTANCE_BASE, DISTANCE_EXTRA};
+use super::{BitReader, DeflateError, HuffmanDecoder};
 
-use crate::inflate::speculative::{
+use super::inflate::speculative::{
     propagate_match_cached, record_match_prefix, SpeculativeContext,
 };
 
@@ -1113,7 +1113,7 @@ mod tests {
         // Find the second block boundary using the serial path.
         let mut br = crate::BitReader::new(&padded);
         let mut dummy: Vec<u8> = Vec::new();
-        let _ = crate::inflate::inflate_block(&mut br, &mut dummy).unwrap(); // block 0
+        let _ = super::super::inflate::inflate_block(&mut br, &mut dummy).unwrap(); // block 0
         let boundary_after_block0 = br.tell_bit();
 
         let mut chunk = SpeculativeChunk::default();
@@ -1142,7 +1142,7 @@ mod tests {
             let mut dummy = Vec::new();
             loop {
                 block_starts.push(br.tell_bit());
-                let bfinal = crate::inflate::inflate_block(&mut br, &mut dummy).unwrap();
+                let bfinal = super::super::inflate::inflate_block(&mut br, &mut dummy).unwrap();
                 if bfinal {
                     break;
                 }
@@ -1159,7 +1159,7 @@ mod tests {
                 if br.tell_bit() >= split_bit {
                     break;
                 }
-                crate::inflate::inflate_block(&mut br, &mut chunk0.bytes).unwrap();
+                super::super::inflate::inflate_block(&mut br, &mut chunk0.bytes).unwrap();
             }
         }
         assert!(chunk0.is_resolved());
@@ -1170,7 +1170,7 @@ mod tests {
 
         // Resolve markers.
         let tail_start = chunk0.bytes.len().saturating_sub(32 * 1024);
-        crate::speculative::resolve_markers(&mut chunk1, &chunk0.bytes[tail_start..]).unwrap();
+        super::super::speculative::resolve_markers(&mut chunk1, &chunk0.bytes[tail_start..]).unwrap();
 
         let mut stitched = chunk0.bytes.clone();
         stitched.extend_from_slice(&chunk1.bytes);
@@ -1196,7 +1196,7 @@ mod tests {
             let mut dummy = Vec::new();
             loop {
                 block_starts.push(br.tell_bit());
-                let bfinal = crate::inflate::inflate_block(&mut br, &mut dummy).unwrap();
+                let bfinal = super::super::inflate::inflate_block(&mut br, &mut dummy).unwrap();
                 if bfinal {
                     break;
                 }
@@ -1230,7 +1230,7 @@ mod tests {
     /// boundary, decode each chunk speculatively, resolve markers, stitch, compare.
     #[test]
     fn multichunk_speculative_roundtrip() {
-        use crate::find_next_dynamic_block;
+        use super::super::find_next_dynamic_block;
         let payload = ascii_payload(4 * 1024 * 1024);
         let body = deflate_via_gzip(&payload, 6);
         let mut padded = body.clone();
@@ -1263,7 +1263,7 @@ mod tests {
             let (_, hit_bfinal) =
                 decode_until(&padded, start_bit, end_bit_hint, &mut chunk).unwrap();
 
-            crate::speculative::resolve_markers(&mut chunk, &prev_tail).unwrap_or_else(|e| {
+            super::super::speculative::resolve_markers(&mut chunk, &prev_tail).unwrap_or_else(|e| {
                 panic!("resolve_markers failed on chunk {i}: {e}");
             });
 

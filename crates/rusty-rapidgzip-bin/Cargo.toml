@@ -17,7 +17,6 @@ path = "src/bench_inflate.rs"
 
 [dependencies]
 rusty-rapidgzip.workspace = true
-rusty-rapidgzip-deflate.workspace = true
 crossbeam-channel.workspace = true
 clap.workspace = true
 anyhow.workspace = true

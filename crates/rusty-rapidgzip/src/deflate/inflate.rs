@@ -8,9 +8,9 @@
 //! into that same buffer — so the caller controls memory: trim it
 //! periodically if streaming long files.
 
-use crate::huffman::{HUFFDEC_EXCEPTIONAL, HUFFDEC_LITERAL, LUT_BITS};
-use crate::tables::*;
-use crate::{BitReader, DeflateError, HuffmanDecoder};
+use super::huffman::{HUFFDEC_EXCEPTIONAL, HUFFDEC_LITERAL, LUT_BITS};
+use super::tables::*;
+use super::{BitReader, DeflateError, HuffmanDecoder};
 
 pub (crate) mod speculative;
 

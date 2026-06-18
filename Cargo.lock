@@ -448,7 +448,6 @@ dependencies = [
  "crossbeam-channel",
  "hex",
  "memmap2",
- "rusty-rapidgzip-deflate",
  "sha2",
  "thiserror",
 ]
@@ -462,15 +461,6 @@ dependencies = [
  "crossbeam-channel",
  "libc",
  "rusty-rapidgzip",
- "rusty-rapidgzip-deflate",
-]
-
-[[package]]
-name = "rusty-rapidgzip-deflate"
-version = "0.1.0"
-dependencies = [
- "criterion",
- "thiserror",
 ]
 
 [[package]]
@@ -639,16 +629,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
-]
-
-[[package]]
-name = "xtask"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "hex",
- "sha2",
 ]
 
 [[package]]

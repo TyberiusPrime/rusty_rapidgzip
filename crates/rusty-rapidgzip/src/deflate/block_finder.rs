@@ -41,8 +41,8 @@
 //! chunk's actual end and re-decodes from the correct offset on a mismatch
 //! (see `pipeline`'s anchored-chain assumption note).
 
-use crate::tables::{CODE_LENGTH_ORDER, DISTANCE_BASE, DISTANCE_EXTRA, LENGTH_BASE, LENGTH_EXTRA};
-use crate::{BitReader, DeflateError, HuffmanDecoder};
+use super::tables::{CODE_LENGTH_ORDER, DISTANCE_BASE, DISTANCE_EXTRA, LENGTH_BASE, LENGTH_EXTRA};
+use super::{BitReader, DeflateError, HuffmanDecoder};
 
 /// Number of symbols we trial-decode after a header parse succeeds. A real
 /// block decodes a long, self-consistent symbol stream; a false-positive
@@ -303,7 +303,7 @@ fn trial_decode(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inflate::inflate_block;
+    use super::super::inflate::inflate_block;
 
     fn deflate_via_gzip(payload: &[u8], level: u32) -> Vec<u8> {
         use std::io::Write;

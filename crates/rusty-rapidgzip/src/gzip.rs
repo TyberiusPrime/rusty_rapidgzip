@@ -11,7 +11,7 @@
 
 use thiserror::Error;
 
-use rusty_rapidgzip_deflate::{fast_inflate, inflate, safe_inflate, BitReader, DeflateError};
+use crate::deflate::{fast_inflate, inflate, safe_inflate, BitReader, DeflateError};
 
 const GZ_MAGIC: [u8; 2] = [0x1f, 0x8b];
 const CM_DEFLATE: u8 = 8;

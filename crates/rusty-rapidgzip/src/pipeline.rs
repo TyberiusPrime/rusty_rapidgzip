@@ -74,7 +74,7 @@ impl std::ops::Deref for InputBytes {
     }
 }
 
-use rusty_rapidgzip_deflate::{
+use crate::deflate::{
     fast_inflate, find_next_dynamic_block, resolve_markers, BitReader, SpeculativeChunk,
 };
 
@@ -98,7 +98,7 @@ impl WorkerKernel {
         start_bit: u64,
         end_bit_hint: u64,
         chunk: &mut SpeculativeChunk,
-    ) -> Result<(u64, bool), rusty_rapidgzip_deflate::DeflateError> {
+    ) -> Result<(u64, bool), crate::deflate::DeflateError> {
         fast_inflate::decode_until_u16(input, start_bit, end_bit_hint, chunk, &mut self.scratch)
     }
 }

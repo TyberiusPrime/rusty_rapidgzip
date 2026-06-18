@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use rusty_rapidgzip::gzip;
-use rusty_rapidgzip_deflate::{fast_inflate, inflate as intree_inflate, safe_inflate, BitReader};
+use rusty_rapidgzip::deflate::{fast_inflate, inflate as intree_inflate, safe_inflate, BitReader};
 
 fn run_safe(body: &[u8], expected_out: usize) {
     let mut out = Vec::with_capacity(expected_out);

@@ -52,7 +52,7 @@ use std::thread;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 
-use rusty_rapidgzip_deflate::{
+use crate::deflate::{
     fast_inflate, find_next_dynamic_block, resolve_markers, SpeculativeChunk,
 };
 

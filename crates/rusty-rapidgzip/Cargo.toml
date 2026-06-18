@@ -8,7 +8,6 @@ repository.workspace = true
 description = "Streaming, parallel gzip decoder. Inspired by rapidgzip / pugz."
 
 [dependencies]
-rusty-rapidgzip-deflate.workspace = true
 crc32fast.workspace = true
 crossbeam-channel.workspace = true
 thiserror.workspace = true
