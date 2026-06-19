@@ -105,6 +105,42 @@ pub fn decode_until(
     Ok((end_bit, hit_bfinal))
 }
 
+/// Decode one complete gzip member (or up to `end_bit_hint`) with the
+/// non-speculative `u8` kernel, appending to `out`.
+///
+/// Every gzip member after the first in a chunk begins with a fresh, empty
+/// DEFLATE window — back-references cannot cross a member boundary — so no
+/// speculative markers can ever arise. Such members skip [`decode_until_u16`]'s
+/// phase-1 entirely and decode at full `u8` bandwidth. Semantics match that
+/// function's phase-2 loop (distances resolve within `out`, which holds the
+/// member's own already-decoded history). Returns `(end_bit, hit_bfinal)`.
+pub fn decode_member_u8(
+    input: &[u8],
+    start_bit: u64,
+    end_bit_hint: u64,
+    out: &mut Vec<u8>,
+) -> Result<(u64, bool), DeflateError> {
+    use std::sync::atomic::Ordering::Relaxed;
+    use std::time::Instant;
+    let t = Instant::now();
+    let bytes_in = out.len();
+    let mut br = BitReader::new(input);
+    br.seek_to_bit(start_bit)?;
+    let mut final_block = false;
+    loop {
+        if decode_one_block(&mut br, out)? {
+            final_block = true;
+            break;
+        }
+        if br.tell_bit() >= end_bit_hint {
+            break;
+        }
+    }
+    PHASE2_NS.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+    PHASE2_BYTES.fetch_add((out.len() - bytes_in) as u64, Relaxed);
+    Ok((br.tell_bit(), final_block))
+}
+
 /// Serial inflate — drop-in for `inflate::inflate`.
 ///
 /// Decodes the complete deflate stream from `br` into `out`. No speculative

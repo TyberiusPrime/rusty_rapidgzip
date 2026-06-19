@@ -876,15 +876,24 @@ fn decode_one_chunk(
     let mut final_block = false;
     let mut member_boundaries: Vec<MemberBoundary> = Vec::new();
 
+    // Only the first member of a chunk can reach into the unknown previous
+    // chunk and thus needs the speculative u16 path. Every later member starts
+    // with a fresh empty window (back-refs can't cross a member boundary), so it
+    // is decoded directly with the fast u8 kernel — no markers, no phase-1.
+    let mut first_member = true;
     loop {
         let pos = br.tell_bit();
         if pos >= item.end_bit_hint {
             break;
         }
 
-        let (new_end, hit_bfinal) = wk
-            .decode_until(body, pos, item.end_bit_hint, &mut chunk)
-            .map_err(Error::Deflate)?;
+        let (new_end, hit_bfinal) = if first_member {
+            wk.decode_until(body, pos, item.end_bit_hint, &mut chunk)
+        } else {
+            fast_inflate::decode_member_u8(body, pos, item.end_bit_hint, &mut chunk.bytes)
+        }
+        .map_err(Error::Deflate)?;
+        first_member = false;
         br.seek_to_bit(new_end).map_err(Error::Deflate)?;
 
         if !hit_bfinal {
