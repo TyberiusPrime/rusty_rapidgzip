@@ -634,15 +634,31 @@ const COPY_HEADROOM_U16: usize = 16;
 const U16_WINDOW: usize = 32 * 1024;
 /// Flush once the write cursor reaches here; emits `_AT - _WINDOW` cells.
 const U16_FLUSH_AT: usize = 256 * 1024;
+/// Hand off the speculative `u16` window to the byte-wide kernel once this many
+/// cells have been produced (at a block boundary). A prefix marker sits at
+/// output position `< U16_WINDOW`, and a back-reference (distance ≤ `U16_WINDOW`)
+/// can only *read* one when its destination is `< 2·U16_WINDOW`. So beyond this
+/// point every byte is provably marker-free and decodes in `u8` — confining the
+/// 2×-bandwidth `u16` path to ≤ 64 KiB of each multi-MiB chunk.
+const U16_HANDOFF_AT: usize = 2 * U16_WINDOW;
 /// Fixed buffer capacity. Headroom past `_FLUSH_AT` covers one max-length
 /// (258-cell) copy plus `copy_back_u16`'s chunked overshoot.
 const U16_BUFCAP: usize = U16_FLUSH_AT + 258 + COPY_HEADROOM_U16 + 8;
 
-/// Speculative decode through a bounded `u16` sliding window, lowering emitted
-/// cells into `chunk` incrementally.
+/// Speculative decode, lowering emitted cells into `chunk` incrementally.
 ///
-/// Drop-in for [`decode_until`] on the parallel fast path. `scratch` is the
-/// worker-owned window buffer (fixed `U16_BUFCAP` cells, reused across chunks).
+/// Drop-in for [`decode_until`] on the parallel fast path. Two phases:
+///
+/// 1. **Speculative `u16` window** — decode through the bounded `u16` window
+///    (worker-owned `scratch`, `U16_BUFCAP` cells) for as long as a
+///    back-reference might still reach the unknown prefix, emitting markers for
+///    those that do. By the DEFLATE 32 KiB-distance bound this lasts at most
+///    [`U16_HANDOFF_AT`] cells.
+/// 2. **Byte-wide kernel** — once the output is provably marker-free (`window_base`
+///    advanced, or `cur ≥ U16_HANDOFF_AT`, always at a block boundary), lower the
+///    live window into `chunk.bytes` and finish with the non-speculative `u8`
+///    [`decode_one_block`] writing straight into `chunk.bytes`. This is where the
+///    bulk of a multi-MiB chunk decodes, at byte (not `u16`) store bandwidth.
 pub fn decode_until_u16(
     input: &[u8],
     start_bit: u64,
@@ -664,12 +680,50 @@ pub fn decode_until_u16(
     let mut cur: usize = 0;
     let mut window_base: u64 = 0;
 
-    let mut final_block = false;
+    // ── Phase 1 — speculative u16 window ────────────────────────────────────
     loop {
         let bfinal = br.read(1)? != 0;
         let btype = br.read(2)?;
         decode_block_u16(&mut br, scratch, chunk, btype, &mut cur, &mut window_base)?;
         if bfinal {
+            // Whole member finished within phase 1: emit all of it and return.
+            chunk.extract_from_u16(&scratch[0..cur]);
+            return Ok((br.tell_bit(), true));
+        }
+        if br.tell_bit() >= end_bit_hint {
+            // Chunk boundary reached on a block edge, still speculative.
+            chunk.extract_from_u16(&scratch[0..cur]);
+            return Ok((br.tell_bit(), false));
+        }
+        // Hand off to the byte kernel once the retained 32 KiB window — the only
+        // history a phase-2 back-reference can read — is provably marker-free.
+        // Markers start in the first 32 KiB but `copy_back_u16` can propagate
+        // them forward through back-reference chains, so a position bound alone
+        // is unsound; we must confirm the live window carries none. Checked only
+        // at block boundaries, once enough history exists to retain a full window
+        // beyond the original marker region. If markers persist (still
+        // propagating), we stay on the u16 path — correct, just not accelerated.
+        if cur >= U16_HANDOFF_AT && scratch[cur - U16_WINDOW..cur].iter().all(|&c| c & MARKER16 == 0)
+        {
+            break;
+        }
+    }
+
+    // ── Hand-off ────────────────────────────────────────────────────────────
+    // Lower the entire live window into the chunk. Cells at position ≥ U16_WINDOW
+    // are real bytes; any markers (only possible below that) are recorded by
+    // `extract_from_u16`. Afterwards `chunk.bytes` holds the full prefix and is
+    // the DEFLATE window for the byte kernel below.
+    chunk.extract_from_u16(&scratch[0..cur]);
+
+    // ── Phase 2 — non-speculative byte kernel into `chunk.bytes` ─────────────
+    // Every remaining back-reference (distance ≤ 32 KiB) now resolves within the
+    // real history we just materialised, so no markers arise and we reuse the
+    // optimised `u8` `decode_one_block`. Marker placeholders sit at positions
+    // < U16_WINDOW and are never read here (phase-2 sources are ≥ U16_WINDOW).
+    let mut final_block = false;
+    loop {
+        if decode_one_block(&mut br, &mut chunk.bytes)? {
             final_block = true;
             break;
         }
@@ -677,10 +731,7 @@ pub fn decode_until_u16(
             break;
         }
     }
-    let end_bit = br.tell_bit();
-    // Final flush: nothing more references this member, so emit all of it.
-    chunk.extract_from_u16(&scratch[0..cur]);
-    Ok((end_bit, final_block))
+    Ok((br.tell_bit(), final_block))
 }
 
 /// Emit everything older than the retained window, then slide the window down.

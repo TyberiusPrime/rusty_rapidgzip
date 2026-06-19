@@ -411,12 +411,14 @@ pub fn parallel_decode_member(
     // stay alive for the whole decode, pulling from the work channel until it
     // drains. Because the pool is fully spawned here, there are no channel clones
     // to retain for spawning later, so the eager drops below stay.
+    let decode_ns = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut worker_handles = Vec::with_capacity(num_threads);
     for _index in 0..num_threads {
         let input = Arc::clone(&input);
         let work_rx = work_rx.clone();
         let result_tx = result_tx.clone();
         let recycle_rx = recycle_rx.clone();
+        let decode_ns = Arc::clone(&decode_ns);
         let handle = thread::spawn(move || {
             let body = &input.as_slice()[body_offset..];
             let mut wk = WorkerKernel::new();
@@ -428,7 +430,12 @@ pub fn parallel_decode_member(
                 // Try to pull a recycled output buffer; pages on it are
                 // warm so subsequent writes don't take page faults.
                 let recycled = recycle_rx.as_ref().and_then(|r| r.try_recv().ok());
+                let _decode_t0 = std::time::Instant::now();
                 let result = decode_one_chunk(body, &item, &mut wk, recycled);
+                decode_ns.fetch_add(
+                    _decode_t0.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 let outcome = WorkOutcome {
                     id: item.id,
                     start_bit: item.start_bit,
@@ -742,6 +749,11 @@ pub fn parallel_decode_member(
             crate::elapsed_since_start(),
             n_markers.load(Relaxed),
             resolve_ns.load(Relaxed) as f64 / 1e9,
+        );
+        eprintln!(
+            "[rapidgzip +{:.2}s] decode stage: decode_cpu={:.3}s across {num_threads} workers (decode_until_u16 + framing)",
+            crate::elapsed_since_start(),
+            decode_ns.load(Relaxed) as f64 / 1e9,
         );
     }
 
