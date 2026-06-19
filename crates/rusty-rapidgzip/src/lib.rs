@@ -4,6 +4,8 @@ pub mod gzip;
 pub mod pipeline;
 mod streaming;
 pub mod deflate;
+#[cfg(feature = "libdeflate")]
+mod libdeflate_ffi;
 
 pub use gzip::{decode_all, decode_one, GzipError};
 

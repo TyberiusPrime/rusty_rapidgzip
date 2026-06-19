@@ -7,6 +7,12 @@ license.workspace = true
 repository.workspace = true
 description = "Streaming, parallel gzip decoder. Inspired by rapidgzip / pugz."
 
+[features]
+# Experimental: route the non-speculative per-member u8 decode through the
+# external libdeflate C library instead of our own inflate kernel. Requires
+# libdeflate's static lib at $LIBDEFLATE_LIB_DIR (see build.rs). Off by default.
+libdeflate = []
+
 [dependencies]
 crc32fast.workspace = true
 crossbeam-channel.workspace = true

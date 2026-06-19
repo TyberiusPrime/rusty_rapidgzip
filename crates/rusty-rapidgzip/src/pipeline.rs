@@ -85,6 +85,39 @@ use crate::{Config, Error};
 #[derive(Default)]
 struct WorkerKernel {
     scratch: Vec<u16>,
+    /// Per-worker libdeflate decompressor (experimental `libdeflate` feature).
+    #[cfg(feature = "libdeflate")]
+    decompressor: crate::libdeflate_ffi::Decompressor,
+}
+
+/// Decode one non-first member of a chunk (fresh empty window, byte-aligned
+/// start). With the `libdeflate` feature, members fully inside the chunk go
+/// through libdeflate; the chunk-final straddling member falls back to our own
+/// `decode_member_u8` (which can stop exactly at `end_bit_hint`).
+#[cfg(feature = "libdeflate")]
+fn decode_subsequent_member(
+    wk: &mut WorkerKernel,
+    body: &[u8],
+    pos: u64,
+    end_bit_hint: u64,
+    out: &mut Vec<u8>,
+) -> Result<(u64, bool), crate::deflate::DeflateError> {
+    use crate::libdeflate_ffi::{decode_member, LdOutcome};
+    match decode_member(&wk.decompressor, body, pos, end_bit_hint, out)? {
+        LdOutcome::Done(end, hit_bfinal) => Ok((end, hit_bfinal)),
+        LdOutcome::Straddle => fast_inflate::decode_member_u8(body, pos, end_bit_hint, out),
+    }
+}
+
+#[cfg(not(feature = "libdeflate"))]
+fn decode_subsequent_member(
+    _wk: &mut WorkerKernel,
+    body: &[u8],
+    pos: u64,
+    end_bit_hint: u64,
+    out: &mut Vec<u8>,
+) -> Result<(u64, bool), crate::deflate::DeflateError> {
+    fast_inflate::decode_member_u8(body, pos, end_bit_hint, out)
 }
 
 impl WorkerKernel {
@@ -889,10 +922,11 @@ fn decode_one_chunk(
 
         let (new_end, hit_bfinal) = if first_member {
             wk.decode_until(body, pos, item.end_bit_hint, &mut chunk)
+                .map_err(Error::Deflate)?
         } else {
-            fast_inflate::decode_member_u8(body, pos, item.end_bit_hint, &mut chunk.bytes)
-        }
-        .map_err(Error::Deflate)?;
+            decode_subsequent_member(wk, body, pos, item.end_bit_hint, &mut chunk.bytes)
+                .map_err(Error::Deflate)?
+        };
         first_member = false;
         br.seek_to_bit(new_end).map_err(Error::Deflate)?;
 
