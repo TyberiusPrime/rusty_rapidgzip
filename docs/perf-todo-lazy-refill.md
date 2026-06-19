@@ -1,5 +1,30 @@
 # Perf TODO — close the ~30% per-thread decode gap vs C++ rapidgzip
 
+> ## ⚠️ CORRECTION (2026-06-19, asm-vs-asm + benchmark): the premise below was WRONG
+>
+> The "gap vs C++ rapidgzip" is **not a codegen gap, and not 30%.** Measured P5 wall
+> on the FASTQ file, all rapidgzip 0.16.0:
+>
+> | Decoder | P5 wall | vs ours |
+> |---|---|---|
+> | C++ **ISA-L assembly** (nixpkg/PyPI rapidgzip, igzip) | 11.7 s | 0.82× (19% faster) |
+> | **rust (ours)** | 14.3 s | 1.0 |
+> | C++ native `readInternalCompressed` `-O3 -march=native` | 24.9 s | **1.75× slower** |
+>
+> - **We already BEAT rapidgzip's own C++ decoder by ~1.75×**, even at -O3 -march=native.
+> - The fast nixpkg build doesn't run `readInternalCompressed` — its `.so` links **ISA-L**
+>   and perf confirms the hot path is ISA-L asm (`decode_huffman_code_block_stateless_04`,
+>   `decode_len_dist`, …). The "C++ ≈ 1150 MiB/s/thread" below is **ISA-L throughput**.
+> - ISA-L's 19% edge = **BMI2 branchless shifts (`shrx`/`shlx`/`bzhi`)** + **software-pipelined
+>   LUT loads** that hide the dependent-load latency our serial loop is gated on. Hand-written
+>   asm doing latency-hiding LLVM won't do for our source — not a Rust limitation.
+> - Closing it is NOT refill micro-opts (exhausted) and NOT a codegen fix. Real levers:
+>   (a) link/call **ISA-L or libdeflate** for the non-speculative u8 phase-2 path; or
+>   (b) hand-write a software-pipelined BMI2 decoder in Rust. (a) is far higher-ROI — ask Florian.
+>
+> Everything below (the lazy-refill investigation) is still valid as a record of a dead lever,
+> but read it knowing the headline gap is to assembly, not to "C++".
+
 Handoff from a profiling session (2026-06-19). Tree state: HEAD `70da66b`, clean.
 The phase1-per-member fix is already committed; nothing else is pending.
 
@@ -19,7 +44,70 @@ already burn +26% user CPU — 71s vs C++ 56.36s).
 - The loop is **critical-path-bound through the `buf` bit-accumulator**: changes that
   lengthen that chain regress even when they cut branches/instructions.
 
-## THE NEXT EXPERIMENT: lazy/conditional bit-buffer refill
+## RESULT (2026-06-19): lazy/conditional refill — fully explored, ALL REGRESS, reverted
+
+Both the simple form AND the deeper C++-style rewrite were A/B'd. Every variant
+lost. **The unconditional branch-free refill is optimal for this loop.** Tree
+clean at HEAD `70da66b`. Interleaved phase2 MiB/s/thread (rock-stable ±2):
+
+| Variant | phase2 | vs base |
+|---|---|---|
+| **baseline** — unconditional refill `bits\|=56` every symbol + double-literal | **~890** | — |
+| simple lazy — one `if bits < 48` gate, double-literal kept | 809 | −9% |
+| **split refill** — `if bits<15` (litlen) + `if bits<33` (L/D tail), no double-literal | 860 | −3.5% |
+| split refill `bits<20`/`<33` + guarded double-literal re-added | 848 | −5% |
+
+### THE ACTUAL REASON (disassembly, 2026-06-19): LLVM already does it
+
+Disassembling the **baseline** `decode_compressed` settles it. Our source says
+"refill unconditionally every symbol (`bits |= 56`)", but LLVM proved the refill
+is a no-op when `bits` is high, hoisted the test, and emitted **exactly the
+C++-style split lazy refill by itself**:
+- litlen refill gated `cmp $0x13,%r13d; ja` → skip when **bits > 19**;
+- L/D-tail refill gated `cmp $0x21,%r13d; jae` → skip when **bits ≥ 33** (0x21 =
+  33, identical to the hand-derived `NEEDED_PAIR`);
+- double-literal kept and scheduled; near-EOF byte-fill unrolled (cmp 24/16/8).
+
+So every hand-rolled lazy refill regressed because **lazy refill was already
+there** — hand-writing it duplicates an optimizer transform while disturbing
+register allocation/scheduling (and tempts dropping double-literal). The earlier
+"Rust codegen can't match C++" gloss was **wrong**: on the refill, LLVM matches
+C++'s hand-written structure. The per-thread gap (≈890 vs ≈1150) is **NOT the
+refill** and is currently **undiagnosed** — likely the litlen LUT load on the
+per-symbol critical path (`shr buf → and 0x3ff → mov (lut) → shr buf`). The next
+step is a side-by-side **disassembly + perf cycle-attribution** vs C++'s
+`readInternalCompressed`, not another source rewrite.
+
+### Why even the deeper rewrite lost (mechanism)
+
+The deeper rewrite did exactly what C++ does: **split the refill into two
+conditional points** so the hot literal path uses a *low* threshold (15) and
+refills only ~1-in-6 symbols, while the rare length/distance path does its own
+`bits<33` refill. md5 stayed `4f66df41…` for every variant. It recovered most of
+the −9% (to −3.5%) — confirming the simple form's loss really was the too-high
+threshold (48 → refill every symbol). But it never reached parity, and adding the
+machinery to claw back the lost double-literal made it *worse*, not better:
+
+- Re-adding double-literal needs a **mandatory `bits >= LUT_BITS` guard** that
+  the baseline doesn't need: with conditional refill, on a skip-iteration the
+  high bits of `buf` above the live `bits` count are **stale** (already consumed),
+  so a speculative second LUT lookup can read garbage. The baseline's *always-fresh*
+  accumulator (it reloads every symbol) makes that guard unnecessary. That one
+  extra guard branch cost more than double-literal saved (848 < 860).
+- Root cause, consistent with the diagnosis above: this loop is
+  **critical-path-bound through `buf`**, not throughput-bound (IPC 2.8). The
+  unconditional `buf |= load << bits` is effectively *free* — it hides under the
+  dependency-chain latency. Any refill **branch**, even mostly-not-taken at 1/6,
+  adds a data-dependent control dependency whose mispredicts flush the pipeline
+  and are *not* free. We trade free work for non-free branches → always a loss.
+
+C++'s lazy refill wins on C++'s codegen/hardware; it does **not** translate to
+this Rust loop on Zen5. **The lazy-refill lever is fully exhausted — do not
+retry any conditional-refill form** (simple, split, peek-small/read-extra, or
+double-literal-guarded). The remaining gap vs C++ is structural+SMT-bound; no
+cheap per-thread win is left in the refill cadence.
+
+## (original) THE EXPERIMENT: lazy/conditional bit-buffer refill
 
 This is the one untried structural difference vs C++, and it was **never A/B'd**
 (confirmed by Florian — the current unconditional refill was inherited from
