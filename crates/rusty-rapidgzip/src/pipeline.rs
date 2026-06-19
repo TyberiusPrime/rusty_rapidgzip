@@ -755,6 +755,20 @@ pub fn parallel_decode_member(
             crate::elapsed_since_start(),
             decode_ns.load(Relaxed) as f64 / 1e9,
         );
+        {
+            use crate::deflate::fast_inflate::{PHASE1_BYTES, PHASE1_NS, PHASE2_BYTES, PHASE2_NS};
+            let p1_ns = PHASE1_NS.load(Relaxed) as f64 / 1e9;
+            let p2_ns = PHASE2_NS.load(Relaxed) as f64 / 1e9;
+            let p1_b = PHASE1_BYTES.load(Relaxed);
+            let p2_b = PHASE2_BYTES.load(Relaxed);
+            let mibps = |b: u64, s: f64| if s > 0.0 { b as f64 / s / (1024.0 * 1024.0) } else { 0.0 };
+            eprintln!(
+                "[rapidgzip +{:.2}s]   phase1 (u16 spec): cpu={p1_ns:.3}s bytes={p1_b} ({:.0} MiB/s/thread) | phase2 (u8): cpu={p2_ns:.3}s bytes={p2_b} ({:.0} MiB/s/thread)",
+                crate::elapsed_since_start(),
+                mibps(p1_b, p1_ns),
+                mibps(p2_b, p2_ns),
+            );
+        }
     }
 
     // Tear down. Dropping `done_rx` unblocks the pool if we exited early; the

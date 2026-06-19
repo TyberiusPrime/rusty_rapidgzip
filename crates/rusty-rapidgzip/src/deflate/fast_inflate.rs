@@ -430,8 +430,33 @@ fn decode_compressed<const IS_SPECULATIVE: bool>(
             }
         };
 
-        // ── Literal ──────────────────────────────────────────────────────────
+        // ── Literal (with a speculative second literal) ──────────────────────
         if entry & HUFFDEC_LITERAL != 0 {
+            // After the unconditional `bits |= 56` refill we hold ≥ 56 bits, and
+            // the first literal consumed ≤ LUT_BITS (10), so ≥ 46 valid bits
+            // remain — enough for a second in-range LUT lookup, and two ≤ 15-bit
+            // codes fit in 56 bits with no mid-pair refill. Committing two
+            // literals per refill on literal runs is a small consistent win; only
+            // a short-code literal is taken speculatively, anything else leaves
+            // `buf` untouched and is decoded normally on the next iteration.
+            let e2 = lit_lut[(buf & LUT_MASK) as usize];
+            let len2 = e2 & 0xff;
+            if len2 != 0 && e2 & HUFFDEC_LITERAL != 0 {
+                buf >>= len2;
+                bits -= len2;
+                if cur + 2 > cap {
+                    publish_len!();
+                    out.reserve(HEADROOM);
+                    cap = out.capacity();
+                    out_ptr = out.as_mut_ptr();
+                }
+                unsafe {
+                    *out_ptr.add(cur) = (entry >> 16) as u8;
+                    *out_ptr.add(cur + 1) = (e2 >> 16) as u8;
+                }
+                cur += 2;
+                continue 'outer;
+            }
             if cur == cap {
                 publish_len!();
                 out.reserve(HEADROOM);
@@ -666,6 +691,17 @@ pub fn decode_until_u16(
     chunk: &mut SpeculativeChunk,
     scratch: &mut Vec<u16>,
 ) -> Result<(u64, bool), DeflateError> {
+    use std::sync::atomic::Ordering::Relaxed;
+    use std::time::Instant;
+    let t_start = Instant::now();
+    let bytes_in = chunk.bytes.len();
+    macro_rules! acct_phase1 {
+        () => {{
+            PHASE1_NS.fetch_add(t_start.elapsed().as_nanos() as u64, Relaxed);
+            PHASE1_BYTES.fetch_add((chunk.bytes.len() - bytes_in) as u64, Relaxed);
+        }};
+    }
+
     let mut br = BitReader::new(input);
     br.seek_to_bit(start_bit)?;
     if scratch.len() != U16_BUFCAP {
@@ -688,11 +724,13 @@ pub fn decode_until_u16(
         if bfinal {
             // Whole member finished within phase 1: emit all of it and return.
             chunk.extract_from_u16(&scratch[0..cur]);
+            acct_phase1!();
             return Ok((br.tell_bit(), true));
         }
         if br.tell_bit() >= end_bit_hint {
             // Chunk boundary reached on a block edge, still speculative.
             chunk.extract_from_u16(&scratch[0..cur]);
+            acct_phase1!();
             return Ok((br.tell_bit(), false));
         }
         // Hand off to the byte kernel once the retained 32 KiB window — the only
@@ -715,12 +753,15 @@ pub fn decode_until_u16(
     // `extract_from_u16`. Afterwards `chunk.bytes` holds the full prefix and is
     // the DEFLATE window for the byte kernel below.
     chunk.extract_from_u16(&scratch[0..cur]);
+    acct_phase1!();
 
     // ── Phase 2 — non-speculative byte kernel into `chunk.bytes` ─────────────
     // Every remaining back-reference (distance ≤ 32 KiB) now resolves within the
     // real history we just materialised, so no markers arise and we reuse the
     // optimised `u8` `decode_one_block`. Marker placeholders sit at positions
     // < U16_WINDOW and are never read here (phase-2 sources are ≥ U16_WINDOW).
+    let t_p2 = Instant::now();
+    let bytes_mid = chunk.bytes.len();
     let mut final_block = false;
     loop {
         if decode_one_block(&mut br, &mut chunk.bytes)? {
@@ -731,8 +772,18 @@ pub fn decode_until_u16(
             break;
         }
     }
+    PHASE2_NS.fetch_add(t_p2.elapsed().as_nanos() as u64, Relaxed);
+    PHASE2_BYTES.fetch_add((chunk.bytes.len() - bytes_mid) as u64, Relaxed);
     Ok((br.tell_bit(), final_block))
 }
+
+/// Temporary phase-split diagnostics (printed under `-v`): wall-ns and output
+/// bytes attributed to the speculative u16 phase vs the byte-kernel phase,
+/// summed across all decode workers.
+pub static PHASE1_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PHASE2_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PHASE1_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PHASE2_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Emit everything older than the retained window, then slide the window down.
 /// Caller guarantees `*cur > U16_WINDOW`.
