@@ -25,12 +25,18 @@ libdeflate = []
 # $ISAL_LIB_DIR / $ISAL_INCLUDE_DIR (see build.rs). Benchmark with
 # `--no-default-features --features isal`.
 isal = []
+# Experimental pure-Rust backend: route per-member / BGZF decode through zlib-rs
+# (via its standard-zlib C ABI, `libz-rs-sys`). Another either/or alternative to
+# `libdeflate` / `isal` (precedence: libdeflate > isal > zlib-rs). No C compiler
+# or external library needed. Benchmark with `--no-default-features --features zlib-rs`.
+zlib-rs = ["dep:libz-rs-sys"]
 
 [dependencies]
 crc32fast.workspace = true
 crossbeam-channel.workspace = true
 thiserror.workspace = true
 memmap2.workspace = true
+libz-rs-sys = { workspace = true, optional = true }
 
 [build-dependencies]
 # Only used to compile src/isal_shim.c when the `isal` feature is active.

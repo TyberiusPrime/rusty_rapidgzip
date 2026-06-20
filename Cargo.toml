@@ -21,6 +21,8 @@ authors = ["Florian Finkernagel <finkernagel@imt.uni-marburg.de>"]
 rusty-rapidgzip = { path = "crates/rusty-rapidgzip", version = "0.1.0", default-features = false }
 
 bstr = "1"
+# Pure-Rust zlib (zlib-rs) via its standard-zlib C ABI; the `zlib-rs` backend.
+libz-rs-sys = "0.6.3"
 crc32fast = "1.4"
 crossbeam-channel = "0.5"
 thiserror = "2"

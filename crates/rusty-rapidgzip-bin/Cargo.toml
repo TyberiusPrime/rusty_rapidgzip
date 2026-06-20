@@ -25,6 +25,9 @@ libdeflate = ["rusty-rapidgzip/libdeflate"]
 # Experimental ISA-L backend (see the lib's `isal` feature). Benchmark with
 # `--no-default-features --features isal`.
 isal = ["rusty-rapidgzip/isal"]
+# Experimental pure-Rust zlib-rs backend (see the lib's `zlib-rs` feature).
+# Benchmark with `--no-default-features --features zlib-rs`.
+zlib-rs = ["rusty-rapidgzip/zlib-rs"]
 
 [dependencies]
 rusty-rapidgzip.workspace = true
