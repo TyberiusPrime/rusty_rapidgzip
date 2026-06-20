@@ -100,6 +100,14 @@ struct WorkerKernel {
     /// `libdeflate` nor `isal` is on). Lazily allocated.
     #[cfg(all(feature = "zlib-rs", not(any(feature = "libdeflate", feature = "isal"))))]
     zlibrs: Option<crate::zlibrs_ffi::Decompressor>,
+    /// Per-worker reusable output scratch for the zune-inflate backend (feature
+    /// `zune`). Grown once to the largest member size; lets zune decode without
+    /// re-zero-filling a fresh buffer each call. Empty by default.
+    #[cfg(all(
+        feature = "zune",
+        not(any(feature = "libdeflate", feature = "isal", feature = "zlib-rs"))
+    ))]
+    zune_scratch: Vec<u8>,
 }
 
 /// Name of the active external member-decode backend, for verbose output.
@@ -209,7 +217,7 @@ fn decode_subsequent_member(
     not(any(feature = "libdeflate", feature = "isal", feature = "zlib-rs"))
 ))]
 fn decode_subsequent_member(
-    _wk: &mut WorkerKernel,
+    wk: &mut WorkerKernel,
     body: &[u8],
     pos: u64,
     end_bit_hint: u64,
@@ -218,8 +226,8 @@ fn decode_subsequent_member(
     use std::sync::atomic::Ordering::Relaxed;
 
     use crate::zune_backend::{decode_member, ZuneOutcome};
-    // zune has no reusable decompressor state — `wk` is unused.
-    match decode_member(body, pos, end_bit_hint, out)? {
+    // Reuse the worker's scratch buffer so zune amortises its output zero-fill.
+    match decode_member(&mut wk.zune_scratch, body, pos, end_bit_hint, out)? {
         ZuneOutcome::Done(end, hit_bfinal) => {
             LD_DONE.fetch_add(1, Relaxed);
             Ok((end, hit_bfinal))

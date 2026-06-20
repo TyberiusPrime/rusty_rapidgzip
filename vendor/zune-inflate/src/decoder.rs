@@ -595,9 +595,49 @@ impl<'a> DeflateDecoder<'a>
     {
         self.stream.get_position() + self.position + self.stream.over_read
     }
+    /// LOCAL PATCH (rusty-rapidgzip): like [`decode_deflate`](Self::decode_deflate)
+    /// but decodes into a reusable caller buffer instead of allocating a fresh
+    /// zero-filled `Vec` each call. `scratch` is grown/zero-filled only when it is
+    /// smaller than `size_hint` (i.e. once, then reused), and is left untruncated
+    /// so a per-worker buffer amortises the zero-fill the owned-`Vec` API
+    /// otherwise pays on every call. The decoded bytes are `scratch[..returned_len]`.
+    pub fn decode_deflate_into(
+        &mut self, scratch: &mut Vec<u8>
+    ) -> Result<usize, InflateDecodeErrors>
+    {
+        let mut buf = core::mem::take(scratch);
+        if buf.len() < self.options.size_hint
+        {
+            buf.resize(self.options.size_hint, 0);
+        }
+        match self.start_deflate_block_buf(buf)
+        {
+            Ok((out, len)) =>
+            {
+                *scratch = out;
+                Ok(len)
+            }
+            Err(e) => Err(e)
+        }
+    }
+
     /// Main inner loop for decompressing deflate data
-    #[allow(unused_assignments)]
     fn start_deflate_block(&mut self) -> Result<Vec<u8>, InflateDecodeErrors>
+    {
+        let buf = vec![0; self.options.size_hint];
+        let (mut out_block, len) = self.start_deflate_block_buf(buf)?;
+        out_block.truncate(len);
+        Ok(out_block)
+    }
+
+    /// LOCAL PATCH (rusty-rapidgzip): the decode loop, taking the output buffer as
+    /// a parameter (assumed pre-sized to >= `size_hint`) and returning it together
+    /// with the decoded length, untruncated. Body is otherwise upstream's
+    /// `start_deflate_block`. See [`decode_deflate_into`](Self::decode_deflate_into).
+    #[allow(unused_assignments)]
+    fn start_deflate_block_buf(
+        &mut self, mut out_block: Vec<u8>
+    ) -> Result<(Vec<u8>, usize), InflateDecodeErrors>
     {
         // start deflate decode
         // re-read the stream so that we can remove code read by zlib
@@ -605,8 +645,6 @@ impl<'a> DeflateDecoder<'a>
 
         self.stream.refill();
 
-        // Output space for our decoded bytes.
-        let mut out_block = vec![0; self.options.size_hint];
         // bits used
 
         let mut src_offset = 0;
@@ -1222,11 +1260,9 @@ impl<'a> DeflateDecoder<'a>
         }
 
         // decompression. DONE
-        // Truncate data to match the number of actual
-        // bytes written.
-        out_block.truncate(dest_offset);
-
-        Ok(out_block)
+        // LOCAL PATCH: return the (untruncated) buffer + decoded length so the
+        // caller can reuse the allocation; `start_deflate_block` truncates.
+        Ok((out_block, dest_offset))
     }
 
     /// Build decode tables for static and dynamic
