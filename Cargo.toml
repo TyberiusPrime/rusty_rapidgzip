@@ -5,6 +5,9 @@ members = [
     "crates/rusty-rapidgzip-bin",
     #"xtask",
 ]
+# Vendored + locally patched third-party crate (see vendor/zune-inflate/LOCAL_PATCH.md).
+# Excluded so it is not built/tested as a workspace member; referenced as a path dep.
+exclude = ["vendor/zune-inflate"]
 
 [workspace.package]
 version = "0.1.0"

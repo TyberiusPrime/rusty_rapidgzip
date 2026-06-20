@@ -109,6 +109,11 @@ pub(crate) const MEMBER_BACKEND: &str = "libdeflate";
 pub(crate) const MEMBER_BACKEND: &str = "ISA-L";
 #[cfg(all(feature = "zlib-rs", not(any(feature = "libdeflate", feature = "isal"))))]
 pub(crate) const MEMBER_BACKEND: &str = "zlib-rs";
+#[cfg(all(
+    feature = "zune",
+    not(any(feature = "libdeflate", feature = "isal", feature = "zlib-rs"))
+))]
+pub(crate) const MEMBER_BACKEND: &str = "zune-inflate";
 
 /// Instrumentation (feature `libdeflate`/`isal`/`zlib-rs`): how the speculative
 /// path's subsequent members were decoded. `LD_DONE` = decoded by the external
@@ -116,9 +121,9 @@ pub(crate) const MEMBER_BACKEND: &str = "zlib-rs";
 /// `decode_member_u8` (redundant work, the CPU tax that can push full-thread wall
 /// up). First-member-per-chunk decodes never reach here — they always use our u16
 /// kernel. Printed in verbose mode.
-#[cfg(any(feature = "libdeflate", feature = "isal", feature = "zlib-rs"))]
+#[cfg(any(feature = "libdeflate", feature = "isal", feature = "zlib-rs", feature = "zune"))]
 pub(crate) static LD_DONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-#[cfg(any(feature = "libdeflate", feature = "isal", feature = "zlib-rs"))]
+#[cfg(any(feature = "libdeflate", feature = "isal", feature = "zlib-rs", feature = "zune"))]
 pub(crate) static LD_STRADDLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Decode one non-first member of a chunk (fresh empty window, byte-aligned
@@ -199,7 +204,39 @@ fn decode_subsequent_member(
     }
 }
 
-#[cfg(not(any(feature = "libdeflate", feature = "isal", feature = "zlib-rs")))]
+#[cfg(all(
+    feature = "zune",
+    not(any(feature = "libdeflate", feature = "isal", feature = "zlib-rs"))
+))]
+fn decode_subsequent_member(
+    _wk: &mut WorkerKernel,
+    body: &[u8],
+    pos: u64,
+    end_bit_hint: u64,
+    out: &mut Vec<u8>,
+) -> Result<(u64, bool), crate::deflate::DeflateError> {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    use crate::zune_backend::{decode_member, ZuneOutcome};
+    // zune has no reusable decompressor state — `wk` is unused.
+    match decode_member(body, pos, end_bit_hint, out)? {
+        ZuneOutcome::Done(end, hit_bfinal) => {
+            LD_DONE.fetch_add(1, Relaxed);
+            Ok((end, hit_bfinal))
+        }
+        ZuneOutcome::Straddle => {
+            LD_STRADDLE.fetch_add(1, Relaxed);
+            fast_inflate::decode_member_u8(body, pos, end_bit_hint, out)
+        }
+    }
+}
+
+#[cfg(not(any(
+    feature = "libdeflate",
+    feature = "isal",
+    feature = "zlib-rs",
+    feature = "zune"
+)))]
 fn decode_subsequent_member(
     _wk: &mut WorkerKernel,
     body: &[u8],
@@ -938,7 +975,7 @@ pub fn parallel_decode_member(
             crate::elapsed_since_start(),
         );
     }
-    #[cfg(any(feature = "libdeflate", feature = "isal", feature = "zlib-rs"))]
+    #[cfg(any(feature = "libdeflate", feature = "isal", feature = "zlib-rs", feature = "zune"))]
     if verbose {
         use std::sync::atomic::Ordering::Relaxed;
         let done = LD_DONE.load(Relaxed);
@@ -1401,7 +1438,18 @@ pub fn parallel_decode_bgzf(
                         &mut out,
                     )
                     .map_err(Error::Deflate);
-                    #[cfg(not(any(feature = "libdeflate", feature = "isal", feature = "zlib-rs")))]
+                    #[cfg(all(
+                        feature = "zune",
+                        not(any(feature = "libdeflate", feature = "isal", feature = "zlib-rs"))
+                    ))]
+                    let res = crate::zune_backend::decode_gzip_member(&file[s..e], &mut out)
+                        .map_err(Error::Deflate);
+                    #[cfg(not(any(
+                        feature = "libdeflate",
+                        feature = "isal",
+                        feature = "zlib-rs",
+                        feature = "zune"
+                    )))]
                     let res = crate::gzip::decode_one_indexed_fast(&file[s..e], &mut out, mi as u32)
                         .map_err(Error::Gzip);
                     match res {

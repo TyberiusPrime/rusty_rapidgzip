@@ -10,6 +10,11 @@ mod libdeflate_ffi;
 mod isal_ffi;
 #[cfg(all(feature = "zlib-rs", not(any(feature = "libdeflate", feature = "isal"))))]
 mod zlibrs_ffi;
+#[cfg(all(
+    feature = "zune",
+    not(any(feature = "libdeflate", feature = "isal", feature = "zlib-rs"))
+))]
+mod zune_backend;
 
 pub use gzip::{decode_all, decode_one, GzipError};
 
