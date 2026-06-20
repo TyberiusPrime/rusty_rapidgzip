@@ -26,6 +26,14 @@ const LIBDEFLATE_INSUFFICIENT_SPACE: c_int = 3;
 extern "C" {
     fn libdeflate_alloc_decompressor() -> *mut LibdeflateDecompressor;
     fn libdeflate_free_decompressor(d: *mut LibdeflateDecompressor);
+    fn libdeflate_gzip_decompress(
+        d: *mut LibdeflateDecompressor,
+        in_: *const u8,
+        in_nbytes: usize,
+        out: *mut u8,
+        out_nbytes_avail: usize,
+        actual_out_nbytes_ret: *mut usize,
+    ) -> c_int;
     fn libdeflate_deflate_decompress_ex(
         d: *mut LibdeflateDecompressor,
         in_: *const u8,
@@ -131,5 +139,58 @@ pub(crate) fn decode_member(
             }
             _ => return Err(DeflateError::Invalid("libdeflate decode failed")),
         }
+    }
+}
+
+/// Decode one *complete* gzip member (header + DEFLATE + trailer), appending its
+/// bytes to `out`. libdeflate parses the gzip header itself and validates the
+/// trailer CRC32 + ISIZE, so the caller gets integrity checking for free.
+///
+/// This is the BGZF path: every BGZF block is an independent, self-contained
+/// gzip member whose exact byte range is already known, so there is no straddle
+/// problem — unlike [`decode_member`], which works on bare DEFLATE bodies cut at
+/// arbitrary block boundaries. The uncompressed size is read from the member's
+/// own ISIZE trailer field (BGZF blocks are ≤64 KiB), giving an exact output
+/// reservation with no growth retries.
+///
+/// Returns the number of bytes appended on success.
+pub(crate) fn decode_gzip_member(
+    d: &Decompressor,
+    member: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<usize, DeflateError> {
+    if member.len() < 18 {
+        return Err(DeflateError::UnexpectedEof);
+    }
+    // ISIZE: size of the uncompressed data mod 2^32, the last 4 bytes of the
+    // member. For BGZF (≤64 KiB blocks) this is the exact uncompressed size.
+    let isize = u32::from_le_bytes(
+        member[member.len() - 4..]
+            .try_into()
+            .expect("4-byte slice (len >= 18 checked above)"),
+    ) as usize;
+
+    let out_start = out.len();
+    out.reserve(isize);
+    let out_ptr = unsafe { out.as_mut_ptr().add(out_start) };
+    let mut out_made: usize = 0;
+    let r = unsafe {
+        libdeflate_gzip_decompress(
+            d.0,
+            member.as_ptr(),
+            member.len(),
+            out_ptr,
+            isize,
+            &mut out_made,
+        )
+    };
+    match r {
+        LIBDEFLATE_SUCCESS => {
+            // SAFETY: libdeflate wrote `out_made` initialised bytes at `out_ptr`,
+            // and `out_made <= isize <= reserved capacity`.
+            unsafe { out.set_len(out_start + out_made) };
+            Ok(out_made)
+        }
+        _ => Err(DeflateError::Invalid("libdeflate gzip decode failed")),
     }
 }

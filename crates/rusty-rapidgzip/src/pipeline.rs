@@ -1253,6 +1253,12 @@ pub fn parallel_decode_bgzf(
         let file = Arc::clone(&file);
         let members_ref: Vec<(usize, usize)> = members.clone();
         workers.push(thread::spawn(move || {
+            // Each BGZF block is a complete, self-contained gzip member, so the
+            // `libdeflate` feature decodes them with libdeflate's full gzip path
+            // (header + DEFLATE + CRC/ISIZE validation) — the ideal case, with no
+            // straddle fallback. Without the feature we use our own decoder.
+            #[cfg(feature = "libdeflate")]
+            let decompressor = crate::libdeflate_ffi::Decompressor::default();
             while let Ok((id, m_start, m_end)) = work_rx.recv() {
                 // BGZF blocks are ≤64 KiB uncompressed; preallocate to avoid
                 // Vec growth reallocations inside the inflate hot loop.
@@ -1264,12 +1270,20 @@ pub fn parallel_decode_bgzf(
                 )]
                 for mi in m_start..m_end {
                     let (s, e) = members_ref[mi];
-                    let res =
-                        crate::gzip::decode_one_indexed_fast(&file[s..e], &mut out, mi as u32);
+                    #[cfg(feature = "libdeflate")]
+                    let res = crate::libdeflate_ffi::decode_gzip_member(
+                        &decompressor,
+                        &file[s..e],
+                        &mut out,
+                    )
+                    .map_err(Error::Deflate);
+                    #[cfg(not(feature = "libdeflate"))]
+                    let res = crate::gzip::decode_one_indexed_fast(&file[s..e], &mut out, mi as u32)
+                        .map_err(Error::Gzip);
                     match res {
                         Ok(_) => {}
-                        Err(ge) => {
-                            err = Some(Error::Gzip(ge));
+                        Err(e) => {
+                            err = Some(e);
                             break;
                         }
                     }
