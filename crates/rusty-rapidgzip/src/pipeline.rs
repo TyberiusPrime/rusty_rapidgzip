@@ -85,10 +85,24 @@ use crate::{Config, Error};
 #[derive(Default)]
 struct WorkerKernel {
     scratch: Vec<u16>,
-    /// Per-worker libdeflate decompressor (experimental `libdeflate` feature).
+    /// Per-worker libdeflate decompressor (feature `libdeflate`). Allocated
+    /// lazily on the first member that libdeflate actually decodes, so a
+    /// single-member stream — where every chunk is a mid-member slice and
+    /// `decode_subsequent_member` is never reached — never allocates one and
+    /// libdeflate stays a true zero-cost no-op.
     #[cfg(feature = "libdeflate")]
-    decompressor: crate::libdeflate_ffi::Decompressor,
+    decompressor: Option<crate::libdeflate_ffi::Decompressor>,
 }
+
+/// Instrumentation (feature `libdeflate`): how the speculative path's subsequent
+/// members were decoded. `LD_DONE` = decoded by libdeflate; `LD_STRADDLE` =
+/// straddled `end_bit_hint`, fell back to our `decode_member_u8` (redundant work,
+/// the CPU tax that can push full-thread wall up). First-member-per-chunk decodes
+/// never reach here — they always use our u16 kernel. Printed in verbose mode.
+#[cfg(feature = "libdeflate")]
+pub(crate) static LD_DONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "libdeflate")]
+pub(crate) static LD_STRADDLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Decode one non-first member of a chunk (fresh empty window, byte-aligned
 /// start). With the `libdeflate` feature, members fully inside the chunk go
@@ -102,10 +116,21 @@ fn decode_subsequent_member(
     end_bit_hint: u64,
     out: &mut Vec<u8>,
 ) -> Result<(u64, bool), crate::deflate::DeflateError> {
-    use crate::libdeflate_ffi::{decode_member, LdOutcome};
-    match decode_member(&wk.decompressor, body, pos, end_bit_hint, out)? {
-        LdOutcome::Done(end, hit_bfinal) => Ok((end, hit_bfinal)),
-        LdOutcome::Straddle => fast_inflate::decode_member_u8(body, pos, end_bit_hint, out),
+    use std::sync::atomic::Ordering::Relaxed;
+
+    use crate::libdeflate_ffi::{decode_member, Decompressor, LdOutcome};
+    // First subsequent member on this worker allocates the decompressor; reused
+    // for all later members. Single-member streams never get here.
+    let d = wk.decompressor.get_or_insert_with(Decompressor::default);
+    match decode_member(d, body, pos, end_bit_hint, out)? {
+        LdOutcome::Done(end, hit_bfinal) => {
+            LD_DONE.fetch_add(1, Relaxed);
+            Ok((end, hit_bfinal))
+        }
+        LdOutcome::Straddle => {
+            LD_STRADDLE.fetch_add(1, Relaxed);
+            fast_inflate::decode_member_u8(body, pos, end_bit_hint, out)
+        }
     }
 }
 
@@ -845,6 +870,22 @@ pub fn parallel_decode_member(
     if verbose && spec_failures > 0 {
         eprintln!(
             "[rapidgzip +{:.2}s] block-finder false boundaries: {spec_failures} chunk(s) re-decoded from the correct offset",
+            crate::elapsed_since_start(),
+        );
+    }
+    #[cfg(feature = "libdeflate")]
+    if verbose {
+        use std::sync::atomic::Ordering::Relaxed;
+        let done = LD_DONE.load(Relaxed);
+        let straddle = LD_STRADDLE.load(Relaxed);
+        let total = done + straddle;
+        let pct = if total > 0 {
+            100.0 * done as f64 / total as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[rapidgzip +{:.2}s] libdeflate: {done} member(s) via libdeflate, {straddle} straddler(s) redone by u8 kernel ({pct:.1}% libdeflate coverage of subsequent members)",
             crate::elapsed_since_start(),
         );
     }

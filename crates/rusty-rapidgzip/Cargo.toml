@@ -8,9 +8,14 @@ repository.workspace = true
 description = "Streaming, parallel gzip decoder. Inspired by rapidgzip / pugz."
 
 [features]
-# Experimental: route the non-speculative per-member u8 decode through the
-# external libdeflate C library instead of our own inflate kernel. Requires
-# libdeflate's static lib at $LIBDEFLATE_LIB_DIR (see build.rs). Off by default.
+# On by default: route the non-speculative per-member decode (and the BGZF
+# fast path) through the external libdeflate C library instead of our own
+# inflate kernel. Measured a 1.1–1.3x win wherever members sit fully inside a
+# chunk (multi-member gzip, BGZF) and a true no-op on single-member streams
+# (libdeflate never engages — the decompressor isn't even allocated). Requires
+# libdeflate's static lib at $LIBDEFLATE_LIB_DIR (see build.rs); build with
+# `--no-default-features` to use the pure-Rust kernel and drop the C dependency.
+default = ["libdeflate"]
 libdeflate = []
 
 [dependencies]

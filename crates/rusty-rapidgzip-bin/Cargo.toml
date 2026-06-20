@@ -16,7 +16,11 @@ name = "bench-inflate"
 path = "src/bench_inflate.rs"
 
 [features]
-# Pass through to the library's experimental libdeflate-backed decode path.
+# libdeflate-backed decode is on by default (a 1.1–1.3x win on multi-member /
+# BGZF, a no-op on single-member). Build with `--no-default-features` to get the
+# pure-Rust kernel and drop the external libdeflate dependency. The lib is pulled
+# with `default-features = false` so this flag is a real off-switch.
+default = ["libdeflate"]
 libdeflate = ["rusty-rapidgzip/libdeflate"]
 
 [dependencies]

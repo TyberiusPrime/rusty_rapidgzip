@@ -15,7 +15,10 @@ repository = "https://github.com/TyberiusPrime/rusty-rapidgzip"
 authors = ["Florian Finkernagel <finkernagel@imt.uni-marburg.de>"]
 
 [workspace.dependencies]
-rusty-rapidgzip = { path = "crates/rusty-rapidgzip" , version="0.1.0" }
+# default-features = false so the bin's own `default` / `--no-default-features`
+# controls libdeflate; an inherited `default-features = false` is otherwise
+# ignored unless set here in the workspace table.
+rusty-rapidgzip = { path = "crates/rusty-rapidgzip", version = "0.1.0", default-features = false }
 
 bstr = "1"
 crc32fast = "1.4"
