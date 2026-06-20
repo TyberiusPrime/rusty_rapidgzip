@@ -293,6 +293,21 @@ struct MemberBoundary {
     trailer_input_byte: u64,
 }
 
+/// Per-chunk CRC32 pieces, computed in parallel by the CRC pool and combined in
+/// chunk order by the serial combiner. Splitting compute (the 59.7 GB scan) from
+/// the combine (cheap polynomial math) keeps CRC validation off the serial path.
+struct ChunkCrc {
+    id: u64,
+    /// One per member ending in this chunk: `(piece_crc, piece_len, boundary)`,
+    /// where the piece is this chunk's contribution to that member's bytes (the
+    /// whole member, or just its tail when the member began in an earlier chunk).
+    members: Vec<(u32, u64, MemberBoundary)>,
+    /// CRC + length of the bytes after the last boundary — a member that
+    /// continues into the next chunk (empty if the chunk ends on a boundary).
+    tail_crc: u32,
+    tail_len: u64,
+}
+
 /// A chunk handed to the resolve pool: its still-unresolved markers plus the
 /// (already fully-resolved) previous-chunk tail they reference.
 struct ResolveJob {
@@ -511,55 +526,110 @@ pub fn parallel_decode_member(
         })
     };
 
-    // ── CRC validator thread ─────────────────────────────────────────────────
+    // ── CRC validation: parallel compute pool + serial combiner ──────────────
     //
-    // Receives fully-resolved chunks in order from the serializer, validates
-    // CRC32 + ISIZE off the hot path, and recycles the output buffer.
-    let (crc_tx, crc_rx) = bounded::<(Arc<Vec<u8>>, Vec<MemberBoundary>)>(num_threads * 2);
+    // CRC32-of-59.7 GB on a single thread was the full-thread Amdahl wall (it
+    // gated wall time while decode workers idled on backpressure). So the
+    // per-chunk piece CRCs are computed in a parallel pool (the 59.7 GB scan),
+    // and a serial combiner stitches them in chunk order with `crc32` combine —
+    // O(members) polynomial math, no data scan. The combiner also recycles
+    // nothing; the pool recycles each output buffer once its bytes are scanned.
+    let crc_threads = std::env::var("RAPIDGZIP_CRC_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or_else(|| num_threads.min(8))
+        .max(1);
+    let (crc_tx, crc_rx) = bounded::<(u64, Arc<Vec<u8>>, Vec<MemberBoundary>)>(num_threads * 2);
+    let (combine_tx, combine_rx) = bounded::<ChunkCrc>(num_threads * 2);
+
+    let mut crc_pool_handles = Vec::with_capacity(crc_threads);
+    for _ in 0..crc_threads {
+        let crc_rx = crc_rx.clone();
+        let combine_tx = combine_tx.clone();
+        let recycle = recycle_tx_for_crc.clone();
+        crc_pool_handles.push(thread::spawn(move || {
+            for (id, bytes_arc, member_boundaries) in crc_rx {
+                let bytes: &[u8] = &bytes_arc;
+                let mut members = Vec::with_capacity(member_boundaries.len());
+                let mut cursor = 0usize;
+                for mb in &member_boundaries {
+                    let piece = &bytes[cursor..mb.byte_offset_in_chunk];
+                    let mut h = crc32fast::Hasher::new();
+                    h.update(piece);
+                    members.push((h.finalize(), piece.len() as u64, mb.clone()));
+                    cursor = mb.byte_offset_in_chunk;
+                }
+                let tail = &bytes[cursor..];
+                let mut h = crc32fast::Hasher::new();
+                h.update(tail);
+                let chunk_crc = ChunkCrc {
+                    id,
+                    members,
+                    tail_crc: h.finalize(),
+                    tail_len: tail.len() as u64,
+                };
+                // Bytes are fully scanned now — recycle the buffer if the sink
+                // has already let go of its reference.
+                if let (Some(tx), Ok(mut v)) = (recycle.as_ref(), Arc::try_unwrap(bytes_arc)) {
+                    v.clear();
+                    let _ = tx.try_send(v);
+                }
+                if combine_tx.send(chunk_crc).is_err() {
+                    return;
+                }
+            }
+        }));
+    }
+    drop(crc_rx);
+    drop(combine_tx);
+
     let crc_handle: thread::JoinHandle<Result<(), Error>> = thread::spawn(move || {
+        // Combine pieces in chunk order. `cur_crc`/`cur_uncompressed` carry the
+        // in-progress member across chunk boundaries, exactly as the old serial
+        // loop did, but via `combine` (no byte scanning here).
+        let mut reorder: std::collections::BTreeMap<u64, ChunkCrc> =
+            std::collections::BTreeMap::new();
+        let mut next: u64 = 0;
         let mut cur_crc = crc32fast::Hasher::new();
         let mut cur_uncompressed: u64 = 0;
         let mut member_idx: u32 = 0;
-        for (bytes_arc, member_boundaries) in crc_rx {
-            let bytes: &[u8] = &bytes_arc;
-            let mut cursor = 0usize;
-            for mb in &member_boundaries {
-                let piece = &bytes[cursor..mb.byte_offset_in_chunk];
-                cur_crc.update(piece);
-                cur_uncompressed += piece.len() as u64;
-                let crc_got = std::mem::replace(&mut cur_crc, crc32fast::Hasher::new()).finalize();
-                if crc_got != mb.crc_expected {
-                    return Err(Error::Gzip(crate::GzipError::CrcMismatch {
-                        expected: mb.crc_expected,
-                        got: crc_got,
-                        member: member_idx,
-                        uncompressed: cur_uncompressed,
-                        trailer_byte: mb.trailer_input_byte,
-                    }));
+        loop {
+            let cc = match combine_rx.recv() {
+                Ok(cc) => cc,
+                Err(_) => return Ok(()),
+            };
+            reorder.insert(cc.id, cc);
+            while let Some(cc) = reorder.remove(&next) {
+                for (pcrc, plen, mb) in &cc.members {
+                    cur_crc.combine(&crc32fast::Hasher::new_with_initial_len(*pcrc, *plen));
+                    cur_uncompressed += *plen;
+                    let crc_got = cur_crc.clone().finalize();
+                    if crc_got != mb.crc_expected {
+                        return Err(Error::Gzip(crate::GzipError::CrcMismatch {
+                            expected: mb.crc_expected,
+                            got: crc_got,
+                            member: member_idx,
+                            uncompressed: cur_uncompressed,
+                            trailer_byte: mb.trailer_input_byte,
+                        }));
+                    }
+                    if (cur_uncompressed & 0xFFFF_FFFF) as u32 != mb.isize_expected {
+                        return Err(Error::Gzip(crate::GzipError::IsizeMismatch {
+                            expected: mb.isize_expected,
+                            got: cur_uncompressed,
+                            member: member_idx,
+                            trailer_byte: mb.trailer_input_byte,
+                        }));
+                    }
+                    member_idx += 1;
+                    cur_crc = crc32fast::Hasher::new();
+                    cur_uncompressed = 0;
                 }
-                if (cur_uncompressed & 0xFFFF_FFFF) as u32 != mb.isize_expected {
-                    return Err(Error::Gzip(crate::GzipError::IsizeMismatch {
-                        expected: mb.isize_expected,
-                        got: cur_uncompressed,
-                        member: member_idx,
-                        trailer_byte: mb.trailer_input_byte,
-                    }));
-                }
-                member_idx += 1;
-                cur_uncompressed = 0;
-                cursor = mb.byte_offset_in_chunk;
-            }
-            let tail = &bytes[cursor..];
-            cur_crc.update(tail);
-            cur_uncompressed += tail.len() as u64;
-            drop(member_boundaries);
-            if let (Some(tx), Ok(mut v)) = (recycle_tx_for_crc.as_ref(), Arc::try_unwrap(bytes_arc))
-            {
-                v.clear();
-                let _ = tx.try_send(v);
+                cur_crc.combine(&crc32fast::Hasher::new_with_initial_len(cc.tail_crc, cc.tail_len));
+                cur_uncompressed += cc.tail_len;
+                next += 1;
             }
         }
-        Ok(())
     });
 
     // ── Resolve fan-out ──────────────────────────────────────────────────────
@@ -740,7 +810,7 @@ pub fn parallel_decode_member(
                 }
             }
             let bytes_arc = Arc::new(done.chunk.bytes);
-            let _ = crc_tx.send((Arc::clone(&bytes_arc), done.member_boundaries));
+            let _ = crc_tx.send((next_id, Arc::clone(&bytes_arc), done.member_boundaries));
             let send_ok = sink.send(bytes_arc).is_ok();
             // Chunk has left the decode pipeline — free its in-flight slot so
             // dispatch may admit the next one. (Release whether or not the sink
@@ -836,6 +906,12 @@ pub fn parallel_decode_member(
         return Err(e);
     }
 
+    // CRC pool drains once `crc_tx` is dropped (above); joining ensures every
+    // buffer has been scanned + recycled and all `combine_tx` clones dropped, so
+    // the combiner below sees a clean channel close.
+    for h in crc_pool_handles {
+        let _ = h.join();
+    }
     crc_handle
         .join()
         .unwrap_or_else(|_| Err(Error::Io(std::io::Error::other("crc thread panicked"))))?;
