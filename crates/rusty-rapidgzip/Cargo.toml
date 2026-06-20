@@ -17,12 +17,24 @@ description = "Streaming, parallel gzip decoder. Inspired by rapidgzip / pugz."
 # `--no-default-features` to use the pure-Rust kernel and drop the C dependency.
 default = ["libdeflate"]
 libdeflate = []
+# Experimental alternative backend: route per-member / BGZF decode through Intel
+# ISA-L's igzip (`isal_inflate`, hand-written SIMD assembly) instead of our own
+# kernel, to quantify whether it beats libdeflate / pure-Rust. Mutually used as
+# an either/or with `libdeflate` (libdeflate takes precedence if both are on).
+# Compiles a small C shim against ISA-L's headers and links libisal at
+# $ISAL_LIB_DIR / $ISAL_INCLUDE_DIR (see build.rs). Benchmark with
+# `--no-default-features --features isal`.
+isal = []
 
 [dependencies]
 crc32fast.workspace = true
 crossbeam-channel.workspace = true
 thiserror.workspace = true
 memmap2.workspace = true
+
+[build-dependencies]
+# Only used to compile src/isal_shim.c when the `isal` feature is active.
+cc = "1"
 
 [dev-dependencies]
 sha2.workspace = true

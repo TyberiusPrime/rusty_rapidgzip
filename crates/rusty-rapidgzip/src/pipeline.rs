@@ -92,16 +92,27 @@ struct WorkerKernel {
     /// libdeflate stays a true zero-cost no-op.
     #[cfg(feature = "libdeflate")]
     decompressor: Option<crate::libdeflate_ffi::Decompressor>,
+    /// Per-worker ISA-L inflate state (feature `isal`, when `libdeflate` is off).
+    /// Lazily allocated exactly like the libdeflate one.
+    #[cfg(all(feature = "isal", not(feature = "libdeflate")))]
+    isal: Option<crate::isal_ffi::Decompressor>,
 }
 
-/// Instrumentation (feature `libdeflate`): how the speculative path's subsequent
-/// members were decoded. `LD_DONE` = decoded by libdeflate; `LD_STRADDLE` =
-/// straddled `end_bit_hint`, fell back to our `decode_member_u8` (redundant work,
-/// the CPU tax that can push full-thread wall up). First-member-per-chunk decodes
-/// never reach here — they always use our u16 kernel. Printed in verbose mode.
+/// Name of the active external member-decode backend, for verbose output.
 #[cfg(feature = "libdeflate")]
+pub(crate) const MEMBER_BACKEND: &str = "libdeflate";
+#[cfg(all(feature = "isal", not(feature = "libdeflate")))]
+pub(crate) const MEMBER_BACKEND: &str = "ISA-L";
+
+/// Instrumentation (feature `libdeflate`/`isal`): how the speculative path's
+/// subsequent members were decoded. `LD_DONE` = decoded by the external backend;
+/// `LD_STRADDLE` = straddled `end_bit_hint`, fell back to our `decode_member_u8`
+/// (redundant work, the CPU tax that can push full-thread wall up).
+/// First-member-per-chunk decodes never reach here — they always use our u16
+/// kernel. Printed in verbose mode.
+#[cfg(any(feature = "libdeflate", feature = "isal"))]
 pub(crate) static LD_DONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-#[cfg(feature = "libdeflate")]
+#[cfg(any(feature = "libdeflate", feature = "isal"))]
 pub(crate) static LD_STRADDLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Decode one non-first member of a chunk (fresh empty window, byte-aligned
@@ -134,7 +145,31 @@ fn decode_subsequent_member(
     }
 }
 
-#[cfg(not(feature = "libdeflate"))]
+#[cfg(all(feature = "isal", not(feature = "libdeflate")))]
+fn decode_subsequent_member(
+    wk: &mut WorkerKernel,
+    body: &[u8],
+    pos: u64,
+    end_bit_hint: u64,
+    out: &mut Vec<u8>,
+) -> Result<(u64, bool), crate::deflate::DeflateError> {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    use crate::isal_ffi::{decode_member, Decompressor, IsalOutcome};
+    let d = wk.isal.get_or_insert_with(Decompressor::default);
+    match decode_member(d, body, pos, end_bit_hint, out)? {
+        IsalOutcome::Done(end, hit_bfinal) => {
+            LD_DONE.fetch_add(1, Relaxed);
+            Ok((end, hit_bfinal))
+        }
+        IsalOutcome::Straddle => {
+            LD_STRADDLE.fetch_add(1, Relaxed);
+            fast_inflate::decode_member_u8(body, pos, end_bit_hint, out)
+        }
+    }
+}
+
+#[cfg(not(any(feature = "libdeflate", feature = "isal")))]
 fn decode_subsequent_member(
     _wk: &mut WorkerKernel,
     body: &[u8],
@@ -873,7 +908,7 @@ pub fn parallel_decode_member(
             crate::elapsed_since_start(),
         );
     }
-    #[cfg(feature = "libdeflate")]
+    #[cfg(any(feature = "libdeflate", feature = "isal"))]
     if verbose {
         use std::sync::atomic::Ordering::Relaxed;
         let done = LD_DONE.load(Relaxed);
@@ -885,7 +920,7 @@ pub fn parallel_decode_member(
             0.0
         };
         eprintln!(
-            "[rapidgzip +{:.2}s] libdeflate: {done} member(s) via libdeflate, {straddle} straddler(s) redone by u8 kernel ({pct:.1}% libdeflate coverage of subsequent members)",
+            "[rapidgzip +{:.2}s] {MEMBER_BACKEND}: {done} member(s) via {MEMBER_BACKEND}, {straddle} straddler(s) redone by u8 kernel ({pct:.1}% {MEMBER_BACKEND} coverage of subsequent members)",
             crate::elapsed_since_start(),
         );
     }
@@ -1300,6 +1335,8 @@ pub fn parallel_decode_bgzf(
             // straddle fallback. Without the feature we use our own decoder.
             #[cfg(feature = "libdeflate")]
             let decompressor = crate::libdeflate_ffi::Decompressor::default();
+            #[cfg(all(feature = "isal", not(feature = "libdeflate")))]
+            let isal_decompressor = crate::isal_ffi::Decompressor::default();
             while let Ok((id, m_start, m_end)) = work_rx.recv() {
                 // BGZF blocks are ≤64 KiB uncompressed; preallocate to avoid
                 // Vec growth reallocations inside the inflate hot loop.
@@ -1318,7 +1355,14 @@ pub fn parallel_decode_bgzf(
                         &mut out,
                     )
                     .map_err(Error::Deflate);
-                    #[cfg(not(feature = "libdeflate"))]
+                    #[cfg(all(feature = "isal", not(feature = "libdeflate")))]
+                    let res = crate::isal_ffi::decode_gzip_member(
+                        &isal_decompressor,
+                        &file[s..e],
+                        &mut out,
+                    )
+                    .map_err(Error::Deflate);
+                    #[cfg(not(any(feature = "libdeflate", feature = "isal")))]
                     let res = crate::gzip::decode_one_indexed_fast(&file[s..e], &mut out, mi as u32)
                         .map_err(Error::Gzip);
                     match res {

@@ -6,6 +6,8 @@ mod streaming;
 pub mod deflate;
 #[cfg(feature = "libdeflate")]
 mod libdeflate_ffi;
+#[cfg(all(feature = "isal", not(feature = "libdeflate")))]
+mod isal_ffi;
 
 pub use gzip::{decode_all, decode_one, GzipError};
 

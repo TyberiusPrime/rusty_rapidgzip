@@ -22,6 +22,9 @@ path = "src/bench_inflate.rs"
 # with `default-features = false` so this flag is a real off-switch.
 default = ["libdeflate"]
 libdeflate = ["rusty-rapidgzip/libdeflate"]
+# Experimental ISA-L backend (see the lib's `isal` feature). Benchmark with
+# `--no-default-features --features isal`.
+isal = ["rusty-rapidgzip/isal"]
 
 [dependencies]
 rusty-rapidgzip.workspace = true
