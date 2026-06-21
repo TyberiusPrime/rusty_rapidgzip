@@ -87,7 +87,11 @@ pub(crate) fn decode_member(
         return Err(DeflateError::UnexpectedEof);
     }
     let in_ptr = unsafe { body.as_ptr().add(byte_pos) };
-    let in_avail = (body.len() - byte_pos) as u32;
+    // `avail_in` is a u32 in zlib's C ABI, but `body` is the whole mmap'd file,
+    // which is routinely >4 GiB. Clamp (don't truncate `as u32`) so a member that
+    // sits past the 4 GiB mark still gets enough input to decode — a member is at
+    // most a few MiB, so u32::MAX of input always covers it.
+    let in_avail = (body.len() - byte_pos).min(u32::MAX as usize) as u32;
 
     // Like the libdeflate/ISA-L backends this is one-shot: on output overflow we
     // grow and re-decode from a clean reset (the 16 MiB start covers FASTQ-sized
