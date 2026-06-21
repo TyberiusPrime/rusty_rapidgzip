@@ -49,13 +49,32 @@
 //! `entry & HUFFDEC_LITERAL`, `entry & HUFFDEC_EXCEPTIONAL`, otherwise it is
 //! a length code with base/extra pre-baked into the entry.
 //!
+//! **`Dist`** (used for the distance tree on the hot inflate paths):
+//!
+//! ```text
+//!   Distance (sym 0..=29):
+//!     bits 31..16: distance base value (1..=24577, fits in 15 bits)
+//!     bits 12..8:  distance-extra bit count (0..=13)
+//!     bits 7..0:   codeword length
+//!
+//!   Reserved (sym 30/31, never valid):
+//!     bit 15:     HUFFDEC_EXCEPTIONAL (1)
+//!     bits 7..0:  codeword length
+//! ```
+//!
+//! Like `LitLen`, the base distance and extra-bit count are pre-baked into the
+//! entry, so the hot match path resolves a distance from the single LUT load —
+//! no dependent `DISTANCE_BASE[sym]` / `DISTANCE_EXTRA[sym]` lookups on the
+//! critical path. The `Simple` encoding (which returns the bare symbol) is kept
+//! for the precode and the block finder's strict-verify path.
+//!
 //! ## Long codes
 //!
 //! Codes longer than `LUT_BITS` go into a `long_codes` table with a small
 //! linear scan. libdeflate uses a chained subtable here — a follow-on phase
 //! can swap that in if profiles ever show it mattering (currently ~0.1%).
 
-use super::tables::{LENGTH_BASE, LENGTH_EXTRA};
+use super::tables::{DISTANCE_BASE, DISTANCE_EXTRA, LENGTH_BASE, LENGTH_EXTRA};
 use super::{BitReader, DeflateError};
 
 /// LUT prefix length. 10 bits → 1024-entry × 4 B = 4 KiB LUT. Comfortable in
@@ -98,6 +117,7 @@ impl LutStorage {
 pub enum Encoding {
     Simple,
     LitLen,
+    Dist,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -137,6 +157,13 @@ impl HuffmanDecoder {
         Ok(out)
     }
 
+    /// Build a `Dist`-encoded decoder for the distance tree (hot inflate path).
+    pub fn from_lengths_dist(lengths: &[u8]) -> Result<Self, DeflateError> {
+        let mut out = Self::new_empty();
+        out.rebuild_from_lengths_dist(lengths)?;
+        Ok(out)
+    }
+
     /// Empty decoder, ready to be filled in place. Each worker keeps one of
     /// these per role (literal / distance / precode) and rebuilds them once
     /// per dynamic block — see the `DecoderPool` in `speculative.rs`.
@@ -168,6 +195,16 @@ impl HuffmanDecoder {
             lengths,
             false,
             Encoding::LitLen,
+        )
+    }
+
+    pub fn rebuild_from_lengths_dist(&mut self, lengths: &[u8]) -> Result<(), DeflateError> {
+        Self::build_into(
+            &mut self.lut.0,
+            &mut self.long_codes,
+            lengths,
+            false,
+            Encoding::Dist,
         )
     }
 
@@ -373,6 +410,18 @@ fn encode_entry(sym: u16, length: u8, encoding: Encoding) -> u32 {
                 // path can tell them apart from EOB (sym 256), which has
                 // zeros there.
                 HUFFDEC_EXCEPTIONAL | ((sym as u32) << 16) | len
+            }
+        }
+        Encoding::Dist => {
+            if sym <= 29 {
+                let base = DISTANCE_BASE[sym as usize] as u32;
+                let extra = DISTANCE_EXTRA[sym as usize] as u32;
+                (base << 16) | (extra << 8) | len
+            } else {
+                // sym 30/31 are reserved by RFC 1951 and never appear in valid
+                // data. Flag exceptional so the hot path rejects them after the
+                // single LUT load (mirrors the old `dsym >= 30` guard).
+                HUFFDEC_EXCEPTIONAL | len
             }
         }
     }

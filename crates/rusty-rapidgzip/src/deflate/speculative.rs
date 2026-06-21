@@ -46,26 +46,93 @@ impl SpeculativeChunk {
     /// 8 bits) or a marker (high bit set, `prefix_offset` in the low 15 bits).
     /// Markers are emitted in increasing `out_pos` order (scratch scanned
     /// left-to-right), preserving the sorted invariant the serializer relies on.
+    ///
+    /// Two passes instead of one branchy interleaved loop: on marker-saturated
+    /// FASTQ this function is ~40% of the speculative path's cost, and the old
+    /// per-cell `if marker { push marker; push 0 } else { push byte }` branch
+    /// mispredicts heavily (~16% marker rate) *and* blocks the u16→u8 narrowing
+    /// from vectorizing.
+    ///
+    /// - **Pass 1** narrows every cell to its low byte, branch-free, straight
+    ///   into reserved spare capacity. This autovectorizes to a `packuswb`-style
+    ///   u16→u8 pack. Marker cells get a junk low byte here.
+    /// - **Pass 2** records the markers and rewrites their placeholder byte to
+    ///   `0`. The placeholder value is irrelevant downstream (every marker
+    ///   position is overwritten by [`resolve_markers`] before it is read, and
+    ///   in-chunk back-references propagate marker-ness through *cells*, not
+    ///   these bytes), but we keep the `0` to stay byte-identical to the
+    ///   side-table path the tests pin against.
+    #[allow(unsafe_code)]
     pub fn extract_from_u16(&mut self, scratch: &[u16]) {
-        self.bytes.reserve(scratch.len());
-        self.markers.reserve(scratch.len() / 8);
-        let base = self.bytes.len() as u32;
+        let n = scratch.len();
+        let base = self.bytes.len();
+
+        // Pass 1: branch-free narrow of all cells (vectorizes).
+        self.bytes.reserve(n);
+        let spare = self.bytes.spare_capacity_mut();
+        for (d, &c) in spare[..n].iter_mut().zip(scratch) {
+            d.write(c as u8);
+        }
+        // SAFETY: the loop initialised exactly `n` bytes of reserved spare
+        // capacity starting at the old length.
+        unsafe { self.bytes.set_len(base + n) }
+
+        // Pass 2: record markers, zeroing their placeholder byte. Reserve for a
+        // generous marker rate; Vec growth absorbs the rest if it saturates.
+        self.markers.reserve(n / 4);
         let mut last = self.max_marker_pos.unwrap_or(0);
         let mut any = false;
-        for (i, &cell) in scratch.iter().enumerate() {
-            if cell & Self::MARKER16 != 0 {
-                let out_pos = base + i as u32;
+
+        // Record one marker cell. `idx` is in 0..n; `cell` has MARKER16 set.
+        // Markers are visited in ascending `idx`, preserving the sorted-by-
+        // out_pos invariant the serializer relies on.
+        macro_rules! record {
+            ($idx:expr, $cell:expr) => {{
+                let out_pos = (base + $idx) as u32;
                 self.markers.push(Marker {
                     out_pos,
-                    prefix_offset: cell & 0x7fff,
+                    prefix_offset: $cell & 0x7fff,
                 });
-                self.bytes.push(0);
+                self.bytes[base + $idx] = 0;
                 last = out_pos;
                 any = true;
-            } else {
-                self.bytes.push(cell as u8);
+            }};
+        }
+
+        // SSE2 marker scan: instead of a per-cell branch (which mispredicts at
+        // FASTQ's ~16% marker rate), pull the high bit of 8 cells at once with
+        // `movemask` and iterate only the set bits. SSE2 is baseline on
+        // x86_64, so no runtime feature check.
+        #[cfg(all(target_arch = "x86_64", not(miri)))]
+        let tail_start = {
+            use core::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_movemask_epi8};
+            let mut i = 0;
+            while i + 8 <= n {
+                // SAFETY: `i + 8 <= n`, so 8 cells (16 bytes) are in bounds.
+                let v = unsafe { _mm_loadu_si128(scratch.as_ptr().add(i).cast::<__m128i>()) };
+                // Each u16 lane's high byte (MARKER16 = bit 15) lands on an odd
+                // movemask bit (2*lane + 1); 0xAAAA keeps just those.
+                let mut m = (unsafe { _mm_movemask_epi8(v) } as u32) & 0xAAAA;
+                while m != 0 {
+                    let lane = (m.trailing_zeros() >> 1) as usize;
+                    let idx = i + lane;
+                    record!(idx, scratch[idx]);
+                    m &= m - 1;
+                }
+                i += 8;
+            }
+            i
+        };
+        #[cfg(not(all(target_arch = "x86_64", not(miri))))]
+        let tail_start = 0;
+
+        for idx in tail_start..n {
+            let cell = scratch[idx];
+            if cell & Self::MARKER16 != 0 {
+                record!(idx, cell);
             }
         }
+
         if any {
             self.max_marker_pos = Some(last);
         }

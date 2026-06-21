@@ -57,7 +57,7 @@ fn inflate_stored(br: &mut BitReader<'_>, out: &mut Vec<u8>) -> Result<(), Defla
 
 fn inflate_fixed(br: &mut BitReader<'_>, out: &mut Vec<u8>) -> Result<(), DeflateError> {
     let lit = HuffmanDecoder::from_lengths_litlen(&fixed_literal_lengths())?;
-    let dist = HuffmanDecoder::from_lengths(&fixed_distance_lengths())?;
+    let dist = HuffmanDecoder::from_lengths_dist(&fixed_distance_lengths())?;
     decode_block(br, out, &lit, &dist)
 }
 
@@ -140,7 +140,7 @@ pub fn read_dynamic_header(
     }
 
     let lit = HuffmanDecoder::from_lengths_litlen(&lengths[..hlit])?;
-    let dist = HuffmanDecoder::from_lengths(&lengths[hlit..])?;
+    let dist = HuffmanDecoder::from_lengths_dist(&lengths[hlit..])?;
     Ok((lit, dist))
 }
 
@@ -291,8 +291,9 @@ fn decode_block(
             bits -= len_extra;
         }
 
-        // Distance symbol — same LUT pattern.
-        let dsym = {
+        // Distance symbol — Dist-encoded LUT entry carries base + extra-count,
+        // so no dependent DISTANCE_BASE / DISTANCE_EXTRA lookups.
+        let dentry = {
             let idx = (buf & LUT_MASK) as usize;
             let e = dist_lut[idx];
             let len = e & 0xff;
@@ -305,7 +306,7 @@ fn decode_block(
                         buf = br.buf;
                         bits = br.bits;
                         byte_pos = br.byte_pos;
-                        (e >> 16) as u16
+                        e
                     }
                     Err(e) => {
                         // `br` already holds the latest state — we synced
@@ -317,20 +318,19 @@ fn decode_block(
             } else {
                 buf >>= len;
                 bits -= len;
-                (e >> 16) as u16
+                e
             }
         };
 
-        if dsym >= 30 {
+        if dentry & HUFFDEC_EXCEPTIONAL != 0 {
             br.buf = buf;
             br.bits = bits;
             br.byte_pos = byte_pos;
             publish_len!();
             break 'outer Err(DeflateError::Invalid("distance symbol out of range"));
         }
-        let di = dsym as usize;
-        let mut distance = DISTANCE_BASE[di] as usize;
-        let dextra = DISTANCE_EXTRA[di] as u32;
+        let mut distance = (dentry >> 16) as usize;
+        let dextra = (dentry >> 8) & 0x1f;
         if dextra > 0 {
             distance += (buf & ((1u64 << dextra) - 1)) as usize;
             buf >>= dextra;

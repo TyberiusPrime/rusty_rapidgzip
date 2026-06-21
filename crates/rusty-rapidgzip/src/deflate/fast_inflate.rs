@@ -33,7 +33,7 @@
 use super::huffman::{HUFFDEC_EXCEPTIONAL, HUFFDEC_LITERAL, LUT_BITS};
 use super::inflate::read_dynamic_header;
 use super::speculative::SpeculativeChunk;
-use super::tables::{fixed_distance_lengths, fixed_literal_lengths, DISTANCE_BASE, DISTANCE_EXTRA};
+use super::tables::{fixed_distance_lengths, fixed_literal_lengths};
 use super::{BitReader, DeflateError, HuffmanDecoder};
 
 use super::inflate::speculative::{
@@ -185,7 +185,7 @@ fn decode_block<const IS_SPECULATIVE: bool>(
         0 => decode_stored(br, out),
         1 => {
             let lit = HuffmanDecoder::from_lengths_litlen(&fixed_literal_lengths())?;
-            let dist = HuffmanDecoder::from_lengths(&fixed_distance_lengths())?;
+            let dist = HuffmanDecoder::from_lengths_dist(&fixed_distance_lengths())?;
             decode_compressed::<IS_SPECULATIVE>(br, out, &lit, &dist, chunk_base, ctx)
         }
         2 => {
@@ -525,7 +525,10 @@ fn decode_compressed<const IS_SPECULATIVE: bool>(
         }
 
         // ── Distance symbol ──────────────────────────────────────────────────
-        let dsym = {
+        // Dist-encoded entry: base + extra-count are pre-baked, so the match
+        // path needs no dependent DISTANCE_BASE / DISTANCE_EXTRA loads (the
+        // latter sat on the `buf` critical chain via `buf >>= dextra`).
+        let dentry = {
             let idx = (buf & LUT_MASK) as usize;
             let e = dist_lut[idx];
             let len = e & 0xff;
@@ -535,24 +538,23 @@ fn decode_compressed<const IS_SPECULATIVE: bool>(
                 match dist.lookup_long(br) {
                     Ok(e) => {
                         reload_from_br!();
-                        (e >> 16) as u16
+                        e
                     }
                     Err(e) => break 'outer Err(e),
                 }
             } else {
                 buf >>= len;
                 bits -= len;
-                (e >> 16) as u16
+                e
             }
         };
-        if dsym >= 30 {
+        if dentry & HUFFDEC_EXCEPTIONAL != 0 {
             publish_len!();
             sync_br!();
             break 'outer Err(DeflateError::Invalid("distance symbol out of range"));
         }
-        let di = dsym as usize;
-        let mut distance = DISTANCE_BASE[di] as usize;
-        let dextra = DISTANCE_EXTRA[di] as u32;
+        let mut distance = (dentry >> 16) as usize;
+        let dextra = (dentry >> 8) & 0x1f;
         if dextra > 0 {
             distance += (buf & ((1u64 << dextra) - 1)) as usize;
             buf >>= dextra;
@@ -849,7 +851,7 @@ fn decode_block_u16(
         0 => decode_stored_u16(br, scratch, chunk, cur, window_base),
         1 => {
             let lit = HuffmanDecoder::from_lengths_litlen(&fixed_literal_lengths())?;
-            let dist = HuffmanDecoder::from_lengths(&fixed_distance_lengths())?;
+            let dist = HuffmanDecoder::from_lengths_dist(&fixed_distance_lengths())?;
             decode_compressed_u16(br, scratch, chunk, &lit, &dist, cur, window_base)
         }
         2 => {
@@ -1049,7 +1051,8 @@ fn decode_compressed_u16(
         }
 
         // ── Distance symbol ──────────────────────────────────────────────────
-        let dsym = {
+        // Dist-encoded entry carries base + extra-count (see the u8 path).
+        let dentry = {
             let idx = (buf & LUT_MASK) as usize;
             let e = dist_lut[idx];
             let len = e & 0xff;
@@ -1058,23 +1061,22 @@ fn decode_compressed_u16(
                 match dist.lookup_long(br) {
                     Ok(e) => {
                         reload_from_br!();
-                        (e >> 16) as u16
+                        e
                     }
                     Err(e) => break 'outer Err(e),
                 }
             } else {
                 buf >>= len;
                 bits -= len;
-                (e >> 16) as u16
+                e
             }
         };
-        if dsym >= 30 {
+        if dentry & HUFFDEC_EXCEPTIONAL != 0 {
             sync_br!();
             break 'outer Err(DeflateError::Invalid("distance symbol out of range"));
         }
-        let di = dsym as usize;
-        let mut distance = DISTANCE_BASE[di] as usize;
-        let dextra = DISTANCE_EXTRA[di] as u32;
+        let mut distance = (dentry >> 16) as usize;
+        let dextra = (dentry >> 8) & 0x1f;
         if dextra > 0 {
             distance += (buf & ((1u64 << dextra) - 1)) as usize;
             buf >>= dextra;
