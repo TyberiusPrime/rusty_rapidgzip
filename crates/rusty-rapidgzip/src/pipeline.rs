@@ -1339,62 +1339,20 @@ pub fn parallel_decode_bgzf(
     let num_threads = effective_threads(config);
     let verbose = config.verbose.is_on();
 
-    // Walk member boundaries up front. The walk stops at the first member that
-    // is not a BGZF block; everything before `pos` is decoded here in parallel.
-    // A non-BGZF member is not necessarily an error: a file may be BGZF blocks
-    // with a plain gzip member concatenated on the end (e.g. `cat a.bgz b.gz`).
-    // In that case `pos` marks where the regular member path takes over below.
-    let mut members: Vec<(usize, usize)> = Vec::new();
-    let mut pos = 0usize;
-    while pos < file.len() {
-        let Some(size) = crate::gzip::parse_bgzf_block_size(&file[pos..]) else {
-            break;
-        };
-        let size = size as usize;
-        if pos + size > file.len() {
-            return Err(Error::Gzip(crate::gzip::GzipError::Truncated));
-        }
-        members.push((pos, pos + size));
-        pos += size;
-    }
-    // Byte offset where the non-BGZF remainder (if any) begins.
-    let remainder_offset = pos;
+    // The BGZF member walk is sequential — each block's offset needs the prior
+    // block's BSIZE — and on a large file it first-touches ~100K mmap header
+    // pages (tens of ms of minor faults). Doing it up front made it a serial
+    // prefix that, at high thread counts, capped scaling (Amdahl: ~24% of the
+    // -P32 wall on a 1.6 GiB file). So we run the walk in the dispatch thread,
+    // emitting batches as it discovers them, OVERLAPPING the walk with worker
+    // decode. Each work item carries its own batch's member ranges; there is no
+    // shared member array. Target batch size ramps from small (start every
+    // worker quickly) up to `chunk_size_bytes` (steady-state amortization).
 
-    // Batch members so each work item covers ~chunk_size_bytes of compressed
-    // input. With BGZF blocks typically ~16 KiB compressed, a 4 MiB chunk
-    // groups ~256 members — enough amortization to keep workers busy. But
-    // for small files we'd end up with one giant batch; cap by the total
-    // size divided by (num_threads × 4) so every worker gets several batches.
-    let total_compressed: usize = members.iter().map(|(s, e)| e - s).sum();
-    let per_worker_target = total_compressed / (num_threads * 4).max(1);
-    let target = config
-        .chunk_size_bytes
-        .min(per_worker_target.max(64 * 1024))
-        .max(64 * 1024);
-    let mut batches: Vec<(usize, usize)> = Vec::new(); // (start_member, end_member) exclusive
-    let mut i = 0;
-    while i < members.len() {
-        let start = i;
-        let mut bytes = 0usize;
-        while i < members.len() && (bytes == 0 || bytes < target) {
-            bytes += members[i].1 - members[i].0;
-            i += 1;
-        }
-        batches.push((start, i));
-    }
-
-    if verbose {
-        eprintln!(
-            "[rapidgzip +{:.2}s] bgzf: {} members → {} batch(es), {} worker(s)",
-            crate::elapsed_since_start(),
-            members.len(),
-            batches.len(),
-            num_threads,
-        );
-    }
-
-    // Work channel: (batch_id, member_start, member_end_exclusive).
-    let (work_tx, work_rx) = bounded::<(u64, usize, usize)>(num_threads * 2);
+    // Work channel: (batch_id, first absolute member index, member ranges).
+    // The member index is only carried so the pure-Rust no-backend path can name
+    // the offending member in a CRC-mismatch error.
+    let (work_tx, work_rx) = bounded::<(u64, u32, Vec<(usize, usize)>)>(num_threads * 2);
     let (result_tx, result_rx) = bounded::<Result<(u64, Vec<u8>), Error>>(num_threads * 2);
 
     let mut workers = Vec::with_capacity(num_threads);
@@ -1402,7 +1360,12 @@ pub fn parallel_decode_bgzf(
         let work_rx = work_rx.clone();
         let result_tx = result_tx.clone();
         let file = Arc::clone(&file);
-        let members_ref: Vec<(usize, usize)> = members.clone();
+        // Recycled output buffers: pull a warm, already-faulted Vec per batch
+        // instead of allocating (and on free, munmap-ing) a fresh ~12 MiB buffer
+        // every time. Without this the per-batch large alloc/free churns the
+        // page-fault + mmap path and, at high thread counts, that kernel
+        // contention — not decode — caps BGZF scaling (sys time balloons).
+        let recycle_rx = config.recycle_rx.clone();
         workers.push(thread::spawn(move || {
             // Each BGZF block is a complete, self-contained gzip member, so the
             // `libdeflate` feature decodes them with libdeflate's full gzip path
@@ -1414,17 +1377,21 @@ pub fn parallel_decode_bgzf(
             let isal_decompressor = crate::isal_ffi::Decompressor::default();
             #[cfg(all(feature = "zlib-rs", not(any(feature = "libdeflate", feature = "isal"))))]
             let mut zlibrs_decompressor = crate::zlibrs_ffi::Decompressor::default();
-            while let Ok((id, m_start, m_end)) = work_rx.recv() {
+            while let Ok((id, first_member, batch_members)) = work_rx.recv() {
                 // BGZF blocks are ≤64 KiB uncompressed; preallocate to avoid
-                // Vec growth reallocations inside the inflate hot loop.
-                let mut out: Vec<u8> = Vec::with_capacity((m_end - m_start) * 65_536);
+                // Vec growth reallocations inside the inflate hot loop. Reuse a
+                // recycled buffer when one is available (warm pages).
+                let mut out: Vec<u8> = recycle_rx
+                    .as_ref()
+                    .and_then(|r| r.try_recv().ok())
+                    .unwrap_or_default();
+                out.clear();
+                out.reserve(batch_members.len() * 65_536);
                 let mut err: Option<Error> = None;
-                #[expect(
-                    clippy::needless_range_loop,
-                    reason = "mi is the absolute member index — used both to index members_ref and as the member id passed to decode_one_indexed_fast"
-                )]
-                for mi in m_start..m_end {
-                    let (s, e) = members_ref[mi];
+                for (offset, &(s, e)) in batch_members.iter().enumerate() {
+                    // `first_member`/`offset` name the member only in the
+                    // pure-Rust no-backend CRC-mismatch path; otherwise unused.
+                    let _ = (first_member, offset);
                     #[cfg(feature = "libdeflate")]
                     let res = crate::libdeflate_ffi::decode_gzip_member(
                         &decompressor,
@@ -1458,8 +1425,12 @@ pub fn parallel_decode_bgzf(
                         feature = "zlib-rs",
                         feature = "zune"
                     )))]
-                    let res = crate::gzip::decode_one_indexed_fast(&file[s..e], &mut out, mi as u32)
-                        .map_err(Error::Gzip);
+                    let res = crate::gzip::decode_one_indexed_fast(
+                        &file[s..e],
+                        &mut out,
+                        first_member + offset as u32,
+                    )
+                    .map_err(Error::Gzip);
                     match res {
                         Ok(_) => {}
                         Err(e) => {
@@ -1484,23 +1455,74 @@ pub fn parallel_decode_bgzf(
     // sink (same default-on policy as the speculative path; see [`InflightCap`]).
     let inflight = make_inflight_cap(num_threads, inflight_factor());
 
-    // Dispatch all work items, then close the work channel. The in-flight cap
-    // throttles how many decoded batches may be outstanding (acquire here,
-    // released at the sink).
+    // Dispatch thread: walk the BGZF members and emit batches as they're
+    // discovered (overlapping the sequential walk with worker decode), then
+    // close the work channel. The in-flight cap throttles how many decoded
+    // batches may be outstanding (acquire here, released at the sink). Returns
+    // `(remainder_offset, n_members, n_batches, walk_error)`.
+    let chunk_target = config.chunk_size_bytes.max(64 * 1024);
     let dispatch = {
         let inflight = inflight.clone();
-        thread::spawn(move || {
-            for (id, &(s, e)) in batches.iter().enumerate() {
-                if let Some(cap) = &inflight {
-                    if !cap.acquire() {
-                        return; // cap shut down during teardown
+        let file = Arc::clone(&file);
+        thread::spawn(move || -> (usize, u64, u64, Option<Error>) {
+            let mut pos = 0usize;
+            let mut id: u64 = 0;
+            let mut n_members: u64 = 0;
+            let mut first_member: u32 = 0;
+            let mut cur: Vec<(usize, usize)> = Vec::new();
+            let mut cur_bytes = 0usize;
+            // Ramp the batch target from small up to `chunk_target`: tiny early
+            // batches get every worker busy while the walk is still running;
+            // steady state amortizes per-batch overhead at the full chunk size.
+            let mut target = 64 * 1024usize;
+            let mut walk_err: Option<Error> = None;
+
+            // Emit `cur` as a batch. Returns false if the pipeline is shutting
+            // down (cap closed / sink gone) and the walk should stop.
+            macro_rules! flush {
+                () => {{
+                    if let Some(cap) = &inflight {
+                        if !cap.acquire() {
+                            return (pos, n_members, id, walk_err);
+                        }
                     }
+                    let batch_first = first_member;
+                    first_member += cur.len() as u32;
+                    let batch = std::mem::take(&mut cur);
+                    cur_bytes = 0;
+                    if work_tx.send((id, batch_first, batch)).is_err() {
+                        return (pos, n_members, id, walk_err);
+                    }
+                    id += 1;
+                }};
+            }
+
+            while pos < file.len() {
+                let Some(size) = crate::gzip::parse_bgzf_block_size(&file[pos..]) else {
+                    break; // first non-BGZF member: the remainder starts at `pos`
+                };
+                let size = size as usize;
+                if pos + size > file.len() {
+                    walk_err = Some(Error::Gzip(crate::gzip::GzipError::Truncated));
+                    break;
                 }
-                if work_tx.send((id as u64, s, e)).is_err() {
-                    return;
+                cur.push((pos, pos + size));
+                cur_bytes += size;
+                pos += size;
+                n_members += 1;
+                if cur_bytes >= target {
+                    flush!();
+                    target = (target * 2).min(chunk_target);
                 }
             }
+            if !cur.is_empty() {
+                flush!();
+            }
             drop(work_tx);
+            // `first_member`/`cur_bytes` get a final dead write inside `flush!`;
+            // touch them so the trailing assignment isn't flagged unused.
+            let _ = (first_member, cur_bytes);
+            (pos, n_members, id, walk_err)
         })
     };
 
@@ -1547,12 +1569,25 @@ pub fn parallel_decode_bgzf(
     if let Some(cap) = &inflight {
         cap.shutdown();
     }
-    let _ = dispatch.join();
+    let (remainder_offset, n_members, n_batches, walk_err) =
+        dispatch.join().unwrap_or((file.len(), 0, 0, None));
     for w in workers {
         let _ = w.join();
     }
 
-    if let Some(e) = last_err {
+    if verbose {
+        eprintln!(
+            "[rapidgzip +{:.2}s] bgzf: {} members → {} batch(es), {} worker(s)",
+            crate::elapsed_since_start(),
+            n_members,
+            n_batches,
+            num_threads,
+        );
+    }
+
+    // A truncation discovered mid-walk surfaces here (the valid prefix was still
+    // streamed); a sink/serializer error takes precedence.
+    if let Some(e) = last_err.or(walk_err) {
         return Err(e);
     }
 

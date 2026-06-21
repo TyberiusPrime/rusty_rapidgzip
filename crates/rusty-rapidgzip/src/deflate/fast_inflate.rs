@@ -1026,6 +1026,9 @@ fn decode_compressed_u16(
         if entry & HUFFDEC_LITERAL != 0 {
             // Mask to the literal byte: `entry >> 16` would otherwise carry
             // HUFFDEC_LITERAL (bit 31) into bit 15, colliding with MARKER16.
+            // (The u8 kernel's double-literal trick was tried here and measured
+            // neutral — this path is store-bound on the 2-byte cell, not
+            // refill-bound, so amortising the refill buys nothing.)
             unsafe { *out_ptr.add(cur) = ((entry >> 16) & 0xff) as u16 };
             cur += 1;
             continue 'outer;
