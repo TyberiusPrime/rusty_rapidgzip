@@ -15,6 +15,11 @@
 //! byte-aligned gzip-trailer start is `total_in - unused_bits / 8`.
 
 #![allow(unsafe_code)]
+// In the kernel A/B/C/D microbench build (e.g. `--features "libdeflate zlib-rs"`
+// or `"isal zlib-rs"`, test-only) this module is compiled for the bench but the
+// pipeline routes through the other backend, so the gzip-member entry points
+// look unused here.
+#![cfg_attr(all(test, any(feature = "libdeflate", feature = "isal")), allow(dead_code))]
 
 use std::os::raw::c_int;
 

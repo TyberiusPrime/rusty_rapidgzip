@@ -643,7 +643,17 @@ impl<'a> DeflateDecoder<'a>
         // re-read the stream so that we can remove code read by zlib
         self.stream = BitStreamReader::new(&self.data[self.position..]);
 
-        self.stream.refill();
+        // PERF PATCH (rusty-rapidgzip): hold the bitstream in a local for the hot
+        // decode loop so `buffer`/`bits_left` stay in registers instead of being
+        // reloaded from / stored to `self.stream` (through the `&mut self`
+        // pointer) on every symbol — LLVM can't prove the output writes don't
+        // alias the struct, so it spilled them. Same trick zlib-rs uses
+        // (`mem::swap` the bit_reader into a local). Synced back around the cold
+        // `build_decode_table` call and at the success return (`input_position`
+        // reads `self.stream`).
+        let mut stream = core::mem::replace(&mut self.stream, BitStreamReader::new(&[]));
+
+        stream.refill();
 
         // bits used
 
@@ -652,10 +662,10 @@ impl<'a> DeflateDecoder<'a>
 
         loop
         {
-            self.stream.refill();
+            stream.refill();
 
-            self.is_last_block = self.stream.get_bits(1) == 1;
-            let block_type = self.stream.get_bits(2);
+            self.is_last_block = stream.get_bits(1) == 1;
+            let block_type = stream.get_bits(2);
 
             if block_type == DEFLATE_BLOCKTYPE_UNCOMPRESSED
             {
@@ -671,7 +681,7 @@ impl<'a> DeflateDecoder<'a>
                  *     copy LEN bytes of data to output
                  */
 
-                if self.stream.over_read > usize::from(self.stream.get_bits_left() >> 3)
+                if stream.over_read > usize::from(stream.get_bits_left() >> 3)
                 {
                     out_block.truncate(dest_offset);
 
@@ -680,12 +690,12 @@ impl<'a> DeflateDecoder<'a>
 
                     return Err(error);
                 }
-                let partial_bits = self.stream.get_bits_left() & 7;
+                let partial_bits = stream.get_bits_left() & 7;
 
-                self.stream.drop_bits(partial_bits);
+                stream.drop_bits(partial_bits);
 
-                let len = self.stream.get_bits(16) as u16;
-                let nlen = self.stream.get_bits(16) as u16;
+                let len = stream.get_bits(16) as u16;
+                let nlen = stream.get_bits(16) as u16;
 
                 // copy to deflate
                 if len != !nlen
@@ -699,7 +709,7 @@ impl<'a> DeflateDecoder<'a>
                 }
                 let len = len as usize;
 
-                let start = self.stream.get_position() + self.position + self.stream.over_read;
+                let start = stream.get_position() + self.position + stream.over_read;
 
                 // ensure there is enough space for a fast copy
                 if dest_offset + len + FASTCOPY_BYTES > out_block.len()
@@ -736,10 +746,10 @@ impl<'a> DeflateDecoder<'a>
                 dest_offset += len;
 
                 // get the new position to write.
-                self.stream.position =
-                    len + (self.stream.position - usize::from(self.stream.bits_left >> 3));
+                stream.position =
+                    len + (stream.position - usize::from(stream.bits_left >> 3));
 
-                self.stream.reset();
+                stream.reset();
 
                 if self.is_last_block
                 {
@@ -758,8 +768,13 @@ impl<'a> DeflateDecoder<'a>
                 return Err(error);
             }
 
-            // build decode tables for static and dynamic tables
-            match self.build_decode_table(block_type)
+            // build decode tables for static and dynamic tables. This reads the
+            // dynamic-header bits, so it needs the live stream: sync it in, then
+            // reclaim it back into the local afterwards (cold — once per block).
+            self.stream = stream;
+            let table_result = self.build_decode_table(block_type);
+            stream = core::mem::replace(&mut self.stream, BitStreamReader::new(&[]));
+            match table_result
             {
                 Ok(_) => (),
                 Err(value) =>
@@ -792,13 +807,13 @@ impl<'a> DeflateDecoder<'a>
 
             'decode: loop
             {
-                let close_src = 3 * FASTCOPY_BYTES < self.stream.remaining_bytes();
+                let close_src = 3 * FASTCOPY_BYTES < stream.remaining_bytes();
 
                 if close_src
                 {
-                    self.stream.refill_inner_loop();
+                    stream.refill_inner_loop();
 
-                    let lit_mask = self.stream.peek_bits::<LITLEN_DECODE_BITS>();
+                    let lit_mask = stream.peek_bits::<LITLEN_DECODE_BITS>();
 
                     entry = litlen_decode_table[lit_mask];
 
@@ -818,22 +833,22 @@ impl<'a> DeflateDecoder<'a>
                         // recheck after every sequence
                         // when we hit continue, we need to recheck this
                         // as we are trying to emulate a do while
-                        let new_check = self.stream.src.len() < self.stream.position + 8;
+                        let new_check = stream.src.len() < stream.position + 8;
 
                         if new_check
                         {
                             break 'sequence;
                         }
 
-                        self.stream.refill_inner_loop();
+                        stream.refill_inner_loop();
                         /*
                          * Consume the bits for the litlen decode table entry.  Save the
                          * original bit-buf for later, in case the extra match length
                          * bits need to be extracted from it.
                          */
-                        saved_bitbuf = self.stream.buffer;
+                        saved_bitbuf = stream.buffer;
 
-                        self.stream.drop_bits((entry & 0xFF) as u8);
+                        stream.drop_bits((entry & 0xFF) as u8);
 
                         /*
                          * Begin by checking for a "fast" literal, i.e. a literal that
@@ -854,20 +869,24 @@ impl<'a> DeflateDecoder<'a>
 
                             literal = entry >> 16;
 
-                            let new_pos = self.stream.peek_bits::<LITLEN_DECODE_BITS>();
+                            let new_pos = stream.peek_bits::<LITLEN_DECODE_BITS>();
 
                             entry = litlen_decode_table[new_pos];
-                            saved_bitbuf = self.stream.buffer;
+                            saved_bitbuf = stream.buffer;
 
-                            self.stream.drop_bits(entry as u8);
+                            stream.drop_bits(entry as u8);
 
-                            let out: &mut [u8; 2] = out_block
-                                .get_mut(dest_offset..dest_offset + 2)
-                                .unwrap()
-                                .try_into()
-                                .unwrap();
+                            // PERF PATCH: unchecked stores. The resize at the top
+                            // of 'sequence guarantees out_block.len() >=
+                            // dest_offset + FASTLOOP_MAX_BYTES_WRITTEN, and
+                            // FASTLOOP_MAX_BYTES_WRITTEN >> 2, so dest_offset and
+                            // dest_offset+1 are in bounds. out_block isn't resized
+                            // between here and the writes, so the cached pointer
+                            // stays valid. This drops the per-literal bounds-check
+                            // + try_into the safe slice path leaves in.
+                            let out_ptr = out_block.as_mut_ptr();
 
-                            out[0] = literal as u8;
+                            unsafe { *out_ptr.add(dest_offset) = literal as u8 };
                             dest_offset += 1;
 
                             if (entry & HUFFDEC_LITERAL) != 0
@@ -880,11 +899,11 @@ impl<'a> DeflateDecoder<'a>
                                 // load in the next entry.
                                 literal = entry >> 16;
 
-                                let new_pos = self.stream.peek_bits::<LITLEN_DECODE_BITS>();
+                                let new_pos = stream.peek_bits::<LITLEN_DECODE_BITS>();
 
                                 entry = litlen_decode_table[new_pos];
 
-                                out[1] = literal as u8;
+                                unsafe { *out_ptr.add(dest_offset) = literal as u8 };
                                 dest_offset += 1;
 
                                 continue;
@@ -911,17 +930,17 @@ impl<'a> DeflateDecoder<'a>
                             let entry_position = ((entry >> 8) & 0x3F) as usize;
                             let mut pos = (entry >> 16) as usize;
 
-                            saved_bitbuf = self.stream.buffer;
+                            saved_bitbuf = stream.buffer;
 
-                            pos += self.stream.peek_var_bits(entry_position);
+                            pos += stream.peek_var_bits(entry_position);
                             entry = litlen_decode_table[pos.min(LITLEN_ENOUGH - 1)];
 
-                            self.stream.drop_bits(entry as u8);
+                            stream.drop_bits(entry as u8);
 
                             if (entry & HUFFDEC_LITERAL) != 0
                             {
                                 // decode a literal that required a sub table
-                                let new_pos = self.stream.peek_bits::<LITLEN_DECODE_BITS>();
+                                let new_pos = stream.peek_bits::<LITLEN_DECODE_BITS>();
 
                                 literal = entry >> 16;
                                 entry = litlen_decode_table[new_pos];
@@ -955,7 +974,7 @@ impl<'a> DeflateDecoder<'a>
                          */
                         let entry_dup = entry;
 
-                        entry = offset_decode_table[self.stream.peek_bits::<OFFSET_TABLEBITS>()];
+                        entry = offset_decode_table[stream.peek_bits::<OFFSET_TABLEBITS>()];
                         length = (entry_dup >> 16) as usize;
 
                         let mask = (1 << entry_dup as u8) - 1;
@@ -965,15 +984,15 @@ impl<'a> DeflateDecoder<'a>
                         // offset requires a subtable
                         if (entry & HUFFDEC_EXCEPTIONAL) != 0
                         {
-                            self.stream.drop_bits(OFFSET_TABLEBITS as u8);
-                            let extra = self.stream.peek_var_bits(((entry >> 8) & 0x3F) as usize);
+                            stream.drop_bits(OFFSET_TABLEBITS as u8);
+                            let extra = stream.peek_var_bits(((entry >> 8) & 0x3F) as usize);
                             entry = offset_decode_table[((entry >> 16) as usize + extra) & 511];
                             // refill to handle some weird edge case where we have
                             // less bits than needed for reading the lit-len
                         }
-                        saved_bitbuf = self.stream.buffer;
+                        saved_bitbuf = stream.buffer;
 
-                        self.stream.drop_bits((entry & 0xFF) as u8);
+                        stream.drop_bits((entry & 0xFF) as u8);
 
                         let mask = (1 << entry as u8) - 1;
 
@@ -992,9 +1011,9 @@ impl<'a> DeflateDecoder<'a>
 
                         src_offset = dest_offset - offset;
 
-                        if self.stream.bits_left < 11
+                        if stream.bits_left < 11
                         {
-                            self.stream.refill_inner_loop();
+                            stream.refill_inner_loop();
                         }
                         // Copy some bytes unconditionally
                         // This makes us copy smaller match lengths quicker because we don't need
@@ -1005,7 +1024,7 @@ impl<'a> DeflateDecoder<'a>
                             dest_offset
                         );
 
-                        entry = litlen_decode_table[self.stream.peek_bits::<LITLEN_DECODE_BITS>()];
+                        entry = litlen_decode_table[stream.peek_bits::<LITLEN_DECODE_BITS>()];
 
                         let mut current_position = dest_offset;
 
@@ -1106,7 +1125,7 @@ impl<'a> DeflateDecoder<'a>
                             return Err(error);
                         }
 
-                        if self.stream.src.len() < self.stream.position + 8
+                        if stream.src.len() < stream.position + 8
                         {
                             // close to input end, move to the slower one
                             break 'sequence;
@@ -1120,9 +1139,9 @@ impl<'a> DeflateDecoder<'a>
                 // assurances of the fast loop bits above.
                 loop
                 {
-                    self.stream.refill();
+                    stream.refill();
 
-                    if self.stream.over_read > usize::from(self.stream.bits_left >> 3)
+                    if stream.over_read > usize::from(stream.bits_left >> 3)
                     {
                         out_block.truncate(dest_offset);
 
@@ -1132,22 +1151,22 @@ impl<'a> DeflateDecoder<'a>
                         return Err(error);
                     }
 
-                    let literal_mask = self.stream.peek_bits::<LITLEN_DECODE_BITS>();
+                    let literal_mask = stream.peek_bits::<LITLEN_DECODE_BITS>();
 
                     entry = litlen_decode_table[literal_mask];
 
-                    saved_bitbuf = self.stream.buffer;
+                    saved_bitbuf = stream.buffer;
 
-                    self.stream.drop_bits((entry & 0xFF) as u8);
+                    stream.drop_bits((entry & 0xFF) as u8);
 
                     if (entry & HUFFDEC_SUITABLE_POINTER) != 0
                     {
-                        let extra = self.stream.peek_var_bits(((entry >> 8) & 0x3F) as usize);
+                        let extra = stream.peek_var_bits(((entry >> 8) & 0x3F) as usize);
 
                         entry = litlen_decode_table[(entry >> 16) as usize + extra];
-                        saved_bitbuf = self.stream.buffer;
+                        saved_bitbuf = stream.buffer;
 
-                        self.stream.drop_bits((entry & 0xFF) as u8);
+                        stream.drop_bits((entry & 0xFF) as u8);
                     }
 
                     length = (entry >> 16) as usize;
@@ -1170,16 +1189,16 @@ impl<'a> DeflateDecoder<'a>
 
                     length += (saved_bitbuf & mask) as usize >> ((entry >> 8) as u8);
 
-                    self.stream.refill();
+                    stream.refill();
 
-                    entry = offset_decode_table[self.stream.peek_bits::<OFFSET_TABLEBITS>()];
+                    entry = offset_decode_table[stream.peek_bits::<OFFSET_TABLEBITS>()];
 
                     if (entry & HUFFDEC_EXCEPTIONAL) != 0
                     {
                         // offset requires a subtable
-                        self.stream.drop_bits(OFFSET_TABLEBITS as u8);
+                        stream.drop_bits(OFFSET_TABLEBITS as u8);
 
-                        let extra = self.stream.peek_var_bits(((entry >> 8) & 0x3F) as usize);
+                        let extra = stream.peek_var_bits(((entry >> 8) & 0x3F) as usize);
 
                         entry = offset_decode_table[((entry >> 16) as usize + extra) & 511];
                     }
@@ -1190,7 +1209,7 @@ impl<'a> DeflateDecoder<'a>
                         let new_len = out_block.len() + RESIZE_BY + length;
                         out_block.resize(new_len, 0);
                     }
-                    saved_bitbuf = self.stream.buffer;
+                    saved_bitbuf = stream.buffer;
 
                     let mask = (1 << (entry & 0xFF) as u8) - 1;
 
@@ -1209,7 +1228,7 @@ impl<'a> DeflateDecoder<'a>
 
                     src_offset = dest_offset - offset;
 
-                    self.stream.drop_bits(entry as u8);
+                    stream.drop_bits(entry as u8);
 
                     let (dest_src, dest_ptr) = out_block.split_at_mut(dest_offset);
 
@@ -1243,7 +1262,7 @@ impl<'a> DeflateDecoder<'a>
              * If any of the implicit appended zero bytes were consumed (not just
              * refilled) before hitting end of stream, then the data is bad.
              */
-            if self.stream.over_read > usize::from(self.stream.bits_left >> 3)
+            if stream.over_read > usize::from(stream.bits_left >> 3)
             {
                 out_block.truncate(dest_offset);
 
@@ -1260,6 +1279,9 @@ impl<'a> DeflateDecoder<'a>
         }
 
         // decompression. DONE
+        // PERF PATCH: sync the local bitstream back so `input_position()` (reads
+        // `self.stream.position`/`over_read`) reports the right trailer offset.
+        self.stream = stream;
         // LOCAL PATCH: return the (untruncated) buffer + decoded length so the
         // caller can reuse the allocation; `start_deflate_block` truncates.
         Ok((out_block, dest_offset))

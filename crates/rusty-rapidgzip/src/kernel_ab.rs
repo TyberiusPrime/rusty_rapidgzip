@@ -17,7 +17,7 @@
 
 use std::time::Instant;
 
-use crate::deflate::fast_inflate::{decode_member_u8, decode_until_u16};
+use crate::deflate::fast_inflate::{decode_member_u8, decode_member_u8_preload, decode_until_u16};
 use crate::deflate::SpeculativeChunk;
 use crate::zlibrs_ffi::{self, ZlibOutcome};
 
@@ -32,6 +32,68 @@ fn load_fixture() -> (Vec<u8>, usize) {
     (body, plainlen)
 }
 
+#[cfg(feature = "zune")]
+fn bench_zune(body: &[u8], plainlen: usize, iters: usize) -> f64 {
+    use zune_inflate::{DeflateDecoder, DeflateOptions};
+    // Decode straight into a reusable scratch (the patched `decode_deflate_into`),
+    // isolating the libdeflate-port decode loop — no copy to `out`.
+    let mut scratch: Vec<u8> = vec![0u8; plainlen + 4096];
+    let opts = DeflateOptions::default().set_size_hint(plainlen + 4096);
+    let mut dec = DeflateDecoder::new_with_options(body, opts);
+    let len = dec.decode_deflate_into(&mut scratch).unwrap();
+    assert_eq!(len, plainlen, "zune: output length mismatch");
+
+    let t = Instant::now();
+    for _ in 0..iters {
+        let mut dec = DeflateDecoder::new_with_options(body, opts);
+        let _ = dec.decode_deflate_into(&mut scratch).unwrap();
+    }
+    let secs = t.elapsed().as_secs_f64();
+    (plainlen as f64 * iters as f64) / secs / 1e6
+}
+
+#[cfg(feature = "isal")]
+fn bench_isal(body: &[u8], plainlen: usize, iters: usize) -> f64 {
+    use crate::isal_ffi::{decode_member, Decompressor, IsalOutcome};
+    let d = Decompressor::default();
+    let mut out = Vec::with_capacity(plainlen + 4096);
+    out.clear();
+    match decode_member(&d, body, 0, u64::MAX, &mut out).unwrap() {
+        IsalOutcome::Done(..) => {}
+        IsalOutcome::Straddle => panic!("unexpected straddle"),
+    }
+    assert_eq!(out.len(), plainlen, "isal: output length mismatch");
+
+    let t = Instant::now();
+    for _ in 0..iters {
+        out.clear();
+        let _ = decode_member(&d, body, 0, u64::MAX, &mut out).unwrap();
+    }
+    let secs = t.elapsed().as_secs_f64();
+    (plainlen as f64 * iters as f64) / secs / 1e6
+}
+
+#[cfg(feature = "libdeflate")]
+fn bench_libdeflate(body: &[u8], plainlen: usize, iters: usize) -> f64 {
+    use crate::libdeflate_ffi::{decode_member, Decompressor, LdOutcome};
+    let d = Decompressor::default();
+    let mut out = Vec::with_capacity(plainlen + 4096);
+    out.clear();
+    match decode_member(&d, body, 0, u64::MAX, &mut out).unwrap() {
+        LdOutcome::Done(..) => {}
+        LdOutcome::Straddle => panic!("unexpected straddle"),
+    }
+    assert_eq!(out.len(), plainlen, "libdeflate: output length mismatch");
+
+    let t = Instant::now();
+    for _ in 0..iters {
+        out.clear();
+        let _ = decode_member(&d, body, 0, u64::MAX, &mut out).unwrap();
+    }
+    let secs = t.elapsed().as_secs_f64();
+    (plainlen as f64 * iters as f64) / secs / 1e6
+}
+
 fn bench_ours(body: &[u8], plainlen: usize, iters: usize) -> f64 {
     let mut out = Vec::with_capacity(plainlen + 4096);
     // warmup + correctness
@@ -43,6 +105,21 @@ fn bench_ours(body: &[u8], plainlen: usize, iters: usize) -> f64 {
     for _ in 0..iters {
         out.clear();
         let _ = decode_member_u8(body, 0, u64::MAX, &mut out).unwrap();
+    }
+    let secs = t.elapsed().as_secs_f64();
+    (plainlen as f64 * iters as f64) / secs / 1e6
+}
+
+fn bench_preload(body: &[u8], plainlen: usize, iters: usize) -> f64 {
+    let mut out = Vec::with_capacity(plainlen + 4096);
+    out.clear();
+    let _ = decode_member_u8_preload(body, 0, u64::MAX, &mut out).unwrap();
+    assert_eq!(out.len(), plainlen, "preload: output length mismatch");
+
+    let t = Instant::now();
+    for _ in 0..iters {
+        out.clear();
+        let _ = decode_member_u8_preload(body, 0, u64::MAX, &mut out).unwrap();
     }
     let secs = t.elapsed().as_secs_f64();
     (plainlen as f64 * iters as f64) / secs / 1e6
@@ -163,15 +240,35 @@ fn run() {
 
     match which.as_str() {
         "ours" => eprintln!("ours    : {:8.1} MB/s", bench_ours(&body, plainlen, iters)),
+        "preload" => eprintln!(
+            "preload : {:8.1} MB/s",
+            bench_preload(&body, plainlen, iters)
+        ),
         "zlibrs" => eprintln!("zlibrs  : {:8.1} MB/s", bench_zlibrs(&body, plainlen, iters)),
         "u16" => eprintln!("u16     : {:8.1} MB/s", bench_u16(&body, plainlen, iters)),
+        #[cfg(feature = "libdeflate")]
+        "libdeflate" => eprintln!(
+            "libdeflate: {:8.1} MB/s",
+            bench_libdeflate(&body, plainlen, iters)
+        ),
+        #[cfg(feature = "isal")]
+        "isal" => eprintln!("isal    : {:8.1} MB/s", bench_isal(&body, plainlen, iters)),
+        #[cfg(feature = "zune")]
+        "zune" => eprintln!("zune    : {:8.1} MB/s", bench_zune(&body, plainlen, iters)),
         _ => {
             let o = bench_ours(&body, plainlen, iters);
+            let p = bench_preload(&body, plainlen, iters);
             let z = bench_zlibrs(&body, plainlen, iters);
             let u = bench_u16(&body, plainlen, iters);
-            eprintln!("ours    : {o:8.1} MB/s  (1.00x)");
-            eprintln!("zlibrs  : {z:8.1} MB/s  ({:.2}x ours)", z / o);
-            eprintln!("u16     : {u:8.1} MB/s  ({:.2}x ours)", u / o);
+            eprintln!("ours      : {o:8.1} MB/s  (1.00x)");
+            eprintln!("preload   : {p:8.1} MB/s  ({:.2}x ours)", p / o);
+            eprintln!("zlibrs    : {z:8.1} MB/s  ({:.2}x ours)", z / o);
+            #[cfg(feature = "libdeflate")]
+            {
+                let l = bench_libdeflate(&body, plainlen, iters);
+                eprintln!("libdeflate: {l:8.1} MB/s  ({:.2}x ours, {:.2}x zlibrs)", l / o, l / z);
+            }
+            eprintln!("u16       : {u:8.1} MB/s  ({:.2}x ours)", u / o);
         }
     }
 }

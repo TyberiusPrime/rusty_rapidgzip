@@ -159,7 +159,7 @@ fn decode_subsequent_member(
         }
         LdOutcome::Straddle => {
             LD_STRADDLE.fetch_add(1, Relaxed);
-            fast_inflate::decode_member_u8(body, pos, end_bit_hint, out)
+            fast_inflate::decode_member_u8_preload(body, pos, end_bit_hint, out)
         }
     }
 }
@@ -183,7 +183,7 @@ fn decode_subsequent_member(
         }
         IsalOutcome::Straddle => {
             LD_STRADDLE.fetch_add(1, Relaxed);
-            fast_inflate::decode_member_u8(body, pos, end_bit_hint, out)
+            fast_inflate::decode_member_u8_preload(body, pos, end_bit_hint, out)
         }
     }
 }
@@ -207,7 +207,7 @@ fn decode_subsequent_member(
         }
         ZlibOutcome::Straddle => {
             LD_STRADDLE.fetch_add(1, Relaxed);
-            fast_inflate::decode_member_u8(body, pos, end_bit_hint, out)
+            fast_inflate::decode_member_u8_preload(body, pos, end_bit_hint, out)
         }
     }
 }
@@ -234,7 +234,7 @@ fn decode_subsequent_member(
         }
         ZuneOutcome::Straddle => {
             LD_STRADDLE.fetch_add(1, Relaxed);
-            fast_inflate::decode_member_u8(body, pos, end_bit_hint, out)
+            fast_inflate::decode_member_u8_preload(body, pos, end_bit_hint, out)
         }
     }
 }
@@ -252,7 +252,7 @@ fn decode_subsequent_member(
     end_bit_hint: u64,
     out: &mut Vec<u8>,
 ) -> Result<(u64, bool), crate::deflate::DeflateError> {
-    fast_inflate::decode_member_u8(body, pos, end_bit_hint, out)
+    fast_inflate::decode_member_u8_preload(body, pos, end_bit_hint, out)
 }
 
 impl WorkerKernel {

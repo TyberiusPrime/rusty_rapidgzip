@@ -141,6 +141,400 @@ pub fn decode_member_u8(
     Ok((br.tell_bit(), final_block))
 }
 
+/// Experimental libdeflate-style **preload** kernel — same contract as
+/// [`decode_member_u8`], non-speculative, all back-refs resolve within `out`.
+///
+/// The shipped `decode_compressed` loop is latency-bound on the
+/// `buf → LUT-load → shift` recurrence: the table load sits at the *top* of the
+/// loop, serially after the previous iteration's shift, and the literal store /
+/// branch work does not overlap it. This kernel restructures the loop the way
+/// libdeflate / ISA-L do — it **preloads** the next table entry immediately
+/// after consuming the current symbol, so the store + pointer-bump + branch run
+/// in the shadow of the load latency, raising IPC. Literals are processed in a
+/// tight preload sub-loop (the common, latency-sensitive case); matches reload
+/// at the top after a refill.
+pub fn decode_member_u8_preload(
+    input: &[u8],
+    start_bit: u64,
+    end_bit_hint: u64,
+    out: &mut Vec<u8>,
+) -> Result<(u64, bool), DeflateError> {
+    use std::sync::atomic::Ordering::Relaxed;
+    use std::time::Instant;
+    let t = Instant::now();
+    let bytes_in = out.len();
+    let mut br = BitReader::new(input);
+    br.seek_to_bit(start_bit)?;
+    let mut final_block = false;
+    loop {
+        if decode_one_block_preload(&mut br, out)? {
+            final_block = true;
+            break;
+        }
+        if br.tell_bit() >= end_bit_hint {
+            break;
+        }
+    }
+    PHASE2_NS.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+    PHASE2_BYTES.fetch_add((out.len() - bytes_in) as u64, Relaxed);
+    Ok((br.tell_bit(), final_block))
+}
+
+/// One non-speculative deflate block via the preload kernel. Returns `true` on
+/// the final block. Drop-in for [`decode_one_block`] with the same window
+/// contract (back-refs resolve within `out`).
+pub fn decode_one_block_preload(
+    br: &mut BitReader<'_>,
+    out: &mut Vec<u8>,
+) -> Result<bool, DeflateError> {
+    let bfinal = br.read(1)? != 0;
+    let btype = br.read(2)?;
+    match btype {
+        0 => decode_stored(br, out)?,
+        1 => {
+            let lit = HuffmanDecoder::from_lengths_litlen(&fixed_literal_lengths())?;
+            let dist = HuffmanDecoder::from_lengths_dist(&fixed_distance_lengths())?;
+            decode_compressed_preload(br, out, &lit, &dist)?;
+        }
+        2 => {
+            let (lit, dist) = read_dynamic_header(br)?;
+            decode_compressed_preload(br, out, &lit, &dist)?;
+        }
+        _ => return Err(DeflateError::Invalid("reserved block type")),
+    }
+    Ok(bfinal)
+}
+
+/// Preload-structured compressed-block decoder (non-speculative). See
+/// [`decode_member_u8_preload`].
+#[allow(unsafe_code)]
+fn decode_compressed_preload(
+    br: &mut BitReader<'_>,
+    out: &mut Vec<u8>,
+    lit: &HuffmanDecoder,
+    dist: &HuffmanDecoder,
+) -> Result<(), DeflateError> {
+    const NEEDED: u32 = 48;
+    const HEADROOM: usize = 4096;
+    const LUT_MASK: u64 = (1u64 << LUT_BITS) - 1;
+    // Minimum valid bits to keep the literal run going without an inline refill:
+    // enough to index the LUT (≥ LUT_BITS) and, should the next symbol be a
+    // length code, consume its code (≤ LUT_BITS) + length-extra (≤5) before the
+    // distance path's own refill. Below this the run tops up inline.
+    const LIT_GUARD: u32 = 15;
+
+    if out.capacity() - out.len() < HEADROOM {
+        out.reserve(HEADROOM);
+    }
+    let mut cap = out.capacity();
+    let mut out_ptr = out.as_mut_ptr();
+    let mut cur = out.len();
+
+    let mut buf = br.buf;
+    let mut bits = br.bits;
+    let mut byte_pos = br.byte_pos;
+    let input_ptr = br.input.as_ptr();
+    let input_len = br.input.len();
+    let lit_lut = lit.lut();
+    let dist_lut = dist.lut();
+
+    macro_rules! sync_br {
+        () => {
+            br.buf = buf;
+            br.bits = bits;
+            br.byte_pos = byte_pos;
+        };
+    }
+    macro_rules! reload_from_br {
+        () => {
+            buf = br.buf;
+            bits = br.bits;
+            byte_pos = br.byte_pos;
+        };
+    }
+    macro_rules! publish_len {
+        () => {
+            unsafe { out.set_len(cur) }
+        };
+    }
+    // Refill `buf` to ≥ NEEDED bits (≥56 on the fast path). EOF-safe.
+    macro_rules! refill {
+        () => {
+            if byte_pos + 8 <= input_len {
+                buf |= unsafe { load_le_u64(input_ptr, byte_pos) } << bits;
+                let advance = (63u32 ^ bits) >> 3;
+                byte_pos += advance as usize;
+                bits |= 56;
+            } else if bits < NEEDED {
+                while bits < NEEDED {
+                    if byte_pos >= input_len {
+                        publish_len!();
+                        sync_br!();
+                        br.exhausted = true;
+                        return Err(DeflateError::UnexpectedEof);
+                    }
+                    buf |= unsafe { (*input_ptr.add(byte_pos)) as u64 } << bits;
+                    byte_pos += 1;
+                    bits += 8;
+                }
+            }
+        };
+    }
+
+    let result: Result<(), DeflateError> = 'outer: loop {
+        // Ensure room for everything this iteration can emit: a short literal
+        // run plus one max-length match plus copy overshoot.
+        if cap - cur < 288 + COPY_HEADROOM {
+            publish_len!();
+            out.reserve(HEADROOM);
+            cap = out.capacity();
+            out_ptr = out.as_mut_ptr();
+        }
+
+        refill!();
+        // Preloaded current entry (load, not yet consumed); reloaded here at the
+        // top of every iteration.
+        let mut entry = lit_lut[(buf & LUT_MASK) as usize];
+
+        // ── Literal preload sub-loop ─────────────────────────────────────────
+        // Consume + store the literal, then immediately preload the next entry
+        // so the store / pointer-bump / flag-test overlap the load latency.
+        // Short codes in the LUT are ≤ LUT_BITS bits, so a literal consumes
+        // ≤ LUT_BITS and the next index only needs ≥ LUT_BITS valid bits — the
+        // run therefore self-refills inline (and re-reserves output) only when
+        // the budget runs low, instead of bailing to the top every couple of
+        // literals. Exits with `entry` holding a non-literal symbol (loaded,
+        // not consumed, ≥ LIT_GUARD bits valid).
+        while entry & HUFFDEC_LITERAL != 0 {
+            let len = entry & 0xff;
+            buf >>= len;
+            bits -= len;
+            unsafe { *out_ptr.add(cur) = (entry >> 16) as u8 };
+            cur += 1;
+            if bits < LIT_GUARD {
+                // Cold-ish: top up bits (and output room) without leaving the run.
+                refill!();
+                if cap - cur < 288 + COPY_HEADROOM {
+                    publish_len!();
+                    out.reserve(HEADROOM);
+                    cap = out.capacity();
+                    out_ptr = out.as_mut_ptr();
+                }
+            }
+            entry = lit_lut[(buf & LUT_MASK) as usize];
+        }
+
+        // ── Long-code / EOB / reserved ───────────────────────────────────────
+        let code_len = entry & 0xff;
+        if code_len == 0 {
+            // Cold: code longer than LUT_BITS. Resolve the whole symbol the
+            // slow way, act on it, and loop.
+            publish_len!();
+            sync_br!();
+            let e = match lit.lookup_long(br) {
+                Ok(e) => e,
+                Err(e) => break 'outer Err(e),
+            };
+            reload_from_br!();
+            if e & HUFFDEC_LITERAL != 0 {
+                if cur == cap {
+                    out.reserve(HEADROOM);
+                    cap = out.capacity();
+                    out_ptr = out.as_mut_ptr();
+                }
+                unsafe { *out_ptr.add(cur) = (e >> 16) as u8 };
+                cur += 1;
+                continue 'outer;
+            }
+            if e & HUFFDEC_EXCEPTIONAL != 0 {
+                if e >> 16 == 0 {
+                    break 'outer Ok(());
+                }
+                break 'outer Err(DeflateError::Invalid("literal/length symbol out of range"));
+            }
+            // Long length code: fold into the shared match path via `entry`.
+            // `lookup_long` already consumed the code bits, so re-add them
+            // conceptually by treating the loaded `entry`'s extra/base directly.
+            let length_base = ((e >> 16) & 0x1ff) as usize;
+            let len_extra = (e >> 8) & 0x1f;
+            let mut length = length_base;
+            if len_extra > 0 {
+                refill!();
+                length += (buf & ((1u64 << len_extra) - 1)) as usize;
+                buf >>= len_extra;
+                bits -= len_extra;
+            }
+            match decode_distance_and_copy(
+                &mut buf, &mut bits, &mut byte_pos, input_ptr, input_len, dist_lut, dist, br,
+                out, &mut out_ptr, &mut cap, &mut cur, length,
+            ) {
+                Ok(()) => continue 'outer,
+                Err(e) => break 'outer Err(e),
+            }
+        }
+        if entry & HUFFDEC_EXCEPTIONAL != 0 {
+            let len = entry & 0xff;
+            buf >>= len;
+            bits -= len;
+            publish_len!();
+            sync_br!();
+            if entry >> 16 == 0 {
+                break 'outer Ok(()); // EOB
+            }
+            break 'outer Err(DeflateError::Invalid("literal/length symbol out of range"));
+        }
+
+        // ── Length code ──────────────────────────────────────────────────────
+        buf >>= code_len;
+        bits -= code_len;
+        let length_base = ((entry >> 16) & 0x1ff) as usize;
+        let len_extra = (entry >> 8) & 0x1f;
+        let mut length = length_base;
+        if len_extra > 0 {
+            length += (buf & ((1u64 << len_extra) - 1)) as usize;
+            buf >>= len_extra;
+            bits -= len_extra;
+        }
+
+        // ── Distance + copy ──────────────────────────────────────────────────
+        // Refill so the distance code (≤15) + extra (≤13) is always covered.
+        if bits < 28 {
+            refill!();
+        }
+        let dentry = {
+            let e = dist_lut[(buf & LUT_MASK) as usize];
+            let len = e & 0xff;
+            if len == 0 {
+                publish_len!();
+                sync_br!();
+                match dist.lookup_long(br) {
+                    Ok(e) => {
+                        reload_from_br!();
+                        e
+                    }
+                    Err(e) => break 'outer Err(e),
+                }
+            } else {
+                buf >>= len;
+                bits -= len;
+                e
+            }
+        };
+        if dentry & HUFFDEC_EXCEPTIONAL != 0 {
+            publish_len!();
+            sync_br!();
+            break 'outer Err(DeflateError::Invalid("distance symbol out of range"));
+        }
+        let mut distance = (dentry >> 16) as usize;
+        let dextra = (dentry >> 8) & 0x1f;
+        if dextra > 0 {
+            distance += (buf & ((1u64 << dextra) - 1)) as usize;
+            buf >>= dextra;
+            bits -= dextra;
+        }
+        if distance == 0 || distance > cur {
+            publish_len!();
+            sync_br!();
+            break 'outer if distance == 0 {
+                Err(DeflateError::Invalid("zero back-reference distance"))
+            } else {
+                Err(DeflateError::Invalid("back-reference distance out of bounds"))
+            };
+        }
+        unsafe { copy_back_raw(out_ptr, cur, distance, length) };
+        cur += length;
+    };
+
+    result
+}
+
+/// Cold-path helper: decode a distance symbol + extra bits and perform the
+/// back-reference copy for a `length` already decoded. Only used by the
+/// long-length-code branch of [`decode_compressed_preload`]; the hot match path
+/// is inlined there. Refills internally.
+#[allow(clippy::too_many_arguments, unsafe_code)]
+#[inline]
+fn decode_distance_and_copy(
+    buf: &mut u64,
+    bits: &mut u32,
+    byte_pos: &mut usize,
+    input_ptr: *const u8,
+    input_len: usize,
+    dist_lut: &[u32; 1 << LUT_BITS],
+    dist: &HuffmanDecoder,
+    br: &mut BitReader<'_>,
+    out: &mut Vec<u8>,
+    out_ptr: &mut *mut u8,
+    cap: &mut usize,
+    cur: &mut usize,
+    length: usize,
+) -> Result<(), DeflateError> {
+    const NEEDED: u32 = 48;
+    const LUT_MASK: u64 = (1u64 << LUT_BITS) - 1;
+    // Refill.
+    if *byte_pos + 8 <= input_len {
+        *buf |= unsafe { load_le_u64(input_ptr, *byte_pos) } << *bits;
+        let advance = (63u32 ^ *bits) >> 3;
+        *byte_pos += advance as usize;
+        *bits |= 56;
+    } else {
+        while *bits < NEEDED {
+            if *byte_pos >= input_len {
+                unsafe { out.set_len(*cur) };
+                br.buf = *buf;
+                br.bits = *bits;
+                br.byte_pos = *byte_pos;
+                br.exhausted = true;
+                return Err(DeflateError::UnexpectedEof);
+            }
+            *buf |= unsafe { (*input_ptr.add(*byte_pos)) as u64 } << *bits;
+            *byte_pos += 1;
+            *bits += 8;
+        }
+    }
+    let dentry = {
+        let e = dist_lut[(*buf & LUT_MASK) as usize];
+        let len = e & 0xff;
+        if len == 0 {
+            unsafe { out.set_len(*cur) };
+            br.buf = *buf;
+            br.bits = *bits;
+            br.byte_pos = *byte_pos;
+            let e = dist.lookup_long(br)?;
+            *buf = br.buf;
+            *bits = br.bits;
+            *byte_pos = br.byte_pos;
+            e
+        } else {
+            *buf >>= len;
+            *bits -= len;
+            e
+        }
+    };
+    if dentry & HUFFDEC_EXCEPTIONAL != 0 {
+        return Err(DeflateError::Invalid("distance symbol out of range"));
+    }
+    let mut distance = (dentry >> 16) as usize;
+    let dextra = (dentry >> 8) & 0x1f;
+    if dextra > 0 {
+        distance += (*buf & ((1u64 << dextra) - 1)) as usize;
+        *buf >>= dextra;
+        *bits -= dextra;
+    }
+    if distance == 0 || distance > *cur {
+        return Err(DeflateError::Invalid("back-reference distance out of bounds"));
+    }
+    if *cap - *cur < length + COPY_HEADROOM {
+        unsafe { out.set_len(*cur) };
+        out.reserve(length + 4096);
+        *cap = out.capacity();
+        *out_ptr = out.as_mut_ptr();
+    }
+    unsafe { copy_back_raw(*out_ptr, *cur, distance, length) };
+    *cur += length;
+    Ok(())
+}
+
 /// Serial inflate — drop-in for `inflate::inflate`.
 ///
 /// Decodes the complete deflate stream from `br` into `out`. No speculative
@@ -802,7 +1196,7 @@ pub fn decode_until_u16(
     let bytes_mid = chunk.bytes.len();
     let mut final_block = false;
     loop {
-        if decode_one_block(&mut br, &mut chunk.bytes)? {
+        if decode_one_block_preload(&mut br, &mut chunk.bytes)? {
             final_block = true;
             break;
         }
@@ -971,6 +1365,30 @@ fn decode_compressed_u16(
             byte_pos = br.byte_pos;
         };
     }
+    // Refill to ≥ NEEDED bits. Takes the loop label so its EOF bail can break
+    // out of the caller's `'outer` loop (label hygiene blocks referring to it
+    // from the macro definition otherwise).
+    macro_rules! refill {
+        ($lbl:lifetime) => {
+            if byte_pos + 8 <= input_len {
+                buf |= unsafe { load_le_u64(input_ptr, byte_pos) } << bits;
+                let advance = (63u32 ^ bits) >> 3;
+                byte_pos += advance as usize;
+                bits |= 56;
+            } else if bits < NEEDED {
+                while bits < NEEDED {
+                    if byte_pos >= input_len {
+                        sync_br!();
+                        br.exhausted = true;
+                        break $lbl Err(DeflateError::UnexpectedEof);
+                    }
+                    buf |= unsafe { (*input_ptr.add(byte_pos)) as u64 } << bits;
+                    byte_pos += 1;
+                    bits += 8;
+                }
+            }
+        };
+    }
 
     let result: Result<(), DeflateError> = 'outer: loop {
         if byte_pos + 8 <= input_len {
@@ -1002,7 +1420,7 @@ fn decode_compressed_u16(
         }
 
         // ── Literal/length symbol ────────────────────────────────────────────
-        let entry = {
+        let mut entry = {
             let idx = (buf & LUT_MASK) as usize;
             let e = lit_lut[idx];
             let len = e & 0xff;
@@ -1022,16 +1440,28 @@ fn decode_compressed_u16(
             }
         };
 
-        // ── Literal ──────────────────────────────────────────────────────────
-        if entry & HUFFDEC_LITERAL != 0 {
-            // Mask to the literal byte: `entry >> 16` would otherwise carry
-            // HUFFDEC_LITERAL (bit 31) into bit 15, colliding with MARKER16.
-            // (The u8 kernel's double-literal trick was tried here and measured
-            // neutral — this path is store-bound on the 2-byte cell, not
-            // refill-bound, so amortising the refill buys nothing.)
+        // ── Literal preload sub-loop ──────────────────────────────────────────
+        // Same latency-hiding restructure as the u8 kernel: store the literal,
+        // then immediately preload the next entry so the (2-byte) cell store and
+        // flag test overlap the table-load latency. Bail to the top — which owns
+        // the unconditional refill and the window-flush — once the bit budget
+        // runs low or the window fills, so both invariants stay where they are.
+        // Mask to the literal byte: `entry >> 16` would otherwise carry
+        // HUFFDEC_LITERAL (bit 31) into bit 15, colliding with MARKER16.
+        while entry & HUFFDEC_LITERAL != 0 {
             unsafe { *out_ptr.add(cur) = ((entry >> 16) & 0xff) as u16 };
             cur += 1;
-            continue 'outer;
+            if bits < 15 || cur >= U16_FLUSH_AT {
+                continue 'outer;
+            }
+            let e = lit_lut[(buf & LUT_MASK) as usize];
+            let len = e & 0xff;
+            if len == 0 {
+                continue 'outer; // long code: re-resolve at the top
+            }
+            buf >>= len;
+            bits -= len;
+            entry = e;
         }
 
         // ── EOB / reserved ───────────────────────────────────────────────────
@@ -1041,6 +1471,13 @@ fn decode_compressed_u16(
                 break 'outer Ok(());
             }
             break 'outer Err(DeflateError::Invalid("literal/length symbol out of range"));
+        }
+
+        // The literal run may have left few bits; ensure the whole match
+        // (length-extra ≤5 + distance code ≤15 + distance-extra ≤13) is covered.
+        // When `entry` came straight from the top refill this is a no-op.
+        if bits < 33 {
+            refill!('outer);
         }
 
         // ── Length code ──────────────────────────────────────────────────────
@@ -1168,6 +1605,56 @@ mod tests {
             p.push(((s >> 56) as u8 % 95) + 32);
         }
         p
+    }
+
+    /// The preload kernel must produce byte-identical output to the shipped
+    /// `decode_member_u8` kernel for every payload/level we test.
+    fn check_preload_matches(payload: &[u8], level: u32) {
+        let deflate = deflate_via_gzip(payload, level);
+        let mut padded = deflate.clone();
+        padded.extend_from_slice(&[0u8; 64]);
+
+        let mut a = Vec::new();
+        decode_member_u8(&padded, 0, u64::MAX, &mut a).unwrap();
+        let mut b = Vec::new();
+        decode_member_u8_preload(&padded, 0, u64::MAX, &mut b).unwrap();
+
+        assert_eq!(a, payload, "u8 kernel mismatch (len={} level={level})", payload.len());
+        assert_eq!(
+            b, payload,
+            "preload kernel mismatch (len={} level={level})",
+            payload.len()
+        );
+    }
+
+    #[test]
+    fn preload_matches_u8() {
+        check_preload_matches(b"", 6);
+        check_preload_matches(b"hello, world\n", 6);
+        check_preload_matches(b"aaaaaaaaaa", 9);
+        check_preload_matches(&vec![b'x'; 10000], 6);
+        check_preload_matches(&ascii_payload(1024), 6);
+        check_preload_matches(&ascii_payload(256 * 1024), 6);
+        let mut p = Vec::new();
+        for _ in 0..1000 {
+            p.extend_from_slice(b"abcdefghij");
+        }
+        check_preload_matches(&p, 6);
+        let mut q = Vec::new();
+        for i in 0..50000u32 {
+            q.extend_from_slice(format!("line {i}: hello world\n").as_bytes());
+        }
+        check_preload_matches(&q, 9);
+        // Stored-block coverage.
+        let mut s: u64 = 0xA1B2C3D4E5F60718;
+        let mut r = Vec::with_capacity(8192);
+        while r.len() < 8192 {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            r.extend_from_slice(&s.to_le_bytes());
+        }
+        check_preload_matches(&r, 1);
     }
 
     #[test]

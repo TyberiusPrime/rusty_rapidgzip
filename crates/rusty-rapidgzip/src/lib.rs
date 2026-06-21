@@ -8,9 +8,15 @@ pub mod deflate;
 mod libdeflate_ffi;
 #[cfg(all(feature = "isal", not(feature = "libdeflate")))]
 mod isal_ffi;
-#[cfg(all(feature = "zlib-rs", not(any(feature = "libdeflate", feature = "isal"))))]
+// Normally only the active backend's FFI compiles. Under `test` we also allow
+// `zlibrs_ffi` to compile alongside libdeflate so the kernel A/B/C microbench
+// (`kernel_ab`) can pit ours vs zlib-rs vs libdeflate in a single binary.
+#[cfg(any(
+    all(feature = "zlib-rs", not(any(feature = "libdeflate", feature = "isal"))),
+    all(test, feature = "zlib-rs")
+))]
 mod zlibrs_ffi;
-#[cfg(all(test, feature = "zlib-rs", not(any(feature = "libdeflate", feature = "isal"))))]
+#[cfg(all(test, feature = "zlib-rs"))]
 mod kernel_ab;
 #[cfg(all(
     feature = "zune",
