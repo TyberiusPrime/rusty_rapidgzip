@@ -1,29 +1,20 @@
 // Links the external decode libraries when their features are enabled.
 //
-// `libdeflate`: links the static libdeflate. The library directory defaults to
-// the nix-store libdeflate-1.25 used during the experiment, overridable via
-// $LIBDEFLATE_LIB_DIR.
+// `libdeflate`: nothing to do here — the `libdeflate-sys` crate compiles the
+// vendored libdeflate C source with `cc` and emits its own static-link
+// directives, so libdeflate builds portably on every target (Linux / macOS /
+// Windows) with no external library directory.
 //
 // `isal`: compiles the small C shim (src/isal_shim.c) against ISA-L's headers
 // and links the shared libisal. Paths default to the nix-store isa-l-2.31.1 and
 // are overridable via $ISAL_LIB_DIR / $ISAL_INCLUDE_DIR.
 fn main() {
-    println!("cargo:rerun-if-env-changed=LIBDEFLATE_LIB_DIR");
     println!("cargo:rerun-if-env-changed=ISAL_LIB_DIR");
     println!("cargo:rerun-if-env-changed=ISAL_INCLUDE_DIR");
 
-    if std::env::var_os("CARGO_FEATURE_LIBDEFLATE").is_some() {
-        let dir = std::env::var("LIBDEFLATE_LIB_DIR").unwrap_or_else(|_| {
-            "/nix/store/04valqpy6qymd3zvirs4h6240pamhbkh-libdeflate-1.25/lib".to_string()
-        });
-        println!("cargo:rustc-link-search=native={dir}");
-        println!("cargo:rustc-link-lib=static=deflate");
-    }
-
     if std::env::var_os("CARGO_FEATURE_ISAL").is_some() {
         let isal_root = "/nix/store/si3q8xbkvcyl496wa0nz2ard39w8f21c-isa-l-2.31.1";
-        let lib_dir =
-            std::env::var("ISAL_LIB_DIR").unwrap_or_else(|_| format!("{isal_root}/lib"));
+        let lib_dir = std::env::var("ISAL_LIB_DIR").unwrap_or_else(|_| format!("{isal_root}/lib"));
         let include_dir =
             std::env::var("ISAL_INCLUDE_DIR").unwrap_or_else(|_| format!("{isal_root}/include"));
 

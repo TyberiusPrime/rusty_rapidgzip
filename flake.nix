@@ -84,6 +84,38 @@
           rustc = rustStable;
         };
 
+        # ── Windows cross-compilation ───────────────────────────────────────
+        # Minimal stable toolchain with the MinGW Windows target added, plus the
+        # MinGW cross-compiler from nixpkgs. Used by `packages.check-windows`
+        # (and `checks.check-windows`) to compile-check the workspace for
+        # x86_64-pc-windows-gnu from Linux — catching cfg(windows)/type/API
+        # breakage without a real Windows runner. libdeflate (the default
+        # backend) is built from source by `libdeflate-sys`, so the MinGW gcc
+        # must also be the C compiler the `cc` crate uses for that target.
+        rust-windows = pkgs.rust-bin.stable.latest.minimal.override {
+          targets = [ "x86_64-pc-windows-gnu" ];
+        };
+        mingw = pkgs.pkgsCross.mingwW64.stdenv.cc;
+        naersk-lib-windows = naersk.lib."${system}".override {
+          cargo = rust-windows;
+          rustc = rust-windows;
+        };
+
+        # ── Fully static (musl) Linux binary ────────────────────────────────
+        # The truly portable "runs on any Linux distro" build: statically linked
+        # against musl libc, so there is no glibc version coupling (the glibc
+        # binary above is built against a very recent nixpkgs glibc and would
+        # fail the symbol-version check on older distros). libdeflate's C source
+        # is compiled for the musl target by the musl cross-gcc and linked in.
+        rust-musl = pkgs.rust-bin.stable.latest.default.override {
+          targets = [ "x86_64-unknown-linux-musl" ];
+        };
+        naersk-lib-musl = naersk.lib."${system}".override {
+          cargo = rust-musl;
+          rustc = rust-musl;
+        };
+        muslCC = pkgs.pkgsCross.musl64.stdenv.cc;
+
         bacon = pkgs.bacon;
 
         # cargo-afl is not in nixpkgs, so we build it from the crates.io tarball.
@@ -173,6 +205,10 @@
             nativeBuildInputs = [
               toolchain
               pkgs.rustPlatform.cargoSetupHook
+              # libdeflate is the default backend: `libdeflate-sys` compiles the
+              # vendored libdeflate C source with the `cc` crate, so a C compiler
+              # must be on PATH for the default-feature builds (stable/clippy).
+              pkgs.stdenv.cc
             ];
             # Check-only: nothing to install, and the default fixup/strip
             # phases have nothing useful to do.
@@ -196,16 +232,24 @@
           name = "rusty-rapidgzip-clippy";
           phase = "cargo clippy --workspace --all-targets --offline -- -D warnings";
         };
+        # Format only our own crates. `--all` also reaches the vendored,
+        # locally-patched third-party `zune-inflate` (it tracks upstream's
+        # style, not ours), and rustfmt's `ignore` option is nightly-only, so we
+        # name the workspace members explicitly instead.
         ciFmt = mkCargoCheck {
           name = "rusty-rapidgzip-fmt";
-          phase = "cargo fmt --all -- --check";
+          phase = "cargo fmt -p rusty-rapidgzip -p rusty-rapidgzip-bin -- --check";
         };
         # MSRV guarantee is for library/binary consumers, so build (not test):
-        # dev-only deps like criterion needn't satisfy 1.80 themselves.
+        # dev-only deps like criterion needn't satisfy 1.85 themselves. Built
+        # with `--no-default-features` (the pure-Rust kernel): the MSRV promise
+        # covers *our* Rust source, not the third-party C build tooling the
+        # optional `libdeflate` feature pulls in (`cc`/`libdeflate-sys` track
+        # their own, faster-moving MSRV, which we do not control).
         ciMsrv = mkCargoCheck {
           name = "rusty-rapidgzip-msrv-1.85";
           toolchain = rustMsrv;
-          phase = "cargo build --workspace --offline";
+          phase = "cargo build --workspace --no-default-features --offline";
         };
 
         # Full-corpus-only extra (local): re-run the golden-hash test without
@@ -222,10 +266,87 @@
 
       in
       rec {
+        # ── Shippable binaries ──────────────────────────────────────────────
+        # `nix build` → the parallel gzip decoder CLI (`rusty-rapidgzip-rs`).
+        # libdeflate (the default backend) is compiled from vendored source by
+        # the `libdeflate-sys` crate and statically linked, so the binary has no
+        # runtime C-library dependency.
+        packages.rusty-rapidgzip = naersk-lib.buildPackage {
+          pname = "rusty-rapidgzip";
+          root = ./.;
+          # A C compiler is required: `libdeflate-sys` builds libdeflate's C
+          # source with the `cc` crate.
+          nativeBuildInputs = [ pkgs.stdenv.cc ];
+          release = true;
+          CARGO_PROFILE_RELEASE_debug = "0";
+          # The internal micro-benchmark helper isn't a user-facing tool.
+          postInstall = "rm -f $out/bin/bench-inflate";
+        };
+        defaultPackage = packages.rusty-rapidgzip;
+
+        # `nix build .#other-linux` → the same binary, but with its ELF
+        # interpreter repointed at the conventional glibc loader so it runs on
+        # ordinary (non-NixOS) Linux distributions. libdeflate is statically
+        # linked, so only the host's libc / libgcc are needed at runtime. CI
+        # proves this by executing it inside a plain Debian container (ci.yml).
+        packages.other-linux = naersk-lib.buildPackage {
+          pname = "rusty-rapidgzip-other-linux";
+          root = ./.;
+          nativeBuildInputs = [ pkgs.stdenv.cc ];
+          release = true;
+          CARGO_PROFILE_RELEASE_debug = "0";
+          postInstall = ''
+            rm -f $out/bin/bench-inflate
+            patchelf $out/bin/rusty-rapidgzip-rs \
+              --set-interpreter /lib64/ld-linux-x86-64.so.2
+          '';
+        };
+
+        # `nix build .#static-linux` → fully static musl binary. Has no ELF
+        # interpreter and no dynamic dependencies at all, so it runs unchanged on
+        # any Linux distribution (Alpine, old CentOS, Debian, …) regardless of
+        # its libc. CI executes this one inside plain Alpine and Debian
+        # containers (ci.yml).
+        packages.static-linux = naersk-lib-musl.buildPackage {
+          pname = "rusty-rapidgzip-static";
+          root = ./.;
+          CARGO_BUILD_TARGET = "x86_64-unknown-linux-musl";
+          # libdeflate-sys builds libdeflate's C source; for the musl target it
+          # must use the musl cross-gcc so the objects link into the static binary.
+          CC_x86_64_unknown_linux_musl = "${muslCC}/bin/${muslCC.targetPrefix}cc";
+          nativeBuildInputs = [ muslCC ];
+          release = true;
+          CARGO_PROFILE_RELEASE_debug = "0";
+          postInstall = "rm -f $out/bin/bench-inflate";
+        };
+
+        # `nix build .#check-windows` — cross-compile-check the workspace for
+        # x86_64-pc-windows-gnu (MinGW) from Linux. Catches cfg(windows) / type /
+        # API breakage cheaply; real Windows test execution happens on a native
+        # GitHub runner (see ci.yml). libdeflate's C source is compiled by the
+        # MinGW cross-gcc that `cc` is pointed at below.
+        packages.check-windows = naersk-lib-windows.buildPackage {
+          src = ./.;
+          mode = "check";
+          name = "rusty-rapidgzip-windows-check";
+          CARGO_BUILD_TARGET = "x86_64-pc-windows-gnu";
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER =
+            "${mingw}/bin/x86_64-w64-mingw32-gcc";
+          CC_x86_64_pc_windows_gnu = "${mingw}/bin/x86_64-w64-mingw32-gcc";
+          nativeBuildInputs = [ mingw pkgs.pkg-config ];
+        };
+
+        # `nix run` → the CLI.
+        apps.rusty-rapidgzip = utils.lib.mkApp {
+          drv = packages.rusty-rapidgzip;
+          name = "rusty-rapidgzip-rs";
+        };
+        defaultApp = apps.rusty-rapidgzip;
+
         # `nix flake check` runs the FULL local matrix: the lean subset
         # (stable test, clippy -D warnings, rustfmt, MSRV build) plus the
-        # heavier full-corpus and Miri jobs. GitHub CI runs only the lean
-        # subset directly via `nix build .#checks.<system>.<name>`
+        # heavier full-corpus, Miri and Windows-cross jobs. GitHub CI runs only
+        # the lean subset directly via `nix build .#checks.<system>.<name>`
         # (see `.github/workflows/ci.yml`).
         checks = {
           stable = ciStable;
@@ -233,15 +354,19 @@
           fmt = ciFmt;
           msrv = ciMsrv;
           corpus-full = ciCorpusFull;
+          # Compile-check for Windows (MinGW). Native Windows test execution
+          # additionally runs on a windows-latest GitHub runner (ci.yml).
+          check-windows = packages.check-windows;
 
-          # `nix build .#checks.<system>.miri` — run the crates' `unsafe` under
+          # `nix build .#checks.<system>.miri` — run the crate's `unsafe` under
           # Miri to catch UB (out-of-bounds, uninit reads, provenance/aliasing
-          # violations). Two targets, sharing one std-sysroot build:
-          #   * rusty-rapidgzip-deflate: the back-reference copy kernels, via the
-          #     self-contained `tests/miri_edge.rs` (no `gzip` subprocess — Miri
-          #     can't exec).
-          # Each runs under the default Stacked Borrows and the stricter Tree
-          # Borrows aliasing models.
+          # violations) in the back-reference copy kernels, via the
+          # self-contained `rusty-rapidgzip/tests/miri_edge.rs` (raw-DEFLATE
+          # vectors — no `gzip` subprocess and no threads, both of which Miri
+          # can't run). Built `--no-default-features` so the pure-Rust kernel is
+          # exercised and no C (`libdeflate-sys`/`cc`) is pulled in. Runs under
+          # both the default Stacked Borrows and the stricter Tree Borrows
+          # aliasing models.
           miri =
             pkgs.stdenv.mkDerivation {
               name = "rusty-rapidgzip-miri";
@@ -272,7 +397,7 @@
                   MIRIFLAGS="$base -Zmiri-tree-borrows" cargo miri test --offline "$@"
                 }
 
-                run_miri deflate   -p rusty-rapidgzip-deflate --test miri_edge
+                run_miri deflate --no-default-features -p rusty-rapidgzip --test miri_edge
 
                 runHook postBuild
               '';

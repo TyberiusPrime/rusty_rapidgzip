@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "crates/rusty-rapidgzip",
     "crates/rusty-rapidgzip-bin",
-    "crates/rusty-rapidgzip-bin-isolated",
     #"xtask",
 ]
 # Vendored + locally patched third-party crate (see vendor/zune-inflate/LOCAL_PATCH.md).
@@ -25,6 +24,11 @@ authors = ["Florian Finkernagel <finkernagel@imt.uni-marburg.de>"]
 rusty-rapidgzip = { path = "crates/rusty-rapidgzip", version = "0.1.0", default-features = false }
 
 bstr = "1"
+# libdeflate, the default per-member / BGZF decode backend. The `-sys` crate
+# vendors the libdeflate C source and compiles it from scratch with `cc`, so the
+# `libdeflate` feature needs no external library and links statically on every
+# target (Linux / macOS / Windows). Pinned to track libdeflate 1.25.
+libdeflate-sys = "1.25"
 # Pure-Rust zlib (zlib-rs) via its standard-zlib C ABI; the `zlib-rs` backend.
 libz-rs-sys = "0.6.3"
 crc32fast = "1.4"

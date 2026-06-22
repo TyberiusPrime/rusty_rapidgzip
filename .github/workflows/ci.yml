@@ -5,17 +5,17 @@ on:
     branches: [main]
   pull_request:
 
-# All the actual work lives in the Nix flake (`nix flake check` runs the full
-# matrix locally; see flake.nix / DEV.txt). CI just fans out over the lean
-# subset of `checks.*` and runs each in a fresh Nix build.
 jobs:
-  checks:
+  # ── Linux: reproducible, offline check matrix via the Nix flake ───────────
+  # `nix flake check` runs the full matrix locally; CI fans out over the lean
+  # subset (plus the Miri UB check and the Windows cross-compile check), each in
+  # a fresh Nix build. See flake.nix / DEV.txt.
+  nix-checks:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        job: [stable, clippy, fmt, msrv]
-
+        job: [stable, clippy, fmt, msrv, miri, check-windows]
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -27,3 +27,70 @@ jobs:
 
       - name: ${{ matrix.job }}
         run: nix build -L ".#checks.x86_64-linux.${{ matrix.job }}"
+
+  # ── Native macOS + Windows: real test execution (no Nix) ──────────────────
+  # libdeflate is the default backend and is compiled from vendored source by
+  # `libdeflate-sys` with the platform C toolchain (clang on macOS, MSVC on
+  # Windows) — both present on the runner images — so no external library is
+  # needed. rustup is pre-installed on both runner images.
+  native:
+    name: native (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        shell: bash
+        run: rustup update --no-self-update stable && rustup default stable
+
+      # Several tests build their fixtures by shelling out to `gzip`. It is not
+      # on PATH by default on the Windows runner, but Git for Windows (always
+      # pre-installed) bundles it under usr/bin.
+      - name: Expose gzip on Windows
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo "C:\Program Files\Git\usr\bin" >> "$GITHUB_PATH"
+
+      - name: Test
+        run: cargo test --workspace
+
+  # ── Non-NixOS Linux: portable binary in plain containers ──────────────────
+  # Build the fully static (musl) binary with Nix, then run it inside stock
+  # Alpine (musl) and Debian (glibc) containers — with no Nix and no system
+  # libdeflate — to prove it works on ordinary Linux distributions.
+  portable-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
+
+      - name: Build the static (musl) binary
+        run: nix build -L .#static-linux
+
+      - name: Stage binary into the workspace
+        run: install -m755 result/bin/rusty-rapidgzip-rs ./rusty-rapidgzip-rs
+
+      - name: Run the binary in plain Alpine and Debian containers
+        run: |
+          set -euo pipefail
+          for img in alpine:latest debian:bookworm-slim; do
+            echo "== $img =="
+            docker run --rm -v "$PWD":/w -w /w "$img" sh -c '
+              set -e
+              ./rusty-rapidgzip-rs tests/corpus/synth-level9.gz | sha256sum > got
+              gzip -dc tests/corpus/synth-level9.gz | sha256sum > want
+              diff got want && echo "OK: static binary runs and decodes correctly on '"$img"'"
+            '
+          done

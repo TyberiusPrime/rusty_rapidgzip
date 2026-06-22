@@ -10,40 +10,20 @@
 
 #![allow(unsafe_code)]
 
-use std::os::raw::c_int;
-
 use crate::deflate::DeflateError;
 
-#[repr(C)]
-struct LibdeflateDecompressor {
-    _private: [u8; 0],
-}
-
-// libdeflate_result discriminants (enum libdeflate_result).
-const LIBDEFLATE_SUCCESS: c_int = 0;
-const LIBDEFLATE_INSUFFICIENT_SPACE: c_int = 3;
-
-extern "C" {
-    fn libdeflate_alloc_decompressor() -> *mut LibdeflateDecompressor;
-    fn libdeflate_free_decompressor(d: *mut LibdeflateDecompressor);
-    fn libdeflate_gzip_decompress(
-        d: *mut LibdeflateDecompressor,
-        in_: *const u8,
-        in_nbytes: usize,
-        out: *mut u8,
-        out_nbytes_avail: usize,
-        actual_out_nbytes_ret: *mut usize,
-    ) -> c_int;
-    fn libdeflate_deflate_decompress_ex(
-        d: *mut LibdeflateDecompressor,
-        in_: *const u8,
-        in_nbytes: usize,
-        out: *mut u8,
-        out_nbytes_avail: usize,
-        actual_in_nbytes_ret: *mut usize,
-        actual_out_nbytes_ret: *mut usize,
-    ) -> c_int;
-}
+// libdeflate is supplied by the `libdeflate-sys` crate, which compiles the
+// vendored libdeflate C source from scratch with the `cc` crate on every target
+// (no external library directory, no system dependency) and links it
+// statically. We use its raw bindings directly so the symbols always resolve
+// against the exact library version that built them — portable across Linux,
+// macOS and Windows.
+use libdeflate_sys::{
+    libdeflate_alloc_decompressor, libdeflate_decompressor as LibdeflateDecompressor,
+    libdeflate_deflate_decompress_ex, libdeflate_free_decompressor, libdeflate_gzip_decompress,
+    libdeflate_result_LIBDEFLATE_INSUFFICIENT_SPACE as LIBDEFLATE_INSUFFICIENT_SPACE,
+    libdeflate_result_LIBDEFLATE_SUCCESS as LIBDEFLATE_SUCCESS,
+};
 
 /// Owns one libdeflate decompressor. A libdeflate decompressor must not be used
 /// concurrently, so each worker thread owns its own — never shared.
@@ -112,9 +92,9 @@ pub(crate) fn decode_member(
         let r = unsafe {
             libdeflate_deflate_decompress_ex(
                 d.0,
-                in_ptr,
+                in_ptr.cast(),
                 in_avail,
-                out_ptr,
+                out_ptr.cast(),
                 out_avail,
                 &mut in_used,
                 &mut out_made,
@@ -177,9 +157,9 @@ pub(crate) fn decode_gzip_member(
     let r = unsafe {
         libdeflate_gzip_decompress(
             d.0,
-            member.as_ptr(),
+            member.as_ptr().cast(),
             member.len(),
-            out_ptr,
+            out_ptr.cast(),
             isize,
             &mut out_made,
         )

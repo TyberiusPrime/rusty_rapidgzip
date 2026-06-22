@@ -19,13 +19,16 @@
 // or `"isal zlib-rs"`, test-only) this module is compiled for the bench but the
 // pipeline routes through the other backend, so the gzip-member entry points
 // look unused here.
-#![cfg_attr(all(test, any(feature = "libdeflate", feature = "isal")), allow(dead_code))]
+#![cfg_attr(
+    all(test, any(feature = "libdeflate", feature = "isal")),
+    allow(dead_code)
+)]
 
 use std::os::raw::c_int;
 
 use libz_rs_sys::{
-    inflate, inflateEnd, inflateInit2_, inflateReset2, z_stream, zlibVersion, Z_BUF_ERROR, Z_FINISH,
-    Z_OK, Z_STREAM_END,
+    inflate, inflateEnd, inflateInit2_, inflateReset2, z_stream, zlibVersion, Z_BUF_ERROR,
+    Z_FINISH, Z_OK, Z_STREAM_END,
 };
 
 use crate::deflate::DeflateError;

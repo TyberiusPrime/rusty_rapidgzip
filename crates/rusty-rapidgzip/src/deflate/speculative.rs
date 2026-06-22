@@ -126,6 +126,9 @@ impl SpeculativeChunk {
         #[cfg(not(all(target_arch = "x86_64", not(miri))))]
         let tail_start = 0;
 
+        // `idx` is the marker position we record (via `record!`), not merely a
+        // loop counter, so the index form is the natural one here.
+        #[allow(clippy::needless_range_loop)]
         for idx in tail_start..n {
             let cell = scratch[idx];
             if cell & Self::MARKER16 != 0 {

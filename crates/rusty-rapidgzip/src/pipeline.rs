@@ -98,7 +98,10 @@ struct WorkerKernel {
     isal: Option<crate::isal_ffi::Decompressor>,
     /// Per-worker zlib-rs inflate state (feature `zlib-rs`, when neither
     /// `libdeflate` nor `isal` is on). Lazily allocated.
-    #[cfg(all(feature = "zlib-rs", not(any(feature = "libdeflate", feature = "isal"))))]
+    #[cfg(all(
+        feature = "zlib-rs",
+        not(any(feature = "libdeflate", feature = "isal"))
+    ))]
     zlibrs: Option<crate::zlibrs_ffi::Decompressor>,
     /// Per-worker reusable output scratch for the zune-inflate backend (feature
     /// `zune`). Grown once to the largest member size; lets zune decode without
@@ -115,7 +118,10 @@ struct WorkerKernel {
 pub(crate) const MEMBER_BACKEND: &str = "libdeflate";
 #[cfg(all(feature = "isal", not(feature = "libdeflate")))]
 pub(crate) const MEMBER_BACKEND: &str = "ISA-L";
-#[cfg(all(feature = "zlib-rs", not(any(feature = "libdeflate", feature = "isal"))))]
+#[cfg(all(
+    feature = "zlib-rs",
+    not(any(feature = "libdeflate", feature = "isal"))
+))]
 pub(crate) const MEMBER_BACKEND: &str = "zlib-rs";
 #[cfg(all(
     feature = "zune",
@@ -129,9 +135,19 @@ pub(crate) const MEMBER_BACKEND: &str = "zune-inflate";
 /// `decode_member_u8` (redundant work, the CPU tax that can push full-thread wall
 /// up). First-member-per-chunk decodes never reach here — they always use our u16
 /// kernel. Printed in verbose mode.
-#[cfg(any(feature = "libdeflate", feature = "isal", feature = "zlib-rs", feature = "zune"))]
+#[cfg(any(
+    feature = "libdeflate",
+    feature = "isal",
+    feature = "zlib-rs",
+    feature = "zune"
+))]
 pub(crate) static LD_DONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-#[cfg(any(feature = "libdeflate", feature = "isal", feature = "zlib-rs", feature = "zune"))]
+#[cfg(any(
+    feature = "libdeflate",
+    feature = "isal",
+    feature = "zlib-rs",
+    feature = "zune"
+))]
 pub(crate) static LD_STRADDLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Decode one non-first member of a chunk (fresh empty window, byte-aligned
@@ -188,7 +204,10 @@ fn decode_subsequent_member(
     }
 }
 
-#[cfg(all(feature = "zlib-rs", not(any(feature = "libdeflate", feature = "isal"))))]
+#[cfg(all(
+    feature = "zlib-rs",
+    not(any(feature = "libdeflate", feature = "isal"))
+))]
 fn decode_subsequent_member(
     wk: &mut WorkerKernel,
     body: &[u8],
@@ -893,7 +912,10 @@ pub fn parallel_decode_member(
                 cur_crc = crc32fast::Hasher::new();
                 cur_uncompressed = 0;
             }
-            cur_crc.combine(&crc32fast::Hasher::new_with_initial_len(done.tail_crc, done.tail_len));
+            cur_crc.combine(&crc32fast::Hasher::new_with_initial_len(
+                done.tail_crc,
+                done.tail_len,
+            ));
             cur_uncompressed += done.tail_len;
 
             let bytes_arc = Arc::new(done.chunk.bytes);
@@ -950,7 +972,13 @@ pub fn parallel_decode_member(
             let p2_ns = PHASE2_NS.load(Relaxed) as f64 / 1e9;
             let p1_b = PHASE1_BYTES.load(Relaxed);
             let p2_b = PHASE2_BYTES.load(Relaxed);
-            let mibps = |b: u64, s: f64| if s > 0.0 { b as f64 / s / (1024.0 * 1024.0) } else { 0.0 };
+            let mibps = |b: u64, s: f64| {
+                if s > 0.0 {
+                    b as f64 / s / (1024.0 * 1024.0)
+                } else {
+                    0.0
+                }
+            };
             eprintln!(
                 "[rapidgzip +{:.2}s]   phase1 (u16 spec): cpu={p1_ns:.3}s bytes={p1_b} ({:.0} MiB/s/thread) | phase2 (u8): cpu={p2_ns:.3}s bytes={p2_b} ({:.0} MiB/s/thread)",
                 crate::elapsed_since_start(),
@@ -983,7 +1011,12 @@ pub fn parallel_decode_member(
             crate::elapsed_since_start(),
         );
     }
-    #[cfg(any(feature = "libdeflate", feature = "isal", feature = "zlib-rs", feature = "zune"))]
+    #[cfg(any(
+        feature = "libdeflate",
+        feature = "isal",
+        feature = "zlib-rs",
+        feature = "zune"
+    ))]
     if verbose {
         use std::sync::atomic::Ordering::Relaxed;
         let done = LD_DONE.load(Relaxed);
@@ -1375,7 +1408,10 @@ pub fn parallel_decode_bgzf(
             let decompressor = crate::libdeflate_ffi::Decompressor::default();
             #[cfg(all(feature = "isal", not(feature = "libdeflate")))]
             let isal_decompressor = crate::isal_ffi::Decompressor::default();
-            #[cfg(all(feature = "zlib-rs", not(any(feature = "libdeflate", feature = "isal"))))]
+            #[cfg(all(
+                feature = "zlib-rs",
+                not(any(feature = "libdeflate", feature = "isal"))
+            ))]
             let mut zlibrs_decompressor = crate::zlibrs_ffi::Decompressor::default();
             while let Ok((id, first_member, batch_members)) = work_rx.recv() {
                 // BGZF blocks are ≤64 KiB uncompressed; preallocate to avoid
@@ -1406,7 +1442,10 @@ pub fn parallel_decode_bgzf(
                         &mut out,
                     )
                     .map_err(Error::Deflate);
-                    #[cfg(all(feature = "zlib-rs", not(any(feature = "libdeflate", feature = "isal"))))]
+                    #[cfg(all(
+                        feature = "zlib-rs",
+                        not(any(feature = "libdeflate", feature = "isal"))
+                    ))]
                     let res = crate::zlibrs_ffi::decode_gzip_member(
                         &mut zlibrs_decompressor,
                         &file[s..e],

@@ -365,8 +365,19 @@ fn decode_compressed_preload(
                 bits -= len_extra;
             }
             match decode_distance_and_copy(
-                &mut buf, &mut bits, &mut byte_pos, input_ptr, input_len, dist_lut, dist, br,
-                out, &mut out_ptr, &mut cap, &mut cur, length,
+                &mut buf,
+                &mut bits,
+                &mut byte_pos,
+                input_ptr,
+                input_len,
+                dist_lut,
+                dist,
+                br,
+                out,
+                &mut out_ptr,
+                &mut cap,
+                &mut cur,
+                length,
             ) {
                 Ok(()) => continue 'outer,
                 Err(e) => break 'outer Err(e),
@@ -438,7 +449,9 @@ fn decode_compressed_preload(
             break 'outer if distance == 0 {
                 Err(DeflateError::Invalid("zero back-reference distance"))
             } else {
-                Err(DeflateError::Invalid("back-reference distance out of bounds"))
+                Err(DeflateError::Invalid(
+                    "back-reference distance out of bounds",
+                ))
             };
         }
         unsafe { copy_back_raw(out_ptr, cur, distance, length) };
@@ -522,7 +535,9 @@ fn decode_distance_and_copy(
         *bits -= dextra;
     }
     if distance == 0 || distance > *cur {
-        return Err(DeflateError::Invalid("back-reference distance out of bounds"));
+        return Err(DeflateError::Invalid(
+            "back-reference distance out of bounds",
+        ));
     }
     if *cap - *cur < length + COPY_HEADROOM {
         unsafe { out.set_len(*cur) };
@@ -1086,27 +1101,45 @@ pub fn decode_three_interleaved(
             let (llb, dlb) = (lb.lut(), distb.lut());
             let (llc, dlc) = (lc.lut(), distc.lut());
             while iba && ibb && ibc {
-                step1!(bufa, bitsa, bpa, ca, pa, lla, dla, &la, &dista, iba, da, bfa, &mut bra, ipa, ila);
-                step1!(bufb, bitsb, bpb, cb, pb, llb, dlb, &lb, &distb, ibb, db, bfb, &mut brb, ipb, ilb);
-                step1!(bufc, bitsc, bpc, cc, pc, llc, dlc, &lc, &distc, ibc, dc, bfc, &mut brc, ipc, ilc);
+                step1!(
+                    bufa, bitsa, bpa, ca, pa, lla, dla, &la, &dista, iba, da, bfa, &mut bra, ipa,
+                    ila
+                );
+                step1!(
+                    bufb, bitsb, bpb, cb, pb, llb, dlb, &lb, &distb, ibb, db, bfb, &mut brb, ipb,
+                    ilb
+                );
+                step1!(
+                    bufc, bitsc, bpc, cc, pc, llc, dlc, &lc, &distc, ibc, dc, bfc, &mut brc, ipc,
+                    ilc
+                );
             }
         } else {
             if iba {
                 let (lla, dla) = (la.lut(), dista.lut());
                 while iba {
-                    step1!(bufa, bitsa, bpa, ca, pa, lla, dla, &la, &dista, iba, da, bfa, &mut bra, ipa, ila);
+                    step1!(
+                        bufa, bitsa, bpa, ca, pa, lla, dla, &la, &dista, iba, da, bfa, &mut bra,
+                        ipa, ila
+                    );
                 }
             }
             if ibb {
                 let (llb, dlb) = (lb.lut(), distb.lut());
                 while ibb {
-                    step1!(bufb, bitsb, bpb, cb, pb, llb, dlb, &lb, &distb, ibb, db, bfb, &mut brb, ipb, ilb);
+                    step1!(
+                        bufb, bitsb, bpb, cb, pb, llb, dlb, &lb, &distb, ibb, db, bfb, &mut brb,
+                        ipb, ilb
+                    );
                 }
             }
             if ibc {
                 let (llc, dlc) = (lc.lut(), distc.lut());
                 while ibc {
-                    step1!(bufc, bitsc, bpc, cc, pc, llc, dlc, &lc, &distc, ibc, dc, bfc, &mut brc, ipc, ilc);
+                    step1!(
+                        bufc, bitsc, bpc, cc, pc, llc, dlc, &lc, &distc, ibc, dc, bfc, &mut brc,
+                        ipc, ilc
+                    );
                 }
             }
         }
@@ -1122,10 +1155,7 @@ pub fn decode_three_interleaved(
 /// one input four times and so shares the compressed footprint in L1).
 #[cfg(test)]
 #[allow(unsafe_code)]
-pub fn decode_four_distinct(
-    ins: [&[u8]; 4],
-    outs: &mut [Vec<u8>; 4],
-) -> Result<(), DeflateError> {
+pub fn decode_four_distinct(ins: [&[u8]; 4], outs: &mut [Vec<u8>; 4]) -> Result<(), DeflateError> {
     let [oa, ob, oc, od] = outs;
     let [ina, inb, inc, ind] = ins;
     let (mut bra, mut brb, mut brc, mut brd) = (
@@ -1161,19 +1191,27 @@ pub fn decode_four_distinct(
     let mut distd = HuffmanDecoder::new_empty();
     while !(da && db && dc && dd) {
         if !iba && !da {
-            let r = step_start_block(&mut bra, &mut bufa, &mut bitsa, &mut bpa, pa, &mut ca, &mut la, &mut dista)?;
+            let r = step_start_block(
+                &mut bra, &mut bufa, &mut bitsa, &mut bpa, pa, &mut ca, &mut la, &mut dista,
+            )?;
             (iba, bfa, da) = r;
         }
         if !ibb && !db {
-            let r = step_start_block(&mut brb, &mut bufb, &mut bitsb, &mut bpb, pb, &mut cb, &mut lb, &mut distb)?;
+            let r = step_start_block(
+                &mut brb, &mut bufb, &mut bitsb, &mut bpb, pb, &mut cb, &mut lb, &mut distb,
+            )?;
             (ibb, bfb, db) = r;
         }
         if !ibc && !dc {
-            let r = step_start_block(&mut brc, &mut bufc, &mut bitsc, &mut bpc, pc, &mut cc, &mut lc, &mut distc)?;
+            let r = step_start_block(
+                &mut brc, &mut bufc, &mut bitsc, &mut bpc, pc, &mut cc, &mut lc, &mut distc,
+            )?;
             (ibc, bfc, dc) = r;
         }
         if !ibd && !dd {
-            let r = step_start_block(&mut brd, &mut bufd, &mut bitsd, &mut bpd, pd, &mut cd, &mut ld, &mut distd)?;
+            let r = step_start_block(
+                &mut brd, &mut bufd, &mut bitsd, &mut bpd, pd, &mut cd, &mut ld, &mut distd,
+            )?;
             (ibd, bfd, dd) = r;
         }
         if iba && ibb && ibc && ibd {
@@ -1182,27 +1220,59 @@ pub fn decode_four_distinct(
             let (llc, dlc) = (lc.lut(), distc.lut());
             let (lld, dld) = (ld.lut(), distd.lut());
             while iba && ibb && ibc && ibd {
-                step1!(bufa, bitsa, bpa, ca, pa, lla, dla, &la, &dista, iba, da, bfa, &mut bra, ipa, ila);
-                step1!(bufb, bitsb, bpb, cb, pb, llb, dlb, &lb, &distb, ibb, db, bfb, &mut brb, ipb, ilb);
-                step1!(bufc, bitsc, bpc, cc, pc, llc, dlc, &lc, &distc, ibc, dc, bfc, &mut brc, ipc, ilc);
-                step1!(bufd, bitsd, bpd, cd, pd, lld, dld, &ld, &distd, ibd, dd, bfd, &mut brd, ipd, ild);
+                step1!(
+                    bufa, bitsa, bpa, ca, pa, lla, dla, &la, &dista, iba, da, bfa, &mut bra, ipa,
+                    ila
+                );
+                step1!(
+                    bufb, bitsb, bpb, cb, pb, llb, dlb, &lb, &distb, ibb, db, bfb, &mut brb, ipb,
+                    ilb
+                );
+                step1!(
+                    bufc, bitsc, bpc, cc, pc, llc, dlc, &lc, &distc, ibc, dc, bfc, &mut brc, ipc,
+                    ilc
+                );
+                step1!(
+                    bufd, bitsd, bpd, cd, pd, lld, dld, &ld, &distd, ibd, dd, bfd, &mut brd, ipd,
+                    ild
+                );
             }
         } else {
             if iba {
                 let (lla, dla) = (la.lut(), dista.lut());
-                while iba { step1!(bufa, bitsa, bpa, ca, pa, lla, dla, &la, &dista, iba, da, bfa, &mut bra, ipa, ila); }
+                while iba {
+                    step1!(
+                        bufa, bitsa, bpa, ca, pa, lla, dla, &la, &dista, iba, da, bfa, &mut bra,
+                        ipa, ila
+                    );
+                }
             }
             if ibb {
                 let (llb, dlb) = (lb.lut(), distb.lut());
-                while ibb { step1!(bufb, bitsb, bpb, cb, pb, llb, dlb, &lb, &distb, ibb, db, bfb, &mut brb, ipb, ilb); }
+                while ibb {
+                    step1!(
+                        bufb, bitsb, bpb, cb, pb, llb, dlb, &lb, &distb, ibb, db, bfb, &mut brb,
+                        ipb, ilb
+                    );
+                }
             }
             if ibc {
                 let (llc, dlc) = (lc.lut(), distc.lut());
-                while ibc { step1!(bufc, bitsc, bpc, cc, pc, llc, dlc, &lc, &distc, ibc, dc, bfc, &mut brc, ipc, ilc); }
+                while ibc {
+                    step1!(
+                        bufc, bitsc, bpc, cc, pc, llc, dlc, &lc, &distc, ibc, dc, bfc, &mut brc,
+                        ipc, ilc
+                    );
+                }
             }
             if ibd {
                 let (lld, dld) = (ld.lut(), distd.lut());
-                while ibd { step1!(bufd, bitsd, bpd, cd, pd, lld, dld, &ld, &distd, ibd, dd, bfd, &mut brd, ipd, ild); }
+                while ibd {
+                    step1!(
+                        bufd, bitsd, bpd, cd, pd, lld, dld, &ld, &distd, ibd, dd, bfd, &mut brd,
+                        ipd, ild
+                    );
+                }
             }
         }
     }
@@ -1219,10 +1289,7 @@ pub fn decode_four_distinct(
 /// to "how many chunks per worker".
 #[cfg(test)]
 #[allow(unsafe_code)]
-pub fn decode_four_interleaved(
-    input: &[u8],
-    outs: &mut [Vec<u8>; 4],
-) -> Result<(), DeflateError> {
+pub fn decode_four_interleaved(input: &[u8], outs: &mut [Vec<u8>; 4]) -> Result<(), DeflateError> {
     let [oa, ob, oc, od] = outs;
     let (mut bra, mut brb, mut brc, mut brd) = (
         BitReader::new(input),
@@ -1285,35 +1352,55 @@ pub fn decode_four_interleaved(
             let (llc, dlc) = (lc.lut(), distc.lut());
             let (lld, dld) = (ld.lut(), distd.lut());
             while iba && ibb && ibc && ibd {
-                step1!(bufa, bitsa, bpa, ca, pa, lla, dla, &la, &dista, iba, da, bfa, &mut bra, ip, il);
-                step1!(bufb, bitsb, bpb, cb, pb, llb, dlb, &lb, &distb, ibb, db, bfb, &mut brb, ip, il);
-                step1!(bufc, bitsc, bpc, cc, pc, llc, dlc, &lc, &distc, ibc, dc, bfc, &mut brc, ip, il);
-                step1!(bufd, bitsd, bpd, cd, pd, lld, dld, &ld, &distd, ibd, dd, bfd, &mut brd, ip, il);
+                step1!(
+                    bufa, bitsa, bpa, ca, pa, lla, dla, &la, &dista, iba, da, bfa, &mut bra, ip, il
+                );
+                step1!(
+                    bufb, bitsb, bpb, cb, pb, llb, dlb, &lb, &distb, ibb, db, bfb, &mut brb, ip, il
+                );
+                step1!(
+                    bufc, bitsc, bpc, cc, pc, llc, dlc, &lc, &distc, ibc, dc, bfc, &mut brc, ip, il
+                );
+                step1!(
+                    bufd, bitsd, bpd, cd, pd, lld, dld, &ld, &distd, ibd, dd, bfd, &mut brd, ip, il
+                );
             }
         } else {
             // Ragged tail: drain whichever are mid-block one at a time.
             if iba {
                 let (lla, dla) = (la.lut(), dista.lut());
                 while iba {
-                    step1!(bufa, bitsa, bpa, ca, pa, lla, dla, &la, &dista, iba, da, bfa, &mut bra, ip, il);
+                    step1!(
+                        bufa, bitsa, bpa, ca, pa, lla, dla, &la, &dista, iba, da, bfa, &mut bra,
+                        ip, il
+                    );
                 }
             }
             if ibb {
                 let (llb, dlb) = (lb.lut(), distb.lut());
                 while ibb {
-                    step1!(bufb, bitsb, bpb, cb, pb, llb, dlb, &lb, &distb, ibb, db, bfb, &mut brb, ip, il);
+                    step1!(
+                        bufb, bitsb, bpb, cb, pb, llb, dlb, &lb, &distb, ibb, db, bfb, &mut brb,
+                        ip, il
+                    );
                 }
             }
             if ibc {
                 let (llc, dlc) = (lc.lut(), distc.lut());
                 while ibc {
-                    step1!(bufc, bitsc, bpc, cc, pc, llc, dlc, &lc, &distc, ibc, dc, bfc, &mut brc, ip, il);
+                    step1!(
+                        bufc, bitsc, bpc, cc, pc, llc, dlc, &lc, &distc, ibc, dc, bfc, &mut brc,
+                        ip, il
+                    );
                 }
             }
             if ibd {
                 let (lld, dld) = (ld.lut(), distd.lut());
                 while ibd {
-                    step1!(bufd, bitsd, bpd, cd, pd, lld, dld, &ld, &distd, ibd, dd, bfd, &mut brd, ip, il);
+                    step1!(
+                        bufd, bitsd, bpd, cd, pd, lld, dld, &ld, &distd, ibd, dd, bfd, &mut brd,
+                        ip, il
+                    );
                 }
             }
         }
@@ -1761,7 +1848,10 @@ pub fn decode_until_u16(
         // at block boundaries, once enough history exists to retain a full window
         // beyond the original marker region. If markers persist (still
         // propagating), we stay on the u16 path — correct, just not accelerated.
-        if cur >= U16_HANDOFF_AT && scratch[cur - U16_WINDOW..cur].iter().all(|&c| c & MARKER16 == 0)
+        if cur >= U16_HANDOFF_AT
+            && scratch[cur - U16_WINDOW..cur]
+                .iter()
+                .all(|&c| c & MARKER16 == 0)
         {
             break;
         }
@@ -2207,9 +2297,15 @@ mod tests {
         let mut b = Vec::new();
         decode_member_u8_preload(&padded, 0, u64::MAX, &mut b).unwrap();
 
-        assert_eq!(a, payload, "u8 kernel mismatch (len={} level={level})", payload.len());
         assert_eq!(
-            b, payload,
+            a,
+            payload,
+            "u8 kernel mismatch (len={} level={level})",
+            payload.len()
+        );
+        assert_eq!(
+            b,
+            payload,
             "preload kernel mismatch (len={} level={level})",
             payload.len()
         );
@@ -2388,7 +2484,8 @@ mod tests {
 
         // Resolve markers.
         let tail_start = chunk0.bytes.len().saturating_sub(32 * 1024);
-        super::super::speculative::resolve_markers(&mut chunk1, &chunk0.bytes[tail_start..]).unwrap();
+        super::super::speculative::resolve_markers(&mut chunk1, &chunk0.bytes[tail_start..])
+            .unwrap();
 
         let mut stitched = chunk0.bytes.clone();
         stitched.extend_from_slice(&chunk1.bytes);
@@ -2481,9 +2578,11 @@ mod tests {
             let (_, hit_bfinal) =
                 decode_until(&padded, start_bit, end_bit_hint, &mut chunk).unwrap();
 
-            super::super::speculative::resolve_markers(&mut chunk, &prev_tail).unwrap_or_else(|e| {
-                panic!("resolve_markers failed on chunk {i}: {e}");
-            });
+            super::super::speculative::resolve_markers(&mut chunk, &prev_tail).unwrap_or_else(
+                |e| {
+                    panic!("resolve_markers failed on chunk {i}: {e}");
+                },
+            );
 
             // Update prev_tail (last 32KB).
             const WINDOW: usize = 32 * 1024;

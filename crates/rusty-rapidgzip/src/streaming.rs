@@ -52,9 +52,7 @@ use std::thread;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 
-use crate::deflate::{
-    fast_inflate, find_next_dynamic_block, resolve_markers, SpeculativeChunk,
-};
+use crate::deflate::{fast_inflate, find_next_dynamic_block, resolve_markers, SpeculativeChunk};
 
 use crate::pipeline::build_prev_tail_fast;
 use crate::{Error, GzipError};

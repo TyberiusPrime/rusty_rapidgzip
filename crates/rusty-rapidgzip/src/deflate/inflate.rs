@@ -12,7 +12,7 @@ use super::huffman::{HUFFDEC_EXCEPTIONAL, HUFFDEC_LITERAL, LUT_BITS};
 use super::tables::*;
 use super::{BitReader, DeflateError, HuffmanDecoder};
 
-pub (crate) mod speculative;
+pub(crate) mod speculative;
 
 /// Maximum back-reference distance permitted by DEFLATE.
 pub const MAX_DISTANCE: usize = 32 * 1024;

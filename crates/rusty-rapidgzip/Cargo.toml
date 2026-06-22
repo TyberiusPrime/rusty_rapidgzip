@@ -12,11 +12,12 @@ description = "Streaming, parallel gzip decoder. Inspired by rapidgzip / pugz."
 # fast path) through the external libdeflate C library instead of our own
 # inflate kernel. Measured a 1.1–1.3x win wherever members sit fully inside a
 # chunk (multi-member gzip, BGZF) and a true no-op on single-member streams
-# (libdeflate never engages — the decompressor isn't even allocated). Requires
-# libdeflate's static lib at $LIBDEFLATE_LIB_DIR (see build.rs); build with
+# (libdeflate never engages — the decompressor isn't even allocated). libdeflate
+# is compiled from vendored C source by the `libdeflate-sys` crate and linked
+# statically, so no external library is needed on any target; build with
 # `--no-default-features` to use the pure-Rust kernel and drop the C dependency.
 default = ["libdeflate"]
-libdeflate = []
+libdeflate = ["dep:libdeflate-sys"]
 # Experimental alternative backend: route per-member / BGZF decode through Intel
 # ISA-L's igzip (`isal_inflate`, hand-written SIMD assembly) instead of our own
 # kernel, to quantify whether it beats libdeflate / pure-Rust. Mutually used as
@@ -41,6 +42,7 @@ crc32fast.workspace = true
 crossbeam-channel.workspace = true
 thiserror.workspace = true
 memmap2.workspace = true
+libdeflate-sys = { workspace = true, optional = true }
 libz-rs-sys = { workspace = true, optional = true }
 zune-inflate = { path = "../../vendor/zune-inflate", default-features = false, features = ["gzip", "std"], optional = true }
 

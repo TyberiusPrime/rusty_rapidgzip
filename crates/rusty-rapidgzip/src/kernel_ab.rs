@@ -190,8 +190,7 @@ fn bench_two_interleaved(body: &[u8], plainlen: usize, iters: usize) -> f64 {
 
 /// Four streams interleaved (find the MLP ceiling).
 fn bench_four_interleaved(body: &[u8], plainlen: usize, iters: usize) -> f64 {
-    let mut outs: [Vec<u8>; 4] =
-        std::array::from_fn(|_| Vec::with_capacity(plainlen + 4096));
+    let mut outs: [Vec<u8>; 4] = std::array::from_fn(|_| Vec::with_capacity(plainlen + 4096));
     decode_four_interleaved(body, &mut outs).unwrap();
     for o in &outs {
         assert_eq!(o.len(), plainlen, "interleaved4: length mismatch");
@@ -236,7 +235,10 @@ fn bench_distinct(iters: usize) {
     let bodies: Vec<&[u8]> = fx.iter().map(|(b, _)| b.as_slice()).collect();
     let plains: Vec<usize> = fx.iter().map(|(_, p)| *p).collect();
 
-    let mut bufs: Vec<Vec<u8>> = fx.iter().map(|(_, p)| Vec::with_capacity(p + 4096)).collect();
+    let mut bufs: Vec<Vec<u8>> = fx
+        .iter()
+        .map(|(_, p)| Vec::with_capacity(p + 4096))
+        .collect();
 
     // 1x stepwise: sum of decoding all four members one after another.
     for (i, b) in bodies.iter().enumerate() {
@@ -378,10 +380,7 @@ fn midstream_chunks(body: &[u8]) -> Vec<(u64, u64)> {
         }
         c += chunk_bits;
     }
-    bounds
-        .windows(2)
-        .map(|w| (w[0], w[1]))
-        .collect()
+    bounds.windows(2).map(|w| (w[0], w[1])).collect()
 }
 
 fn bench_u16(body: &[u8], _plainlen: usize, iters: usize) -> f64 {
@@ -459,7 +458,10 @@ fn run() {
             "preload : {:8.1} MB/s",
             bench_preload(&body, plainlen, iters)
         ),
-        "zlibrs" => eprintln!("zlibrs  : {:8.1} MB/s", bench_zlibrs(&body, plainlen, iters)),
+        "zlibrs" => eprintln!(
+            "zlibrs  : {:8.1} MB/s",
+            bench_zlibrs(&body, plainlen, iters)
+        ),
         "stepwise" => eprintln!(
             "stepwise: {:8.1} MB/s",
             bench_stepwise(&body, plainlen, iters)
@@ -496,7 +498,11 @@ fn run() {
             #[cfg(feature = "libdeflate")]
             {
                 let l = bench_libdeflate(&body, plainlen, iters);
-                eprintln!("libdeflate: {l:8.1} MB/s  ({:.2}x ours, {:.2}x zlibrs)", l / o, l / z);
+                eprintln!(
+                    "libdeflate: {l:8.1} MB/s  ({:.2}x ours, {:.2}x zlibrs)",
+                    l / o,
+                    l / z
+                );
             }
             eprintln!("u16       : {u:8.1} MB/s  ({:.2}x ours)", u / o);
         }

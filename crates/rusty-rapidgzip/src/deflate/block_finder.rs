@@ -302,8 +302,8 @@ fn trial_decode(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::inflate::inflate_block;
+    use super::*;
 
     fn deflate_via_gzip(payload: &[u8], level: u32) -> Vec<u8> {
         use std::io::Write;

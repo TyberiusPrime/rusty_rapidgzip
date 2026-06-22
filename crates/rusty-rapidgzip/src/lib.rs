@@ -1,23 +1,26 @@
 //! Streaming, parallel gzip decoder.
 
-pub mod gzip;
-pub mod pipeline;
-mod streaming;
 pub mod deflate;
-#[cfg(feature = "libdeflate")]
-mod libdeflate_ffi;
+pub mod gzip;
 #[cfg(all(feature = "isal", not(feature = "libdeflate")))]
 mod isal_ffi;
+#[cfg(feature = "libdeflate")]
+mod libdeflate_ffi;
+pub mod pipeline;
+mod streaming;
 // Normally only the active backend's FFI compiles. Under `test` we also allow
 // `zlibrs_ffi` to compile alongside libdeflate so the kernel A/B/C microbench
 // (`kernel_ab`) can pit ours vs zlib-rs vs libdeflate in a single binary.
+#[cfg(all(test, feature = "zlib-rs"))]
+mod kernel_ab;
 #[cfg(any(
-    all(feature = "zlib-rs", not(any(feature = "libdeflate", feature = "isal"))),
+    all(
+        feature = "zlib-rs",
+        not(any(feature = "libdeflate", feature = "isal"))
+    ),
     all(test, feature = "zlib-rs")
 ))]
 mod zlibrs_ffi;
-#[cfg(all(test, feature = "zlib-rs"))]
-mod kernel_ab;
 #[cfg(all(
     feature = "zune",
     not(any(feature = "libdeflate", feature = "isal", feature = "zlib-rs"))
@@ -45,8 +48,8 @@ use std::time::Instant;
 use crossbeam_channel::{Receiver, Sender};
 use thiserror::Error;
 
-use pipeline::InputBytes;
 use crate::deflate::{inflate_block, BitReader, DeflateError};
+use pipeline::InputBytes;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -435,7 +438,10 @@ pub fn read_gz(
     // Regular non-empty file: mmap so workers can fault pages in on demand
     // instead of paying for the whole file up front.
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
-    // Best-effort hint for sequential access; OS may ignore.
+    // Best-effort hint for sequential access; OS may ignore. `madvise` (and thus
+    // memmap2's `Advice`) is unix-only — on other platforms we simply skip the
+    // hint.
+    #[cfg(unix)]
     let _ = mmap.advise(memmap2::Advice::Sequential);
     let compressed_bytes = mmap.len() as u64;
     let input = Arc::new(InputBytes::Mapped(mmap));
