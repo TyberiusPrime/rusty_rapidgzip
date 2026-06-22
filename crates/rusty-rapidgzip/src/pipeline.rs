@@ -65,6 +65,40 @@ impl InputBytes {
     pub fn is_empty(&self) -> bool {
         self.as_slice().is_empty()
     }
+
+    /// Best-effort: tell the kernel the byte range `[offset, offset + len)` of
+    /// the backing store is no longer needed resident, via `MADV_DONTNEED`.
+    ///
+    /// The parallel decoder reads compressed input strictly forward, so once the
+    /// serializer has advanced past a region nothing reads it again; dropping it
+    /// keeps resident input bounded instead of pinning the whole (multi-GiB) file
+    /// in RSS, which on a memory-pressured host would otherwise evict and refault
+    /// the very pages still being decoded (huge `sys` time).
+    ///
+    /// `offset` and `len` must be page-aligned for the hint to take effect; the
+    /// caller advises in coarse, page-multiple granules. No-op for the owned
+    /// buffer, on non-unix targets, and on any range the kernel rejects.
+    #[inline]
+    pub fn advise_dontneed(&self, offset: usize, len: usize) {
+        #[cfg(unix)]
+        if let InputBytes::Mapped(m) = self {
+            if len > 0 && offset + len <= m.len() {
+                // SAFETY: `m` is a read-only `Mmap` (no `MAP_PRIVATE` dirty
+                // pages), so `MADV_DONTNEED` only discards clean, file-backed
+                // pages that re-fault transparently from the page cache on the
+                // next access. We never read this range again (forward-only
+                // decode), so there is no re-fault and no data can be lost.
+                unsafe {
+                    let _ =
+                        m.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, offset, len);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (offset, len);
+        }
+    }
 }
 
 impl std::ops::Deref for InputBytes {
@@ -730,6 +764,13 @@ pub fn parallel_decode_member(
             // gzip-of-gzip test in `tests/nested_gzip.rs`.
             let mut expected_start: u64 = 0;
             let mut spec_failures: u64 = 0;
+            // Watermark (in absolute `input` bytes) up to which we've already
+            // released consumed compressed pages. Advise in coarse, page-multiple
+            // granules so the hint is cheap (a few hundred syscalls over a
+            // multi-GiB file) and always page-aligned regardless of the host page
+            // size (`DONTNEED_GRANULE` is a multiple of every common page size).
+            const DONTNEED_GRANULE: usize = 32 * 1024 * 1024;
+            let mut input_advised: usize = 0;
             while next_id < num_chunks {
                 while let Some(outcome) = reorder.remove(&next_id) {
                     let WorkOutcome {
@@ -767,6 +808,17 @@ pub fn parallel_decode_member(
                         }
                     };
                     expected_start = res.actual_end_bit;
+                    // Release compressed input the decode has moved past. Bytes
+                    // strictly below `expected_start / 8` are fully consumed (the
+                    // byte holding the next block's first bit may be mid-read, so
+                    // floor and align down). Workers only ever read forward from
+                    // `expected_start`, so this never drops a page still in use.
+                    let consumed = body_offset + (expected_start / 8) as usize;
+                    let new_advised = (consumed / DONTNEED_GRANULE) * DONTNEED_GRANULE;
+                    if new_advised > input_advised {
+                        input_a.advise_dontneed(input_advised, new_advised - input_advised);
+                        input_advised = new_advised;
+                    }
                     // Resolve only this chunk's tail to feed the next chunk; the
                     // bulk resolve happens in the pool against `prev_arc`.
                     let new_tail = build_prev_tail_fast(&res.chunk, &prev_tail);
