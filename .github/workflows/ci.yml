@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch: # allow manual runs from the Actions tab / `gh workflow run`
 
 jobs:
   # ── Linux: reproducible, offline check matrix via the Nix flake ───────────
