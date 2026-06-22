@@ -737,6 +737,594 @@ unsafe fn load_le_u64(ptr: *const u8, pos: usize) -> u64 {
     u64::from_le(std::ptr::read_unaligned(ptr.add(pos) as *const u64))
 }
 
+// ── EXPERIMENT: dual-stream interleave (single-core MLP test) ──────────────────
+// Hypothesis: the decode loop is latency-bound on a per-symbol L1 LUT load, so a
+// single core has spare execution capacity. Decoding TWO independent streams with
+// interleaved per-symbol steps presents the core two independent load chains that
+// should overlap, ~1.5-1.8x single-core throughput if the hypothesis holds. The
+// baseline and interleaved paths share the identical `step1!` body, so the only
+// variable is interleaving — a clean ratio test. (`#[cfg(test)]`, bench-only.)
+
+/// Decode exactly one litlen symbol (literal, EOB, or a full length+distance
+/// match) for a stream whose bit state lives in the named locals. Refills first.
+/// Cold paths (long codes, EOF) sync to `$br` and reload. Sets `$inb=false` (and
+/// `$done` on a final-block EOB) when the block ends.
+#[cfg(test)]
+macro_rules! step1 {
+    ($buf:ident,$bits:ident,$bp:ident,$cur:ident,$outp:ident,
+     $litlut:expr,$distlut:expr,$lit:expr,$dist:expr,
+     $inb:ident,$done:ident,$bfinal:ident,$br:expr,$inptr:ident,$inlen:ident) => {{
+        const MASK: u64 = (1u64 << LUT_BITS) - 1;
+        if $bp + 8 <= $inlen {
+            $buf |= unsafe { load_le_u64($inptr, $bp) } << $bits;
+            $bp += ((63u32 ^ $bits) >> 3) as usize;
+            $bits |= 56;
+        } else {
+            while $bits < 48 {
+                if $bp >= $inlen {
+                    $done = true;
+                    $inb = false;
+                    break;
+                }
+                $buf |= unsafe { (*$inptr.add($bp)) as u64 } << $bits;
+                $bp += 1;
+                $bits += 8;
+            }
+        }
+        if $inb {
+            let mut entry = $litlut[($buf & MASK) as usize];
+            let clen = entry & 0xff;
+            if clen == 0 {
+                $br.buf = $buf;
+                $br.bits = $bits;
+                $br.byte_pos = $bp;
+                entry = $lit.lookup_long($br)?;
+                $buf = $br.buf;
+                $bits = $br.bits;
+                $bp = $br.byte_pos;
+            } else {
+                $buf >>= clen;
+                $bits -= clen;
+            }
+            if entry & HUFFDEC_LITERAL != 0 {
+                unsafe { *$outp.add($cur) = (entry >> 16) as u8 };
+                $cur += 1;
+            } else if entry & HUFFDEC_EXCEPTIONAL != 0 {
+                if entry >> 16 == 0 {
+                    $inb = false;
+                    if $bfinal {
+                        $done = true;
+                    }
+                } else {
+                    return Err(DeflateError::Invalid("litlen symbol out of range"));
+                }
+            } else {
+                let mut length = ((entry >> 16) & 0x1ff) as usize;
+                let lextra = (entry >> 8) & 0x1f;
+                if lextra > 0 {
+                    length += ($buf & ((1u64 << lextra) - 1)) as usize;
+                    $buf >>= lextra;
+                    $bits -= lextra;
+                }
+                if $bits < 33 {
+                    if $bp + 8 <= $inlen {
+                        $buf |= unsafe { load_le_u64($inptr, $bp) } << $bits;
+                        $bp += ((63u32 ^ $bits) >> 3) as usize;
+                        $bits |= 56;
+                    } else {
+                        while $bits < 33 && $bp < $inlen {
+                            $buf |= unsafe { (*$inptr.add($bp)) as u64 } << $bits;
+                            $bp += 1;
+                            $bits += 8;
+                        }
+                    }
+                }
+                let mut dentry = $distlut[($buf & MASK) as usize];
+                let dlen = dentry & 0xff;
+                if dlen == 0 {
+                    $br.buf = $buf;
+                    $br.bits = $bits;
+                    $br.byte_pos = $bp;
+                    dentry = $dist.lookup_long($br)?;
+                    $buf = $br.buf;
+                    $bits = $br.bits;
+                    $bp = $br.byte_pos;
+                } else {
+                    $buf >>= dlen;
+                    $bits -= dlen;
+                }
+                let mut distance = (dentry >> 16) as usize;
+                let dextra = (dentry >> 8) & 0x1f;
+                if dextra > 0 {
+                    distance += ($buf & ((1u64 << dextra) - 1)) as usize;
+                    $buf >>= dextra;
+                    $bits -= dextra;
+                }
+                unsafe { copy_back_raw($outp, $cur, distance, length) };
+                $cur += length;
+            }
+        }
+    }};
+}
+
+/// Cold per-block header parse, shared by the single and dual-stream drivers.
+/// On a stored block it copies the payload directly into `out_ptr[*cur..]`.
+/// Returns `(in_block, bfinal, done)`.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+#[allow(unsafe_code)]
+fn step_start_block(
+    br: &mut BitReader<'_>,
+    buf: &mut u64,
+    bits: &mut u32,
+    bp: &mut usize,
+    out_ptr: *mut u8,
+    cur: &mut usize,
+    lit: &mut HuffmanDecoder,
+    dist: &mut HuffmanDecoder,
+) -> Result<(bool, bool, bool), DeflateError> {
+    br.buf = *buf;
+    br.bits = *bits;
+    br.byte_pos = *bp;
+    let bfinal = br.read(1)? != 0;
+    let btype = br.read(2)?;
+    let mut in_block = true;
+    let mut done = false;
+    match btype {
+        0 => {
+            br.byte_align();
+            let len = br.read(16)? as usize;
+            let _nlen = br.read(16)?;
+            for _ in 0..len {
+                let b = br.read(8)? as u8;
+                unsafe { *out_ptr.add(*cur) = b };
+                *cur += 1;
+            }
+            in_block = false;
+            done = bfinal;
+        }
+        1 => {
+            lit.rebuild_from_lengths_litlen(&fixed_literal_lengths())?;
+            dist.rebuild_from_lengths_dist(&fixed_distance_lengths())?;
+        }
+        2 => {
+            let (l, d) = read_dynamic_header(br)?;
+            *lit = l;
+            *dist = d;
+        }
+        _ => return Err(DeflateError::Invalid("reserved block type")),
+    }
+    *buf = br.buf;
+    *bits = br.bits;
+    *bp = br.byte_pos;
+    Ok((in_block, bfinal, done))
+}
+
+/// Baseline: decode one whole member, one symbol per loop step (no literal
+/// sub-loop, refill every symbol) — the per-symbol shape the dual-stream test
+/// interleaves, so the two are directly comparable.
+#[cfg(test)]
+#[allow(unsafe_code)]
+pub fn decode_member_stepwise(input: &[u8], out: &mut Vec<u8>) -> Result<(), DeflateError> {
+    let mut br = BitReader::new(input);
+    let out_ptr = out.as_mut_ptr();
+    let mut cur = 0usize;
+    let mut buf = 0u64;
+    let mut bits = 0u32;
+    let mut bp = 0usize;
+    let input_ptr = input.as_ptr();
+    let input_len = input.len();
+    let mut in_block = false;
+    let mut done = false;
+    let mut bfinal = false;
+    let mut lit = HuffmanDecoder::new_empty();
+    let mut dist = HuffmanDecoder::new_empty();
+    while !done {
+        if !in_block {
+            let (ib, bf, dn) = step_start_block(
+                &mut br, &mut buf, &mut bits, &mut bp, out_ptr, &mut cur, &mut lit, &mut dist,
+            )?;
+            in_block = ib;
+            bfinal = bf;
+            done = dn;
+            continue;
+        }
+        let lit_lut = lit.lut();
+        let dist_lut = dist.lut();
+        while in_block {
+            step1!(
+                buf, bits, bp, cur, out_ptr, lit_lut, dist_lut, &lit, &dist, in_block, done,
+                bfinal, &mut br, input_ptr, input_len
+            );
+        }
+    }
+    unsafe { out.set_len(cur) };
+    Ok(())
+}
+
+/// Interleaved: decode two members at once, one symbol from each per fused step,
+/// so the two independent LUT-load chains overlap on one core.
+#[cfg(test)]
+#[allow(unsafe_code)]
+pub fn decode_two_interleaved(
+    in_a: &[u8],
+    out_a: &mut Vec<u8>,
+    in_b: &[u8],
+    out_b: &mut Vec<u8>,
+) -> Result<(), DeflateError> {
+    let mut bra = BitReader::new(in_a);
+    let mut brb = BitReader::new(in_b);
+    let pa = out_a.as_mut_ptr();
+    let pb = out_b.as_mut_ptr();
+    let (mut ca, mut cb) = (0usize, 0usize);
+    let (mut bufa, mut bufb) = (0u64, 0u64);
+    let (mut bitsa, mut bitsb) = (0u32, 0u32);
+    let (mut bpa, mut bpb) = (0usize, 0usize);
+    let ipa = in_a.as_ptr();
+    let ila = in_a.len();
+    let ipb = in_b.as_ptr();
+    let ilb = in_b.len();
+    let (mut iba, mut ibb) = (false, false);
+    let (mut da, mut db) = (false, false);
+    let (mut bfa, mut bfb) = (false, false);
+    let mut lita = HuffmanDecoder::new_empty();
+    let mut dista = HuffmanDecoder::new_empty();
+    let mut litb = HuffmanDecoder::new_empty();
+    let mut distb = HuffmanDecoder::new_empty();
+    while !(da && db) {
+        if !iba && !da {
+            let (ib, bf, dn) = step_start_block(
+                &mut bra, &mut bufa, &mut bitsa, &mut bpa, pa, &mut ca, &mut lita, &mut dista,
+            )?;
+            iba = ib;
+            bfa = bf;
+            da = dn;
+        }
+        if !ibb && !db {
+            let (ib, bf, dn) = step_start_block(
+                &mut brb, &mut bufb, &mut bitsb, &mut bpb, pb, &mut cb, &mut litb, &mut distb,
+            )?;
+            ibb = ib;
+            bfb = bf;
+            db = dn;
+        }
+        if iba && ibb {
+            let lut_a = lita.lut();
+            let dlut_a = dista.lut();
+            let lut_b = litb.lut();
+            let dlut_b = distb.lut();
+            while iba && ibb {
+                step1!(
+                    bufa, bitsa, bpa, ca, pa, lut_a, dlut_a, &lita, &dista, iba, da, bfa, &mut bra,
+                    ipa, ila
+                );
+                step1!(
+                    bufb, bitsb, bpb, cb, pb, lut_b, dlut_b, &litb, &distb, ibb, db, bfb, &mut brb,
+                    ipb, ilb
+                );
+            }
+        } else if iba {
+            let lut_a = lita.lut();
+            let dlut_a = dista.lut();
+            while iba {
+                step1!(
+                    bufa, bitsa, bpa, ca, pa, lut_a, dlut_a, &lita, &dista, iba, da, bfa, &mut bra,
+                    ipa, ila
+                );
+            }
+        } else if ibb {
+            let lut_b = litb.lut();
+            let dlut_b = distb.lut();
+            while ibb {
+                step1!(
+                    bufb, bitsb, bpb, cb, pb, lut_b, dlut_b, &litb, &distb, ibb, db, bfb, &mut brb,
+                    ipb, ilb
+                );
+            }
+        }
+    }
+    unsafe { out_a.set_len(ca) };
+    unsafe { out_b.set_len(cb) };
+    Ok(())
+}
+
+/// 3-way interleave over THREE DISTINCT inputs (the likely production N).
+#[cfg(test)]
+#[allow(unsafe_code)]
+#[allow(clippy::too_many_arguments)]
+pub fn decode_three_interleaved(
+    in_a: &[u8],
+    out_a: &mut Vec<u8>,
+    in_b: &[u8],
+    out_b: &mut Vec<u8>,
+    in_c: &[u8],
+    out_c: &mut Vec<u8>,
+) -> Result<(), DeflateError> {
+    let (mut bra, mut brb, mut brc) = (
+        BitReader::new(in_a),
+        BitReader::new(in_b),
+        BitReader::new(in_c),
+    );
+    let (pa, pb, pc) = (out_a.as_mut_ptr(), out_b.as_mut_ptr(), out_c.as_mut_ptr());
+    let (ipa, ila) = (in_a.as_ptr(), in_a.len());
+    let (ipb, ilb) = (in_b.as_ptr(), in_b.len());
+    let (ipc, ilc) = (in_c.as_ptr(), in_c.len());
+    let (mut ca, mut cb, mut cc) = (0usize, 0usize, 0usize);
+    let (mut bufa, mut bufb, mut bufc) = (0u64, 0u64, 0u64);
+    let (mut bitsa, mut bitsb, mut bitsc) = (0u32, 0u32, 0u32);
+    let (mut bpa, mut bpb, mut bpc) = (0usize, 0usize, 0usize);
+    let (mut iba, mut ibb, mut ibc) = (false, false, false);
+    let (mut da, mut db, mut dc) = (false, false, false);
+    let (mut bfa, mut bfb, mut bfc) = (false, false, false);
+    let mut la = HuffmanDecoder::new_empty();
+    let mut dista = HuffmanDecoder::new_empty();
+    let mut lb = HuffmanDecoder::new_empty();
+    let mut distb = HuffmanDecoder::new_empty();
+    let mut lc = HuffmanDecoder::new_empty();
+    let mut distc = HuffmanDecoder::new_empty();
+    while !(da && db && dc) {
+        if !iba && !da {
+            let r = step_start_block(
+                &mut bra, &mut bufa, &mut bitsa, &mut bpa, pa, &mut ca, &mut la, &mut dista,
+            )?;
+            (iba, bfa, da) = r;
+        }
+        if !ibb && !db {
+            let r = step_start_block(
+                &mut brb, &mut bufb, &mut bitsb, &mut bpb, pb, &mut cb, &mut lb, &mut distb,
+            )?;
+            (ibb, bfb, db) = r;
+        }
+        if !ibc && !dc {
+            let r = step_start_block(
+                &mut brc, &mut bufc, &mut bitsc, &mut bpc, pc, &mut cc, &mut lc, &mut distc,
+            )?;
+            (ibc, bfc, dc) = r;
+        }
+        if iba && ibb && ibc {
+            let (lla, dla) = (la.lut(), dista.lut());
+            let (llb, dlb) = (lb.lut(), distb.lut());
+            let (llc, dlc) = (lc.lut(), distc.lut());
+            while iba && ibb && ibc {
+                step1!(bufa, bitsa, bpa, ca, pa, lla, dla, &la, &dista, iba, da, bfa, &mut bra, ipa, ila);
+                step1!(bufb, bitsb, bpb, cb, pb, llb, dlb, &lb, &distb, ibb, db, bfb, &mut brb, ipb, ilb);
+                step1!(bufc, bitsc, bpc, cc, pc, llc, dlc, &lc, &distc, ibc, dc, bfc, &mut brc, ipc, ilc);
+            }
+        } else {
+            if iba {
+                let (lla, dla) = (la.lut(), dista.lut());
+                while iba {
+                    step1!(bufa, bitsa, bpa, ca, pa, lla, dla, &la, &dista, iba, da, bfa, &mut bra, ipa, ila);
+                }
+            }
+            if ibb {
+                let (llb, dlb) = (lb.lut(), distb.lut());
+                while ibb {
+                    step1!(bufb, bitsb, bpb, cb, pb, llb, dlb, &lb, &distb, ibb, db, bfb, &mut brb, ipb, ilb);
+                }
+            }
+            if ibc {
+                let (llc, dlc) = (lc.lut(), distc.lut());
+                while ibc {
+                    step1!(bufc, bitsc, bpc, cc, pc, llc, dlc, &lc, &distc, ibc, dc, bfc, &mut brc, ipc, ilc);
+                }
+            }
+        }
+    }
+    unsafe { out_a.set_len(ca) };
+    unsafe { out_b.set_len(cb) };
+    unsafe { out_c.set_len(cc) };
+    Ok(())
+}
+
+/// 4-way interleave over FOUR DISTINCT inputs (truly distinct working sets, the
+/// realistic ship-or-not validation — vs `decode_four_interleaved` which reuses
+/// one input four times and so shares the compressed footprint in L1).
+#[cfg(test)]
+#[allow(unsafe_code)]
+pub fn decode_four_distinct(
+    ins: [&[u8]; 4],
+    outs: &mut [Vec<u8>; 4],
+) -> Result<(), DeflateError> {
+    let [oa, ob, oc, od] = outs;
+    let [ina, inb, inc, ind] = ins;
+    let (mut bra, mut brb, mut brc, mut brd) = (
+        BitReader::new(ina),
+        BitReader::new(inb),
+        BitReader::new(inc),
+        BitReader::new(ind),
+    );
+    let (pa, pb, pc, pd) = (
+        oa.as_mut_ptr(),
+        ob.as_mut_ptr(),
+        oc.as_mut_ptr(),
+        od.as_mut_ptr(),
+    );
+    let (ipa, ila) = (ina.as_ptr(), ina.len());
+    let (ipb, ilb) = (inb.as_ptr(), inb.len());
+    let (ipc, ilc) = (inc.as_ptr(), inc.len());
+    let (ipd, ild) = (ind.as_ptr(), ind.len());
+    let (mut ca, mut cb, mut cc, mut cd) = (0usize, 0usize, 0usize, 0usize);
+    let (mut bufa, mut bufb, mut bufc, mut bufd) = (0u64, 0u64, 0u64, 0u64);
+    let (mut bitsa, mut bitsb, mut bitsc, mut bitsd) = (0u32, 0u32, 0u32, 0u32);
+    let (mut bpa, mut bpb, mut bpc, mut bpd) = (0usize, 0usize, 0usize, 0usize);
+    let (mut iba, mut ibb, mut ibc, mut ibd) = (false, false, false, false);
+    let (mut da, mut db, mut dc, mut dd) = (false, false, false, false);
+    let (mut bfa, mut bfb, mut bfc, mut bfd) = (false, false, false, false);
+    let mut la = HuffmanDecoder::new_empty();
+    let mut dista = HuffmanDecoder::new_empty();
+    let mut lb = HuffmanDecoder::new_empty();
+    let mut distb = HuffmanDecoder::new_empty();
+    let mut lc = HuffmanDecoder::new_empty();
+    let mut distc = HuffmanDecoder::new_empty();
+    let mut ld = HuffmanDecoder::new_empty();
+    let mut distd = HuffmanDecoder::new_empty();
+    while !(da && db && dc && dd) {
+        if !iba && !da {
+            let r = step_start_block(&mut bra, &mut bufa, &mut bitsa, &mut bpa, pa, &mut ca, &mut la, &mut dista)?;
+            (iba, bfa, da) = r;
+        }
+        if !ibb && !db {
+            let r = step_start_block(&mut brb, &mut bufb, &mut bitsb, &mut bpb, pb, &mut cb, &mut lb, &mut distb)?;
+            (ibb, bfb, db) = r;
+        }
+        if !ibc && !dc {
+            let r = step_start_block(&mut brc, &mut bufc, &mut bitsc, &mut bpc, pc, &mut cc, &mut lc, &mut distc)?;
+            (ibc, bfc, dc) = r;
+        }
+        if !ibd && !dd {
+            let r = step_start_block(&mut brd, &mut bufd, &mut bitsd, &mut bpd, pd, &mut cd, &mut ld, &mut distd)?;
+            (ibd, bfd, dd) = r;
+        }
+        if iba && ibb && ibc && ibd {
+            let (lla, dla) = (la.lut(), dista.lut());
+            let (llb, dlb) = (lb.lut(), distb.lut());
+            let (llc, dlc) = (lc.lut(), distc.lut());
+            let (lld, dld) = (ld.lut(), distd.lut());
+            while iba && ibb && ibc && ibd {
+                step1!(bufa, bitsa, bpa, ca, pa, lla, dla, &la, &dista, iba, da, bfa, &mut bra, ipa, ila);
+                step1!(bufb, bitsb, bpb, cb, pb, llb, dlb, &lb, &distb, ibb, db, bfb, &mut brb, ipb, ilb);
+                step1!(bufc, bitsc, bpc, cc, pc, llc, dlc, &lc, &distc, ibc, dc, bfc, &mut brc, ipc, ilc);
+                step1!(bufd, bitsd, bpd, cd, pd, lld, dld, &ld, &distd, ibd, dd, bfd, &mut brd, ipd, ild);
+            }
+        } else {
+            if iba {
+                let (lla, dla) = (la.lut(), dista.lut());
+                while iba { step1!(bufa, bitsa, bpa, ca, pa, lla, dla, &la, &dista, iba, da, bfa, &mut bra, ipa, ila); }
+            }
+            if ibb {
+                let (llb, dlb) = (lb.lut(), distb.lut());
+                while ibb { step1!(bufb, bitsb, bpb, cb, pb, llb, dlb, &lb, &distb, ibb, db, bfb, &mut brb, ipb, ilb); }
+            }
+            if ibc {
+                let (llc, dlc) = (lc.lut(), distc.lut());
+                while ibc { step1!(bufc, bitsc, bpc, cc, pc, llc, dlc, &lc, &distc, ibc, dc, bfc, &mut brc, ipc, ilc); }
+            }
+            if ibd {
+                let (lld, dld) = (ld.lut(), distd.lut());
+                while ibd { step1!(bufd, bitsd, bpd, cd, pd, lld, dld, &ld, &distd, ibd, dd, bfd, &mut brd, ipd, ild); }
+            }
+        }
+    }
+    unsafe { oa.set_len(ca) };
+    unsafe { ob.set_len(cb) };
+    unsafe { oc.set_len(cc) };
+    unsafe { od.set_len(cd) };
+    Ok(())
+}
+
+/// 4-way interleave, pure-locals (register-resident) to find the MLP sweet spot.
+/// Same structure as the 2-way, extended to four lockstep streams. If 4-way
+/// stops beating 2-way that's the register/load-port ceiling — i.e. the answer
+/// to "how many chunks per worker".
+#[cfg(test)]
+#[allow(unsafe_code)]
+pub fn decode_four_interleaved(
+    input: &[u8],
+    outs: &mut [Vec<u8>; 4],
+) -> Result<(), DeflateError> {
+    let [oa, ob, oc, od] = outs;
+    let (mut bra, mut brb, mut brc, mut brd) = (
+        BitReader::new(input),
+        BitReader::new(input),
+        BitReader::new(input),
+        BitReader::new(input),
+    );
+    let (pa, pb, pc, pd) = (
+        oa.as_mut_ptr(),
+        ob.as_mut_ptr(),
+        oc.as_mut_ptr(),
+        od.as_mut_ptr(),
+    );
+    let ip = input.as_ptr();
+    let il = input.len();
+    let (mut ca, mut cb, mut cc, mut cd) = (0usize, 0usize, 0usize, 0usize);
+    let (mut bufa, mut bufb, mut bufc, mut bufd) = (0u64, 0u64, 0u64, 0u64);
+    let (mut bitsa, mut bitsb, mut bitsc, mut bitsd) = (0u32, 0u32, 0u32, 0u32);
+    let (mut bpa, mut bpb, mut bpc, mut bpd) = (0usize, 0usize, 0usize, 0usize);
+    let (mut iba, mut ibb, mut ibc, mut ibd) = (false, false, false, false);
+    let (mut da, mut db, mut dc, mut dd) = (false, false, false, false);
+    let (mut bfa, mut bfb, mut bfc, mut bfd) = (false, false, false, false);
+    let mut la = HuffmanDecoder::new_empty();
+    let mut dista = HuffmanDecoder::new_empty();
+    let mut lb = HuffmanDecoder::new_empty();
+    let mut distb = HuffmanDecoder::new_empty();
+    let mut lc = HuffmanDecoder::new_empty();
+    let mut distc = HuffmanDecoder::new_empty();
+    let mut ld = HuffmanDecoder::new_empty();
+    let mut distd = HuffmanDecoder::new_empty();
+
+    while !(da && db && dc && dd) {
+        if !iba && !da {
+            let r = step_start_block(
+                &mut bra, &mut bufa, &mut bitsa, &mut bpa, pa, &mut ca, &mut la, &mut dista,
+            )?;
+            (iba, bfa, da) = r;
+        }
+        if !ibb && !db {
+            let r = step_start_block(
+                &mut brb, &mut bufb, &mut bitsb, &mut bpb, pb, &mut cb, &mut lb, &mut distb,
+            )?;
+            (ibb, bfb, db) = r;
+        }
+        if !ibc && !dc {
+            let r = step_start_block(
+                &mut brc, &mut bufc, &mut bitsc, &mut bpc, pc, &mut cc, &mut lc, &mut distc,
+            )?;
+            (ibc, bfc, dc) = r;
+        }
+        if !ibd && !dd {
+            let r = step_start_block(
+                &mut brd, &mut bufd, &mut bitsd, &mut bpd, pd, &mut cd, &mut ld, &mut distd,
+            )?;
+            (ibd, bfd, dd) = r;
+        }
+        if iba && ibb && ibc && ibd {
+            let (lla, dla) = (la.lut(), dista.lut());
+            let (llb, dlb) = (lb.lut(), distb.lut());
+            let (llc, dlc) = (lc.lut(), distc.lut());
+            let (lld, dld) = (ld.lut(), distd.lut());
+            while iba && ibb && ibc && ibd {
+                step1!(bufa, bitsa, bpa, ca, pa, lla, dla, &la, &dista, iba, da, bfa, &mut bra, ip, il);
+                step1!(bufb, bitsb, bpb, cb, pb, llb, dlb, &lb, &distb, ibb, db, bfb, &mut brb, ip, il);
+                step1!(bufc, bitsc, bpc, cc, pc, llc, dlc, &lc, &distc, ibc, dc, bfc, &mut brc, ip, il);
+                step1!(bufd, bitsd, bpd, cd, pd, lld, dld, &ld, &distd, ibd, dd, bfd, &mut brd, ip, il);
+            }
+        } else {
+            // Ragged tail: drain whichever are mid-block one at a time.
+            if iba {
+                let (lla, dla) = (la.lut(), dista.lut());
+                while iba {
+                    step1!(bufa, bitsa, bpa, ca, pa, lla, dla, &la, &dista, iba, da, bfa, &mut bra, ip, il);
+                }
+            }
+            if ibb {
+                let (llb, dlb) = (lb.lut(), distb.lut());
+                while ibb {
+                    step1!(bufb, bitsb, bpb, cb, pb, llb, dlb, &lb, &distb, ibb, db, bfb, &mut brb, ip, il);
+                }
+            }
+            if ibc {
+                let (llc, dlc) = (lc.lut(), distc.lut());
+                while ibc {
+                    step1!(bufc, bitsc, bpc, cc, pc, llc, dlc, &lc, &distc, ibc, dc, bfc, &mut brc, ip, il);
+                }
+            }
+            if ibd {
+                let (lld, dld) = (ld.lut(), distd.lut());
+                while ibd {
+                    step1!(bufd, bitsd, bpd, cd, pd, lld, dld, &ld, &distd, ibd, dd, bfd, &mut brd, ip, il);
+                }
+            }
+        }
+    }
+    unsafe { oa.set_len(ca) };
+    unsafe { ob.set_len(cb) };
+    unsafe { oc.set_len(cc) };
+    unsafe { od.set_len(cd) };
+    Ok(())
+}
+
 /// Decode one compressed deflate block (fixed or dynamic Huffman).
 ///
 /// `IS_SPECULATIVE = false`: serial path — all speculative marker code dead.

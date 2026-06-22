@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/rusty-rapidgzip",
     "crates/rusty-rapidgzip-bin",
+    "crates/rusty-rapidgzip-bin-isolated",
     #"xtask",
 ]
 # Vendored + locally patched third-party crate (see vendor/zune-inflate/LOCAL_PATCH.md).

@@ -17,7 +17,10 @@
 
 use std::time::Instant;
 
-use crate::deflate::fast_inflate::{decode_member_u8, decode_member_u8_preload, decode_until_u16};
+use crate::deflate::fast_inflate::{
+    decode_four_distinct, decode_four_interleaved, decode_member_stepwise, decode_member_u8,
+    decode_member_u8_preload, decode_three_interleaved, decode_two_interleaved, decode_until_u16,
+};
 use crate::deflate::SpeculativeChunk;
 use crate::zlibrs_ffi::{self, ZlibOutcome};
 
@@ -123,6 +126,218 @@ fn bench_preload(body: &[u8], plainlen: usize, iters: usize) -> f64 {
     }
     let secs = t.elapsed().as_secs_f64();
     (plainlen as f64 * iters as f64) / secs / 1e6
+}
+
+/// Single-stream stepwise baseline (one symbol per loop iter, refill each time).
+/// Reference point for the interleave ratio — NOT the production preload number.
+fn bench_stepwise(body: &[u8], plainlen: usize, iters: usize) -> f64 {
+    let mut out = Vec::with_capacity(plainlen + 4096);
+    out.clear();
+    decode_member_stepwise(body, &mut out).unwrap();
+    assert_eq!(out.len(), plainlen, "stepwise: output length mismatch");
+
+    let t = Instant::now();
+    for _ in 0..iters {
+        out.clear();
+        decode_member_stepwise(body, &mut out).unwrap();
+    }
+    let secs = t.elapsed().as_secs_f64();
+    (plainlen as f64 * iters as f64) / secs / 1e6
+}
+
+/// Two streams, sequential (decode member A fully, then B). The honest baseline
+/// for the interleave comparison: same total work, same per-symbol code.
+fn bench_two_sequential(body: &[u8], plainlen: usize, iters: usize) -> f64 {
+    let mut a = Vec::with_capacity(plainlen + 4096);
+    let mut b = Vec::with_capacity(plainlen + 4096);
+    a.clear();
+    b.clear();
+    decode_member_stepwise(body, &mut a).unwrap();
+    decode_member_stepwise(body, &mut b).unwrap();
+    assert_eq!(a.len(), plainlen);
+    assert_eq!(b.len(), plainlen);
+
+    let t = Instant::now();
+    for _ in 0..iters {
+        a.clear();
+        b.clear();
+        decode_member_stepwise(body, &mut a).unwrap();
+        decode_member_stepwise(body, &mut b).unwrap();
+    }
+    let secs = t.elapsed().as_secs_f64();
+    (2.0 * plainlen as f64 * iters as f64) / secs / 1e6
+}
+
+/// Two streams, interleaved one symbol each per fused step (the experiment).
+fn bench_two_interleaved(body: &[u8], plainlen: usize, iters: usize) -> f64 {
+    let mut a = Vec::with_capacity(plainlen + 4096);
+    let mut b = Vec::with_capacity(plainlen + 4096);
+    a.clear();
+    b.clear();
+    decode_two_interleaved(body, &mut a, body, &mut b).unwrap();
+    assert_eq!(a.len(), plainlen, "interleaved A: length mismatch");
+    assert_eq!(b.len(), plainlen, "interleaved B: length mismatch");
+
+    let t = Instant::now();
+    for _ in 0..iters {
+        a.clear();
+        b.clear();
+        decode_two_interleaved(body, &mut a, body, &mut b).unwrap();
+    }
+    let secs = t.elapsed().as_secs_f64();
+    (2.0 * plainlen as f64 * iters as f64) / secs / 1e6
+}
+
+/// Four streams interleaved (find the MLP ceiling).
+fn bench_four_interleaved(body: &[u8], plainlen: usize, iters: usize) -> f64 {
+    let mut outs: [Vec<u8>; 4] =
+        std::array::from_fn(|_| Vec::with_capacity(plainlen + 4096));
+    decode_four_interleaved(body, &mut outs).unwrap();
+    for o in &outs {
+        assert_eq!(o.len(), plainlen, "interleaved4: length mismatch");
+    }
+
+    let t = Instant::now();
+    for _ in 0..iters {
+        for o in &mut outs {
+            o.clear();
+        }
+        decode_four_interleaved(body, &mut outs).unwrap();
+    }
+    let secs = t.elapsed().as_secs_f64();
+    (4.0 * plainlen as f64 * iters as f64) / secs / 1e6
+}
+
+/// Load the four DISTINCT deflate members (prepared out-of-band: decompress the
+/// main fixture, split plain into 4 quarters, recompress each as raw deflate).
+fn load_distinct() -> Vec<(Vec<u8>, usize)> {
+    (0..4)
+        .map(|i| {
+            let mut body =
+                std::fs::read(format!("/tmp/fastq_member_{i}.deflate")).expect("distinct fixture");
+            body.extend_from_slice(&[0u8; 64]);
+            let plainlen: usize =
+                std::fs::read_to_string(format!("/tmp/fastq_member_{i}.plainlen"))
+                    .expect("distinct plainlen")
+                    .trim()
+                    .parse()
+                    .unwrap();
+            (body, plainlen)
+        })
+        .collect()
+}
+
+/// Validation on DISTINCT working sets: stepwise baseline vs 2/3/4-way interleave,
+/// each stream a different deflate member. This is the ship-or-not test (the `il2`
+/// bench reuses one fixture, sharing the compressed footprint in cache).
+fn bench_distinct(iters: usize) {
+    let fx = load_distinct();
+    let total_plain: usize = fx.iter().map(|(_, p)| *p).sum();
+    let bodies: Vec<&[u8]> = fx.iter().map(|(b, _)| b.as_slice()).collect();
+    let plains: Vec<usize> = fx.iter().map(|(_, p)| *p).collect();
+
+    let mut bufs: Vec<Vec<u8>> = fx.iter().map(|(_, p)| Vec::with_capacity(p + 4096)).collect();
+
+    // 1x stepwise: sum of decoding all four members one after another.
+    for (i, b) in bodies.iter().enumerate() {
+        bufs[i].clear();
+        decode_member_stepwise(b, &mut bufs[i]).unwrap();
+        assert_eq!(bufs[i].len(), plains[i], "distinct stepwise len mismatch");
+    }
+    let t = Instant::now();
+    for _ in 0..iters {
+        for (i, b) in bodies.iter().enumerate() {
+            bufs[i].clear();
+            decode_member_stepwise(b, &mut bufs[i]).unwrap();
+        }
+    }
+    let s1 = (total_plain as f64 * iters as f64) / t.elapsed().as_secs_f64() / 1e6;
+
+    // 2-way interleave (members 0&1, then 2&3), distinct inputs.
+    let t = Instant::now();
+    for _ in 0..iters {
+        for c in bufs.iter_mut() {
+            c.clear();
+        }
+        let (a, rest) = bufs.split_at_mut(1);
+        let (b, rest) = rest.split_at_mut(1);
+        let (cc, dd) = rest.split_at_mut(1);
+        decode_two_interleaved(bodies[0], &mut a[0], bodies[1], &mut b[0]).unwrap();
+        decode_two_interleaved(bodies[2], &mut cc[0], bodies[3], &mut dd[0]).unwrap();
+    }
+    let i2 = (total_plain as f64 * iters as f64) / t.elapsed().as_secs_f64() / 1e6;
+
+    // 3-way interleave (members 0,1,2; member 3 stepwise tail).
+    let three_plain = plains[0] + plains[1] + plains[2];
+    let t = Instant::now();
+    for _ in 0..iters {
+        for c in bufs.iter_mut() {
+            c.clear();
+        }
+        let (a, rest) = bufs.split_at_mut(1);
+        let (b, rest) = rest.split_at_mut(1);
+        let (cc, _) = rest.split_at_mut(1);
+        decode_three_interleaved(
+            bodies[0], &mut a[0], bodies[1], &mut b[0], bodies[2], &mut cc[0],
+        )
+        .unwrap();
+    }
+    let i3 = (three_plain as f64 * iters as f64) / t.elapsed().as_secs_f64() / 1e6;
+
+    // 4-way interleave, all four distinct.
+    let mut outs4: [Vec<u8>; 4] = std::array::from_fn(|i| Vec::with_capacity(plains[i] + 4096));
+    decode_four_distinct([bodies[0], bodies[1], bodies[2], bodies[3]], &mut outs4).unwrap();
+    for (i, o) in outs4.iter().enumerate() {
+        assert_eq!(o.len(), plains[i], "distinct 4-way len mismatch");
+    }
+    let t = Instant::now();
+    for _ in 0..iters {
+        for o in outs4.iter_mut() {
+            o.clear();
+        }
+        decode_four_distinct([bodies[0], bodies[1], bodies[2], bodies[3]], &mut outs4).unwrap();
+    }
+    let i4 = (total_plain as f64 * iters as f64) / t.elapsed().as_secs_f64() / 1e6;
+
+    // CONTROL: same function (decode_four_distinct) but fed ONE member 4x. If this
+    // reproduces ~1.78x while the distinct run is ~1.0x, the gain was a same-input
+    // cache/lockstep artifact, not the kernel structure.
+    let one = bodies[0];
+    let p0 = plains[0];
+    let mut outs_same: [Vec<u8>; 4] = std::array::from_fn(|_| Vec::with_capacity(p0 + 4096));
+    decode_four_distinct([one, one, one, one], &mut outs_same).unwrap();
+    let t = Instant::now();
+    for _ in 0..iters {
+        for o in outs_same.iter_mut() {
+            o.clear();
+        }
+        decode_four_distinct([one, one, one, one], &mut outs_same).unwrap();
+    }
+    let i4same = (4.0 * p0 as f64 * iters as f64) / t.elapsed().as_secs_f64() / 1e6;
+
+    // CONTROL 2: four DISTINCT buffer copies of identical content (distinct
+    // addresses, identical control flow). Separates address-sharing (input cache)
+    // from control-flow lockstep (branch prediction).
+    let copies: Vec<Vec<u8>> = (0..4).map(|_| one.to_vec()).collect();
+    let copy_refs: [&[u8]; 4] = [&copies[0], &copies[1], &copies[2], &copies[3]];
+    let mut outs_copy: [Vec<u8>; 4] = std::array::from_fn(|_| Vec::with_capacity(p0 + 4096));
+    decode_four_distinct(copy_refs, &mut outs_copy).unwrap();
+    let t = Instant::now();
+    for _ in 0..iters {
+        for o in outs_copy.iter_mut() {
+            o.clear();
+        }
+        decode_four_distinct(copy_refs, &mut outs_copy).unwrap();
+    }
+    let i4copy = (4.0 * p0 as f64 * iters as f64) / t.elapsed().as_secs_f64() / 1e6;
+
+    eprintln!("DISTINCT working sets (4 different deflate members):");
+    eprintln!("4x SAME-input : {i4same:8.1} MB/s  (control: shared addr + lockstep)");
+    eprintln!("4x copy-input : {i4copy:8.1} MB/s  (control: distinct addr, lockstep)");
+    eprintln!("1x stepwise   : {s1:8.1} MB/s  (1.00x)");
+    eprintln!("2x interleaved: {i2:8.1} MB/s  ({:.2}x)", i2 / s1);
+    eprintln!("3x interleaved: {i3:8.1} MB/s  ({:.2}x)", i3 / s1);
+    eprintln!("4x interleaved: {i4:8.1} MB/s  ({:.2}x)", i4 / s1);
 }
 
 fn bench_zlibrs(body: &[u8], plainlen: usize, iters: usize) -> f64 {
@@ -245,6 +460,21 @@ fn run() {
             bench_preload(&body, plainlen, iters)
         ),
         "zlibrs" => eprintln!("zlibrs  : {:8.1} MB/s", bench_zlibrs(&body, plainlen, iters)),
+        "stepwise" => eprintln!(
+            "stepwise: {:8.1} MB/s",
+            bench_stepwise(&body, plainlen, iters)
+        ),
+        "il2" => {
+            let s = bench_two_sequential(&body, plainlen, iters);
+            let i2 = bench_two_interleaved(&body, plainlen, iters);
+            let i4 = bench_four_interleaved(&body, plainlen, iters);
+            let s1 = bench_stepwise(&body, plainlen, iters);
+            eprintln!("1x stepwise   : {s1:8.1} MB/s  (1.00x)");
+            eprintln!("2x sequential : {s:8.1} MB/s  ({:.2}x)", s / s1);
+            eprintln!("2x interleaved: {i2:8.1} MB/s  ({:.2}x vs 1x)", i2 / s1);
+            eprintln!("4x interleaved: {i4:8.1} MB/s  ({:.2}x vs 1x)", i4 / s1);
+        }
+        "ild" => bench_distinct(iters),
         "u16" => eprintln!("u16     : {:8.1} MB/s", bench_u16(&body, plainlen, iters)),
         #[cfg(feature = "libdeflate")]
         "libdeflate" => eprintln!(
