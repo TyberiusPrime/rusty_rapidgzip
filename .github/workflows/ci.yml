@@ -28,6 +28,21 @@ jobs:
       - name: ${{ matrix.job }}
         run: nix build -L ".#checks.x86_64-linux.${{ matrix.job }}"
 
+  # ── Dependency audit (advisories / bans / sources) via cargo-deny ─────────
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
+
+      - name: cargo-deny
+        run: nix develop .#deny --command cargo deny check advisories bans sources
+
   # ── Native macOS + Windows: real test execution (no Nix) ──────────────────
   # libdeflate is the default backend and is compiled from vendored source by
   # `libdeflate-sys` with the platform C toolchain (clang on macOS, MSVC on

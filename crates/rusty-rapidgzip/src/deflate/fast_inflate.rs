@@ -7,21 +7,21 @@
 //! - **`decode_until`** / **`decode_member`**: the parallel pipeline's speculative
 //!   path. Starts decoding at an arbitrary bit offset with no prior history.
 //!   Back-references whose source falls before the chunk's first byte are recorded
-//!   as [`Marker`]s and resolved downstream once the preceding chunk's window is
+//!   as `Marker`s and resolved downstream once the preceding chunk's window is
 //!   known.
 //!
 //! ## Speculative marker tracking
 //!
 //! For in-buffer back-refs (distance ≤ bytes emitted in this member):
 //! - Copy bytes from the output buffer as normal.
-//! - Call [`propagate_match_cached`] to propagate any source-byte markers to the
+//! - Call `propagate_match_cached` to propagate any source-byte markers to the
 //!   newly written destination bytes. On the serial path (`ctx_ptr == null`) this
 //!   is a single null-check and returns immediately — essentially free.
 //!
 //! For over-distance back-refs (distance > bytes emitted):
 //! - Serial path: `Err(DeflateError::Invalid)`.
 //! - Speculative path: push placeholder `0u8` bytes and call
-//!   [`record_match_prefix`] to register the markers. Then copy any in-buffer
+//!   `record_match_prefix` to register the markers. Then copy any in-buffer
 //!   tail normally.
 //!
 //! ## Relationship to existing code
@@ -1785,7 +1785,7 @@ const U16_BUFCAP: usize = U16_FLUSH_AT + 258 + COPY_HEADROOM_U16 + 8;
 ///    (worker-owned `scratch`, `U16_BUFCAP` cells) for as long as a
 ///    back-reference might still reach the unknown prefix, emitting markers for
 ///    those that do. By the DEFLATE 32 KiB-distance bound this lasts at most
-///    [`U16_HANDOFF_AT`] cells.
+///    `U16_HANDOFF_AT` cells.
 /// 2. **Byte-wide kernel** — once the output is provably marker-free (`window_base`
 ///    advanced, or `cur ≥ U16_HANDOFF_AT`, always at a block boundary), lower the
 ///    live window into `chunk.bytes` and finish with the non-speculative `u8`

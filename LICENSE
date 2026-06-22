@@ -1,4 +1,4 @@
-Crates: rusty-rapidgzip, rusty-rapidgzip-bin, rusty-rapidgzip-deflate:
+Crates: rusty-rapidgzip, rusty-rapidgzip-bin:
 
 (C) 2026 Florian Finkernagel, Philipps University Marburg
 
@@ -22,7 +22,7 @@ SOFTWARE.
 
 ---
 
-The code in rusty-rapidgzip-inflate is derived (and modified), from zlib-rs,
+The code in rusty-rapidgzip/deflate is derived (and modified), from zlib-rs,
 which is under the following license.
 
 

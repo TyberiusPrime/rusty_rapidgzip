@@ -1,4 +1,5 @@
-//! Safe, allocation-light DEFLATE inflater — alternative to [`crate::inflate`].
+//! Safe, allocation-light DEFLATE inflater — alternative to the
+//! [`inflate`](mod@crate::deflate::inflate) module.
 //!
 //! Algorithm follows Mark Adler's reference puff.c (public domain, distributed
 //! with zlib); the Rust shape draws from ieviev/mini-gzip's compact rendering.

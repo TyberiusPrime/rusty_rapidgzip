@@ -18,7 +18,7 @@
 //!
 //! - Handles multi-member gzip directly: at each BFINAL the worker consumes
 //!   the 8-byte trailer + the next gzip header and continues decoding into
-//!   the next member, recording a [`MemberBoundary`] at each transition. The
+//!   the next member, recording a `MemberBoundary` at each transition. The
 //!   serializer keeps a running CRC32 + uncompressed counter per member and
 //!   validates the trailer at every boundary.
 //! - If the block finder fails to locate enough internal boundaries, we
@@ -103,14 +103,6 @@ struct WorkerKernel {
         not(any(feature = "libdeflate", feature = "isal"))
     ))]
     zlibrs: Option<crate::zlibrs_ffi::Decompressor>,
-    /// Per-worker reusable output scratch for the zune-inflate backend (feature
-    /// `zune`). Grown once to the largest member size; lets zune decode without
-    /// re-zero-filling a fresh buffer each call. Empty by default.
-    #[cfg(all(
-        feature = "zune",
-        not(any(feature = "libdeflate", feature = "isal", feature = "zlib-rs"))
-    ))]
-    zune_scratch: Vec<u8>,
 }
 
 /// Name of the active external member-decode backend, for verbose output.
@@ -123,11 +115,6 @@ pub(crate) const MEMBER_BACKEND: &str = "ISA-L";
     not(any(feature = "libdeflate", feature = "isal"))
 ))]
 pub(crate) const MEMBER_BACKEND: &str = "zlib-rs";
-#[cfg(all(
-    feature = "zune",
-    not(any(feature = "libdeflate", feature = "isal", feature = "zlib-rs"))
-))]
-pub(crate) const MEMBER_BACKEND: &str = "zune-inflate";
 
 /// Instrumentation (feature `libdeflate`/`isal`/`zlib-rs`): how the speculative
 /// path's subsequent members were decoded. `LD_DONE` = decoded by the external
@@ -135,19 +122,9 @@ pub(crate) const MEMBER_BACKEND: &str = "zune-inflate";
 /// `decode_member_u8` (redundant work, the CPU tax that can push full-thread wall
 /// up). First-member-per-chunk decodes never reach here — they always use our u16
 /// kernel. Printed in verbose mode.
-#[cfg(any(
-    feature = "libdeflate",
-    feature = "isal",
-    feature = "zlib-rs",
-    feature = "zune"
-))]
+#[cfg(any(feature = "libdeflate", feature = "isal", feature = "zlib-rs"))]
 pub(crate) static LD_DONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-#[cfg(any(
-    feature = "libdeflate",
-    feature = "isal",
-    feature = "zlib-rs",
-    feature = "zune"
-))]
+#[cfg(any(feature = "libdeflate", feature = "isal", feature = "zlib-rs"))]
 pub(crate) static LD_STRADDLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Decode one non-first member of a chunk (fresh empty window, byte-aligned
@@ -231,39 +208,7 @@ fn decode_subsequent_member(
     }
 }
 
-#[cfg(all(
-    feature = "zune",
-    not(any(feature = "libdeflate", feature = "isal", feature = "zlib-rs"))
-))]
-fn decode_subsequent_member(
-    wk: &mut WorkerKernel,
-    body: &[u8],
-    pos: u64,
-    end_bit_hint: u64,
-    out: &mut Vec<u8>,
-) -> Result<(u64, bool), crate::deflate::DeflateError> {
-    use std::sync::atomic::Ordering::Relaxed;
-
-    use crate::zune_backend::{decode_member, ZuneOutcome};
-    // Reuse the worker's scratch buffer so zune amortises its output zero-fill.
-    match decode_member(&mut wk.zune_scratch, body, pos, end_bit_hint, out)? {
-        ZuneOutcome::Done(end, hit_bfinal) => {
-            LD_DONE.fetch_add(1, Relaxed);
-            Ok((end, hit_bfinal))
-        }
-        ZuneOutcome::Straddle => {
-            LD_STRADDLE.fetch_add(1, Relaxed);
-            fast_inflate::decode_member_u8_preload(body, pos, end_bit_hint, out)
-        }
-    }
-}
-
-#[cfg(not(any(
-    feature = "libdeflate",
-    feature = "isal",
-    feature = "zlib-rs",
-    feature = "zune"
-)))]
+#[cfg(not(any(feature = "libdeflate", feature = "isal", feature = "zlib-rs")))]
 fn decode_subsequent_member(
     _wk: &mut WorkerKernel,
     body: &[u8],
@@ -1011,12 +956,7 @@ pub fn parallel_decode_member(
             crate::elapsed_since_start(),
         );
     }
-    #[cfg(any(
-        feature = "libdeflate",
-        feature = "isal",
-        feature = "zlib-rs",
-        feature = "zune"
-    ))]
+    #[cfg(any(feature = "libdeflate", feature = "isal", feature = "zlib-rs"))]
     if verbose {
         use std::sync::atomic::Ordering::Relaxed;
         let done = LD_DONE.load(Relaxed);
@@ -1452,17 +1392,10 @@ pub fn parallel_decode_bgzf(
                         &mut out,
                     )
                     .map_err(Error::Deflate);
-                    #[cfg(all(
-                        feature = "zune",
-                        not(any(feature = "libdeflate", feature = "isal", feature = "zlib-rs"))
-                    ))]
-                    let res = crate::zune_backend::decode_gzip_member(&file[s..e], &mut out)
-                        .map_err(Error::Deflate);
                     #[cfg(not(any(
                         feature = "libdeflate",
                         feature = "isal",
-                        feature = "zlib-rs",
-                        feature = "zune"
+                        feature = "zlib-rs"
                     )))]
                     let res = crate::gzip::decode_one_indexed_fast(
                         &file[s..e],

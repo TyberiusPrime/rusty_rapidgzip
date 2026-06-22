@@ -5,15 +5,12 @@ members = [
     "crates/rusty-rapidgzip-bin",
     #"xtask",
 ]
-# Vendored + locally patched third-party crate (see vendor/zune-inflate/LOCAL_PATCH.md).
-# Excluded so it is not built/tested as a workspace member; referenced as a path dep.
-exclude = ["vendor/zune-inflate"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 repository = "https://github.com/TyberiusPrime/rusty-rapidgzip"
 authors = ["Florian Finkernagel <finkernagel@imt.uni-marburg.de>"]
 
@@ -21,7 +18,7 @@ authors = ["Florian Finkernagel <finkernagel@imt.uni-marburg.de>"]
 # default-features = false so the bin's own `default` / `--no-default-features`
 # controls libdeflate; an inherited `default-features = false` is otherwise
 # ignored unless set here in the workspace table.
-rusty-rapidgzip = { path = "crates/rusty-rapidgzip", version = "0.1.0", default-features = false }
+rusty-rapidgzip = { path = "crates/rusty-rapidgzip", version = "0.2.0", default-features = false }
 
 bstr = "1"
 # libdeflate, the default per-member / BGZF decode backend. The `-sys` crate

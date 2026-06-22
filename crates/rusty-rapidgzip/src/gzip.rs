@@ -1,4 +1,4 @@
-//! gzip framing on top of [`rapidgzip_deflate`]'s inflate.
+//! gzip framing on top of [`crate::deflate`]'s inflate.
 //!
 //! Implements RFC 1952 framing:
 //!   - 10-byte fixed header (magic + CMF + FLG + MTIME + XFL + OS)

@@ -35,26 +35,6 @@ fn load_fixture() -> (Vec<u8>, usize) {
     (body, plainlen)
 }
 
-#[cfg(feature = "zune")]
-fn bench_zune(body: &[u8], plainlen: usize, iters: usize) -> f64 {
-    use zune_inflate::{DeflateDecoder, DeflateOptions};
-    // Decode straight into a reusable scratch (the patched `decode_deflate_into`),
-    // isolating the libdeflate-port decode loop — no copy to `out`.
-    let mut scratch: Vec<u8> = vec![0u8; plainlen + 4096];
-    let opts = DeflateOptions::default().set_size_hint(plainlen + 4096);
-    let mut dec = DeflateDecoder::new_with_options(body, opts);
-    let len = dec.decode_deflate_into(&mut scratch).unwrap();
-    assert_eq!(len, plainlen, "zune: output length mismatch");
-
-    let t = Instant::now();
-    for _ in 0..iters {
-        let mut dec = DeflateDecoder::new_with_options(body, opts);
-        let _ = dec.decode_deflate_into(&mut scratch).unwrap();
-    }
-    let secs = t.elapsed().as_secs_f64();
-    (plainlen as f64 * iters as f64) / secs / 1e6
-}
-
 #[cfg(feature = "isal")]
 fn bench_isal(body: &[u8], plainlen: usize, iters: usize) -> f64 {
     use crate::isal_ffi::{decode_member, Decompressor, IsalOutcome};
@@ -485,8 +465,6 @@ fn run() {
         ),
         #[cfg(feature = "isal")]
         "isal" => eprintln!("isal    : {:8.1} MB/s", bench_isal(&body, plainlen, iters)),
-        #[cfg(feature = "zune")]
-        "zune" => eprintln!("zune    : {:8.1} MB/s", bench_zune(&body, plainlen, iters)),
         _ => {
             let o = bench_ours(&body, plainlen, iters);
             let p = bench_preload(&body, plainlen, iters);

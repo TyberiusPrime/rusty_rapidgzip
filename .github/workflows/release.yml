@@ -1,0 +1,173 @@
+name: Release Workflow
+
+env:
+  # The CLI binary name (crates/rusty-rapidgzip-bin → [[bin]] name).
+  BINARY_NAME: rusty-rapidgzip-rs
+
+on:
+  push:
+    tags:
+      - 'v*' # Triggers on any tag that starts with 'v'
+
+jobs:
+  # ── Linux binary (Nix, fully static musl) + nix-verified tests ────────────
+  build:
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Verify tag matches version
+        run: |
+          # Version lives in [workspace.package] in the root Cargo.toml.
+          BINARY_REPORTED_VERSION=v$(grep '^\s*version' Cargo.toml | head -n1 | cut -d '"' -f2)
+          echo "Found version: $BINARY_REPORTED_VERSION"
+          if [ "${GITHUB_REF}" != "refs/tags/$BINARY_REPORTED_VERSION" ]; then
+            echo "Tag ${GITHUB_REF} does not match Cargo.toml version $BINARY_REPORTED_VERSION. Aborting."
+            exit 1
+          fi
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
+
+      - name: Audit dependencies with cargo-deny
+        run: nix develop .#deny --command cargo deny check advisories bans sources
+
+      - name: Test (full workspace, via Nix)
+        run: nix build -L ".#checks.x86_64-linux.stable"
+
+      - name: Build static Linux binary
+        run: nix build -L .#static-linux -o result-linux
+
+      - name: Upload Linux binary as artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux-binary
+          path: ./result-linux/bin/${{ env.BINARY_NAME }}
+
+  # ── Native macOS + Windows binaries ───────────────────────────────────────
+  build_platforms:
+    runs-on: ${{ matrix.runner }}
+    needs: build
+    strategy:
+      matrix:
+        include:
+          - name: macos-arm64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+          - name: win-amd64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: stable
+          targets: "${{ matrix.target }}"
+
+      - name: Setup cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      # Several tests build their fixtures by shelling out to `gzip`, which is not
+      # on PATH by default on the Windows runner but ships with Git for Windows.
+      - name: Expose gzip on Windows
+        if: matrix.runner == 'windows-latest'
+        shell: bash
+        run: echo "C:\Program Files\Git\usr\bin" >> "$GITHUB_PATH"
+
+      - name: Run tests (release)
+        run: cargo test --verbose --locked --release
+
+      - name: Build binary
+        run: cargo build --verbose --locked --release --target ${{ matrix.target }}
+
+      - name: Upload binary as artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.name }}-binary
+          path: target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}${{ matrix.runner == 'windows-latest' && '.exe' || '' }}
+
+  # ── Publish the library crate to crates.io (trusted publishing / OIDC) ─────
+  # Only the reusable `rusty-rapidgzip` library is published; the CLI binaries
+  # are distributed as the GitHub Release assets below.
+  publish-crate:
+    name: Publish to crates.io
+    environment: release
+    runs-on: ubuntu-latest
+    needs: [build, build_platforms]
+    permissions:
+      id-token: write # Required for trusted publishing (OIDC token exchange)
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: stable
+
+      - name: Authenticate to crates.io (trusted publishing)
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        id: auth
+
+      - name: Publish to crates.io
+        run: |
+          output=$(cargo publish -p rusty-rapidgzip 2>&1) && echo "$output" || {
+            echo "$output"
+            echo "$output" | grep -q 'already exists on crates.io index' || exit 1
+            echo "Version already published to crates.io, treating as success."
+          }
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  # ── Create the GitHub Release with all platform binaries attached ─────────
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build, build_platforms, publish-crate]
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: artifacts/
+
+      - name: Display artifact structure
+        run: ls -R artifacts/
+
+      - name: Rename binaries with target information
+        run: |
+          mkdir -p release-binaries
+          # Linux: fully static musl binary (runs on any distro).
+          cp artifacts/linux-binary/${BINARY_NAME} release-binaries/rusty-rapidgzip-x86_64-unknown-linux-musl
+          # macOS (Apple Silicon).
+          cp artifacts/macos-arm64-binary/${BINARY_NAME} release-binaries/rusty-rapidgzip-aarch64-apple-darwin
+          # Windows (MSVC).
+          cp artifacts/win-amd64-binary/${BINARY_NAME}.exe release-binaries/rusty-rapidgzip-x86_64-pc-windows-msvc.exe
+          ls -lh release-binaries/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2.5.0
+        with:
+          files: |
+            release-binaries/rusty-rapidgzip-x86_64-unknown-linux-musl
+            release-binaries/rusty-rapidgzip-aarch64-apple-darwin
+            release-binaries/rusty-rapidgzip-x86_64-pc-windows-msvc.exe

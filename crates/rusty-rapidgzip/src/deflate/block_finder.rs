@@ -27,7 +27,7 @@
 //!      than one bit when no candidate begins at the current position.
 //!      See `rapidgzip_cpp/src/rapidgzip/blockfinder/DynamicHuffman.hpp`.
 //!
-//! 2. **Full header parse** via [`crate::inflate::read_dynamic_header`]. This
+//! 2. **Full header parse** via [`crate::deflate::inflate::read_dynamic_header`]. This
 //!    rebuilds the precode, decodes HLIT+HDIST code lengths, and constructs
 //!    canonical Huffman decoders. False positives can survive the 13-bit
 //!    prefilter; very few survive a successful header parse.

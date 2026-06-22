@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Streaming, parallel gzip decoder. Inspired by rapidgzip / pugz."
+readme = "README.md"
+keywords = ["gzip", "deflate", "decompression", "parallel", "bgzf"]
+categories = ["compression", "concurrency"]
 
 [features]
 # On by default: route the non-speculative per-member decode (and the BGZF
@@ -31,11 +34,6 @@ isal = []
 # `libdeflate` / `isal` (precedence: libdeflate > isal > zlib-rs). No C compiler
 # or external library needed. Benchmark with `--no-default-features --features zlib-rs`.
 zlib-rs = ["dep:libz-rs-sys"]
-# Experimental pure-Rust backend: zune-inflate (a pure-Rust port of libdeflate's
-# algorithm), vendored + patched under vendor/zune-inflate. Another either/or
-# alternative (precedence: libdeflate > isal > zlib-rs > zune > pure-Rust). No C,
-# no external library. Benchmark with `--no-default-features --features zune`.
-zune = ["dep:zune-inflate"]
 
 [dependencies]
 crc32fast.workspace = true
@@ -44,7 +42,6 @@ thiserror.workspace = true
 memmap2.workspace = true
 libdeflate-sys = { workspace = true, optional = true }
 libz-rs-sys = { workspace = true, optional = true }
-zune-inflate = { path = "../../vendor/zune-inflate", default-features = false, features = ["gzip", "std"], optional = true }
 
 [build-dependencies]
 # Only used to compile src/isal_shim.c when the `isal` feature is active.

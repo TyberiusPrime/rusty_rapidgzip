@@ -28,9 +28,6 @@ isal = ["rusty-rapidgzip/isal"]
 # Experimental pure-Rust zlib-rs backend (see the lib's `zlib-rs` feature).
 # Benchmark with `--no-default-features --features zlib-rs`.
 zlib-rs = ["rusty-rapidgzip/zlib-rs"]
-# Experimental pure-Rust zune-inflate backend (see the lib's `zune` feature).
-# Benchmark with `--no-default-features --features zune`.
-zune = ["rusty-rapidgzip/zune"]
 
 [dependencies]
 rusty-rapidgzip.workspace = true

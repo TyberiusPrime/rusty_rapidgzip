@@ -21,11 +21,6 @@ mod kernel_ab;
     all(test, feature = "zlib-rs")
 ))]
 mod zlibrs_ffi;
-#[cfg(all(
-    feature = "zune",
-    not(any(feature = "libdeflate", feature = "isal", feature = "zlib-rs"))
-))]
-mod zune_backend;
 
 pub use gzip::{decode_all, decode_one, GzipError};
 

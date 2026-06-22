@@ -232,13 +232,9 @@
           name = "rusty-rapidgzip-clippy";
           phase = "cargo clippy --workspace --all-targets --offline -- -D warnings";
         };
-        # Format only our own crates. `--all` also reaches the vendored,
-        # locally-patched third-party `zune-inflate` (it tracks upstream's
-        # style, not ours), and rustfmt's `ignore` option is nightly-only, so we
-        # name the workspace members explicitly instead.
         ciFmt = mkCargoCheck {
           name = "rusty-rapidgzip-fmt";
-          phase = "cargo fmt -p rusty-rapidgzip -p rusty-rapidgzip-bin -- --check";
+          phase = "cargo fmt --all -- --check";
         };
         # MSRV guarantee is for library/binary consumers, so build (not test):
         # dev-only deps like criterion needn't satisfy 1.85 themselves. Built
@@ -403,6 +399,16 @@
               '';
               installPhase = "touch $out";
             };
+        };
+
+        # Minimal shell for the cargo-deny CI/release check — avoids pulling in
+        # the full devShell. Usage: nix develop .#deny --command cargo deny check
+        devShells.deny = pkgs.mkShell {
+          nativeBuildInputs = [
+            pkgs.cargo-deny
+            pkgs.git
+            rust
+          ];
         };
 
         # `nix develop`

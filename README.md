@@ -1,4 +1,4 @@
-# rapidgzip_rs
+# rusty-rapidgzip
 
 A streaming, parallel gzip decoder for Rust, inspired by [rapidgzip][1] / [pugz][2].
 
@@ -33,10 +33,11 @@ Decompress huge `.gz` files in parallel and stream the decompressed bytes
 back to the caller through a bounded channel:
 
 ```rust
+use std::sync::Arc;
 use crossbeam_channel::bounded;
-use rapidgzip::{read_gz, Config};
+use rusty_rapidgzip::{read_gz, Config};
 
-let (tx, rx) = bounded::<Vec<u8>>(16);
+let (tx, rx) = bounded::<Arc<Vec<u8>>>(16);
 std::thread::spawn(move || read_gz("huge.gz", tx, Config::default()));
 for chunk in rx { /* process bytes in stream order */ }
 ```
