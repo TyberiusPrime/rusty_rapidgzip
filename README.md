@@ -76,3 +76,10 @@ there's also a set of [rust bindings](https://github.com/alekseizarubin/rapidgzi
 
 1.85
 
+
+
+## Changelog
+### 0.2.1
+    - Inform kernel that we're no longer in need of previous mmaped pages,
+      reducing RSS
+    - dependency updates
