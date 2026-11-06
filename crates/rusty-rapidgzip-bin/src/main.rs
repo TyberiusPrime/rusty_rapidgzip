@@ -23,6 +23,9 @@ struct Args {
     /// Print per-member / per-chunk diagnostics to stderr.
     #[arg(short = 'v', long)]
     verbose: bool,
+    /// Stop after writing this many decompressed bytes.
+    #[arg(long)]
+    max_bytes: Option<usize>,
 }
 
 fn main() -> Result<()> {
@@ -46,6 +49,7 @@ fn main() -> Result<()> {
         },
         recycle_rx: Some(recycle_rx),
         recycle_tx: Some(recycle_tx.clone()),
+        max_bytes_output: args.max_bytes,
     };
 
     let (tx, rx) = bounded::<Arc<Vec<u8>>>(16);

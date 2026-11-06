@@ -1243,6 +1243,13 @@ fn serial_decode_member(
     let mut total_uncompressed: u64 = 0;
     let mut chunks_sent: u64 = 0;
     let mut member_idx: u32 = 0;
+    // Output budget (`Config::max_bytes_output`). Every emitted byte is
+    // charged against it; once it is exhausted we stop decoding. The
+    // truncated member's CRC/ISIZE can't be checked, so they are skipped.
+    let mut remaining: Option<usize> = config.max_bytes_output;
+    if remaining == Some(0) {
+        return Ok((0, 0, 0));
+    }
 
     // Per-member running CRC + uncompressed byte count. Each output byte is
     // folded into the CRC exactly once, at the moment it is emitted.
@@ -1251,6 +1258,18 @@ fn serial_decode_member(
 
     loop {
         let bfinal = fast_inflate::decode_one_block(&mut br, &mut out).map_err(Error::Deflate)?;
+
+        // Budget reached: everything in `out` is not yet emitted, so send its
+        // first `r` bytes and stop. Checked before the regular emits below,
+        // which therefore never exceed the budget.
+        if let Some(r) = remaining {
+            if out.len() >= r {
+                out.truncate(r);
+                let n = out.len() as u64;
+                let _ = sink.send(Arc::new(out));
+                return Ok((total_uncompressed + n, 0, chunks_sent + 1));
+            }
+        }
 
         if !bfinal {
             // Mid-member: emit whole chunks while keeping the 32 KiB window.
@@ -1269,6 +1288,9 @@ fn serial_decode_member(
                 total_uncompressed += n;
                 member_uncompressed += n;
                 chunks_sent += 1;
+                if let Some(r) = remaining.as_mut() {
+                    *r -= n as usize;
+                }
             }
             continue;
         }
@@ -1287,6 +1309,9 @@ fn serial_decode_member(
             total_uncompressed += n;
             member_uncompressed += n;
             chunks_sent += 1;
+            if let Some(r) = remaining.as_mut() {
+                *r -= n as usize;
+            }
         }
 
         // Byte-align and read the 8-byte trailer.

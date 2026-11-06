@@ -67,6 +67,8 @@ pub struct Config {
     /// recycle return path because `sink` emits `Arc<Vec<u8>>` shared with
     /// the CRC validator, and only the pipeline knows when both refs drop.
     pub recycle_tx: Option<Sender<Vec<u8>>>,
+    /// Output at most these many bytes and exit
+    pub max_bytes_output: Option<usize>,
 }
 
 /// How chatty `read_gz` is on stderr.
@@ -95,6 +97,7 @@ impl Default for Config {
             verbose: Verbosity::Off,
             recycle_rx: None,
             recycle_tx: None,
+            max_bytes_output: None,
         }
     }
 }
@@ -251,7 +254,15 @@ impl<R: Read> StreamBuf<R> {
 
 /// Decode a non-seekable gzip stream (pipe, stdin) serially, emitting
 /// decompressed bytes block by block to `sink`.
-fn read_gz_streaming<R: Read>(reader: R, sink: &Sender<Arc<Vec<u8>>>) -> Result<(u64, u64), Error> {
+///
+/// With `max_bytes_output = Some(n)`, stops after emitting `n` bytes (the
+/// truncated member's CRC/ISIZE is not checked). Also stops early, without
+/// error, once the receiving end of `sink` has hung up.
+fn read_gz_streaming<R: Read>(
+    reader: R,
+    sink: &Sender<Arc<Vec<u8>>>,
+    max_bytes_output: Option<usize>,
+) -> Result<(u64, u64), Error> {
     // DEFLATE back-references can reach up to 32 KiB behind the current output
     // position. We therefore maintain a single output Vec across all blocks in a
     // member (so that each block can reference bytes produced by earlier blocks)
@@ -262,6 +273,10 @@ fn read_gz_streaming<R: Read>(reader: R, sink: &Sender<Arc<Vec<u8>>>) -> Result<
     let mut total_uc = 0u64;
     let mut chunks_sent = 0u64;
     let mut member = 0u32;
+    let mut remaining = max_bytes_output;
+    if remaining == Some(0) {
+        return Ok((0, 0));
+    }
 
     // Prime the buffer.
     sb.fill_more().map_err(Error::Io)?;
@@ -283,6 +298,14 @@ fn read_gz_streaming<R: Read>(reader: R, sink: &Sender<Arc<Vec<u8>>>) -> Result<
         loop {
             let bfinal = sb.decode_block(&mut out)?;
 
+            // Budget reached: emit the first `r` not-yet-emitted bytes and stop.
+            if let Some(r) = remaining {
+                if out.len() - crc_cursor >= r {
+                    let _ = sink.send(Arc::new(out[crc_cursor..crc_cursor + r].to_vec()));
+                    return Ok((total_uc + member_uc + r as u64, chunks_sent + 1));
+                }
+            }
+
             // Emit bytes produced since last emission, keeping the last WINDOW
             // bytes in `out` as the back-reference history for subsequent blocks.
             let emit_end = if bfinal {
@@ -294,9 +317,16 @@ fn read_gz_streaming<R: Read>(reader: R, sink: &Sender<Arc<Vec<u8>>>) -> Result<
                 let new_bytes = &out[crc_cursor..emit_end];
                 crc_hasher.update(new_bytes);
                 member_uc += new_bytes.len() as u64;
+                let n = new_bytes.len();
                 let chunk = Arc::new(new_bytes.to_vec());
-                let _ = sink.send(chunk);
+                if sink.send(chunk).is_err() {
+                    // Receiver gone: nobody wants the rest.
+                    return Ok((total_uc + member_uc, chunks_sent));
+                }
                 chunks_sent += 1;
+                if let Some(r) = remaining.as_mut() {
+                    *r -= n;
+                }
                 crc_cursor = emit_end;
             }
             if bfinal {
@@ -366,8 +396,15 @@ fn read_gz_streaming<R: Read>(reader: R, sink: &Sender<Arc<Vec<u8>>>) -> Result<
 pub fn read_gz(
     path: impl AsRef<Path>,
     sink: Sender<Arc<Vec<u8>>>,
-    config: Config,
+    mut config: Config,
 ) -> Result<DecodeStats, Error> {
+    // Output cap: decode serially so we can stop as soon as the budget is
+    // met. (The parallel paths would race ahead over the whole file.)
+    let limited = config.max_bytes_output.is_some();
+    if limited {
+        config.num_threads = 1;
+    }
+
     let path = path.as_ref();
     let verbose = config.verbose.is_on();
     let t_open = std::time::Instant::now();
@@ -396,8 +433,11 @@ pub fn read_gz(
                     path.display(),
                 );
             }
-            let (total_uncompressed, chunks_sent) =
-                read_gz_streaming(std::io::BufReader::new(file), &sink)?;
+            let (total_uncompressed, chunks_sent) = read_gz_streaming(
+                std::io::BufReader::new(file),
+                &sink,
+                config.max_bytes_output,
+            )?;
             drop(sink);
             return Ok(DecodeStats {
                 compressed_bytes: 0,
@@ -460,7 +500,9 @@ pub fn read_gz(
     // whole file is bgzip — every member is an independent deflate stream
     // and we can decode them in parallel without speculation or markers.
     let (total_uncompressed, chunks_sent, speculation_failures) =
-        if gzip::parse_bgzf_block_size(input.as_slice()).is_some() {
+        // With an output cap we skip the BGZF fast path: BGZF is ordinary
+        // multi-member gzip, and the serial member decoder honours the cap.
+        if !limited && gzip::parse_bgzf_block_size(input.as_slice()).is_some() {
             if verbose {
                 eprintln!(
                     "[rapidgzip +{:.2}s] bgzf detected — using fast path",
@@ -546,13 +588,20 @@ mod tests {
     /// Write `bytes` to a temp file, decode it via [`read_gz`], and return the
     /// concatenated decompressed output.
     fn decode_gz_bytes(bytes: &[u8]) -> Result<Vec<u8>, super::Error> {
+        decode_gz_bytes_limited(bytes, None)
+    }
+
+    fn decode_gz_bytes_limited(
+        bytes: &[u8],
+        max_bytes_output: Option<usize>,
+    ) -> Result<Vec<u8>, super::Error> {
         use std::sync::Arc;
+        // pid + counter: tests run in parallel and must not share a file.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
-            "rr_bgzf_test_{}.gz",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .subsec_nanos()
+            "rr_bgzf_test_{}_{}.gz",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::write(&path, bytes).expect("write temp file");
         let (sink, rx) = crossbeam_channel::unbounded::<Arc<Vec<u8>>>();
@@ -562,6 +611,7 @@ mod tests {
             verbose: super::Verbosity::Off,
             recycle_rx: None,
             recycle_tx: None,
+            max_bytes_output,
         };
         let result = super::read_gz(&path, sink, config);
         let _ = std::fs::remove_file(&path);
@@ -608,5 +658,127 @@ mod tests {
         input.extend(make_bgzf_member(b"world"));
         let out = decode_gz_bytes(&input).expect("gz+bgzf should decode");
         assert_eq!(out, b"hello world");
+    }
+
+    // ── max_bytes_output ────────────────────────────────────────────────────
+
+    /// Single gzip member made of as many stored deflate blocks as `data`
+    /// needs (each ≤ 65535 bytes), so large inputs span many blocks.
+    fn make_gz_member_multi(data: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff];
+        let blocks: Vec<&[u8]> = data.chunks(0xFFFF).collect();
+        for (i, block) in blocks.iter().enumerate() {
+            out.push(u8::from(i + 1 == blocks.len())); // BFINAL on last, BTYPE=00
+            let len = block.len() as u16;
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&(!len).to_le_bytes());
+            out.extend_from_slice(block);
+        }
+        out.extend_from_slice(&crc32fast::hash(data).to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out
+    }
+
+    fn pattern(n: usize) -> Vec<u8> {
+        (0..n).map(|i| (i * 7 + i / 251) as u8).collect()
+    }
+
+    /// Garbage that is not a valid gzip member. Decoding it is an error, so a
+    /// successful capped decode proves we stopped before reaching it.
+    const GARBAGE: &[u8] = b"this is definitely not a gzip member";
+
+    #[test]
+    fn max_bytes_truncates_small_and_large_members() {
+        let data = pattern(3 << 20); // 3 MiB → spans many blocks and >1 chunk
+        let gz = make_gz_member_multi(&data);
+        for n in [
+            1,
+            4,
+            100,
+            65535,
+            65536,
+            200_000,
+            (1 << 20) + 12_345,
+            data.len(),
+        ] {
+            let out = decode_gz_bytes_limited(&gz, Some(n)).expect("capped decode");
+            assert_eq!(out, &data[..n], "n = {n}");
+        }
+    }
+
+    #[test]
+    fn max_bytes_larger_than_output_returns_everything() {
+        let data = pattern(500_000);
+        let gz = make_gz_member_multi(&data);
+        let out = decode_gz_bytes_limited(&gz, Some(10 << 20)).expect("decode");
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn max_bytes_zero_outputs_nothing() {
+        let gz = make_gz_member(b"hello");
+        assert!(decode_gz_bytes_limited(&gz, Some(0))
+            .expect("decode")
+            .is_empty());
+    }
+
+    #[test]
+    fn max_bytes_stops_before_trailing_garbage() {
+        let data = pattern(2 << 20);
+        let mut gz = make_gz_member_multi(&data);
+        gz.extend_from_slice(GARBAGE);
+        assert!(
+            decode_gz_bytes(&gz).is_err(),
+            "uncapped decode must hit the garbage"
+        );
+        let out = decode_gz_bytes_limited(&gz, Some(1000)).expect("capped decode");
+        assert_eq!(out, &data[..1000]);
+    }
+
+    #[test]
+    fn max_bytes_spans_member_boundary() {
+        let mut gz = make_gz_member(b"hello ");
+        gz.extend(make_gz_member(b"world"));
+        gz.extend_from_slice(GARBAGE);
+        let out = decode_gz_bytes_limited(&gz, Some(8)).expect("capped decode");
+        assert_eq!(out, b"hello wo");
+    }
+
+    #[test]
+    fn max_bytes_on_bgzf_skips_fast_path_and_stops_early() {
+        let mut gz = make_bgzf_member(b"hello ");
+        gz.extend(make_bgzf_member(b"world"));
+        gz.extend_from_slice(GARBAGE);
+        let out = decode_gz_bytes_limited(&gz, Some(9)).expect("capped decode");
+        assert_eq!(out, b"hello wor");
+    }
+
+    #[test]
+    fn max_bytes_streaming_path_stops_early() {
+        // Non-seekable path: drive the streaming decoder from a reader.
+        let data = pattern(2 << 20);
+        let mut gz = make_gz_member_multi(&data);
+        gz.extend_from_slice(GARBAGE);
+        for n in [0, 1, 4, 70_000, 1 << 20] {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            let (uc, _) = super::read_gz_streaming(std::io::Cursor::new(&gz), &tx, Some(n))
+                .expect("capped streaming decode");
+            drop(tx);
+            let out: Vec<u8> = rx.iter().flat_map(|c| c.to_vec()).collect();
+            assert_eq!(uc, n as u64);
+            assert_eq!(out, &data[..n], "n = {n}");
+        }
+    }
+
+    #[test]
+    fn streaming_path_stops_when_receiver_gone() {
+        let data = pattern(2 << 20);
+        let mut gz = make_gz_member_multi(&data);
+        gz.extend_from_slice(GARBAGE);
+        let (tx, rx) = crossbeam_channel::unbounded::<std::sync::Arc<Vec<u8>>>();
+        drop(rx);
+        // Without the early exit this would decode on and fail on the garbage.
+        super::read_gz_streaming(std::io::Cursor::new(&gz), &tx, None)
+            .expect("stops quietly once nobody listens");
     }
 }
